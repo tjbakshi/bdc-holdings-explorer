@@ -157,9 +157,10 @@ export default function Admin() {
             totalHoldingsInserted += holdingsData.holdingsInserted || 0;
             filingsParsed += 1;
 
+            const warningsStr = holdingsData?.warnings?.length > 0 ? ` (Warnings: ${holdingsData.warnings.join(", ")})` : "";
             addLog(
               "extract_holdings_for_filing",
-              `Filing ${filing.sec_accession_no}: ${holdingsData.holdingsInserted} holdings`,
+              `Filing ${filing.sec_accession_no}: ${holdingsData.holdingsInserted} holdings${warningsStr}`,
               filingsData.cik
             );
           } catch (error: any) {
@@ -208,12 +209,12 @@ export default function Admin() {
 
       addLog(
         "extract_holdings_for_filing",
-        `Filing ${accessionNo}: ${data.holdingsInserted} holdings inserted`
+        `Filing ${accessionNo}: ${data.holdingsInserted} holdings inserted${data?.warnings?.length > 0 ? ` (Warnings: ${data.warnings.join(", ")})` : ""}`
       );
 
       toast({
         title: "Success",
-        description: `Parsed filing ${accessionNo}. Inserted ${data.holdingsInserted} holdings.`,
+        description: `Parsed filing ${accessionNo}. Inserted ${data.holdingsInserted} holdings${data?.warnings?.length > 0 ? ". " + data.warnings.join(", ") : ""}.`,
       });
 
       refetchFilings();

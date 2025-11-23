@@ -111,24 +111,35 @@ function extractInterestRate(text: string): { rate: string | null; reference: st
 
 // Extract candidate HTML snippets containing Schedule of Investments
 function extractCandidateTableHtml(html: string): string[] {
-  const lower = html.toLowerCase();
+  // Normalize HTML to handle &nbsp; and extra whitespace
+  const normalized = html.replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
+  const lower = normalized.toLowerCase();
   
-  // Prefer regions around "schedule of investments"
+  // Broaden keywords to catch more variations
   const keywords = [
     "consolidated schedule of investments",
-    "schedule of investments",
+    "schedule of investments (unaudited)",
     "schedule of investments (continued)",
+    "schedule of investments",
+    "portfolio investments",
   ];
   
   const snippets: string[] = [];
   
   for (const keyword of keywords) {
-    const idx = lower.indexOf(keyword);
-    if (idx !== -1) {
+    let searchStart = 0;
+    while (true) {
+      const idx = lower.indexOf(keyword, searchStart);
+      if (idx === -1) break;
+      
       // Take a window around the keyword (±150kb)
       const start = Math.max(0, idx - 150_000);
       const end = Math.min(html.length, idx + 150_000);
       snippets.push(html.slice(start, end));
+      
+      searchStart = idx + keyword.length;
+      // Only find first occurrence per keyword to avoid too many snippets
+      break;
     }
   }
   
@@ -143,174 +154,214 @@ function extractCandidateTableHtml(html: string): string[] {
   return snippets;
 }
 
-// Parse HTML Schedule of Investments table from snippets
-function parseHtmlScheduleOfInvestments(html: string): Holding[] {
+// Helper to find header row in a table
+function findHeaderRow(table: Element): Element | null {
+  const rows = (table as Element).querySelectorAll("tr");
+  
+  // Scan first ~5 rows to find the header
+  const maxHeaderScan = Math.min(5, rows.length);
+  
+  for (let i = 0; i < maxHeaderScan; i++) {
+    const row = rows[i] as Element;
+    const rowText = row.textContent?.toLowerCase() || "";
+    
+    // Header must contain BOTH fair value/market value AND cost/amortized
+    const hasFairValue = rowText.includes("fair value") || rowText.includes("market value");
+    const hasCost = rowText.includes("cost") || rowText.includes("amortized");
+    
+    if (hasFairValue && hasCost) {
+      return row;
+    }
+  }
+  
+  return null;
+}
+
+// Parse tables looking for Schedule of Investments
+function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number): Holding[] {
   const holdings: Holding[] = [];
   
-  try {
-    // Extract only relevant HTML snippets instead of parsing entire document
-    const snippets = extractCandidateTableHtml(html);
+  for (const table of tables) {
+    // Find the header row (don't assume it's the first row)
+    const headerRow = findHeaderRow(table as Element);
+    if (!headerRow) continue;
     
-    for (const snippet of snippets) {
-      // Parse only this snippet
-      const doc = new DOMParser().parseFromString(snippet, "text/html");
-      if (!doc) continue;
-      
-      // Find tables that might contain Schedule of Investments
-      const tables = doc.querySelectorAll("table");
+    // Find column indices
+    const headerCells = Array.from(headerRow.querySelectorAll("th, td"));
+    const headers = headerCells.map(
+      (h) => (h as Element).textContent?.toLowerCase().trim() || ""
+    );
     
-    for (const table of tables) {
-      // Look for table headers that indicate this is a Schedule of Investments
-      const headerRow = (table as Element).querySelector("tr");
-      if (!headerRow) continue;
-      
-      const headerText = headerRow.textContent?.toLowerCase() || "";
-      
-      // Check if this table looks like a Schedule of Investments
-      const isSOI = 
-        headerText.includes("portfolio") ||
-        headerText.includes("investment") ||
-        headerText.includes("company") ||
-        (headerText.includes("fair value") && headerText.includes("cost"));
-      
-      if (!isSOI) continue;
-      
-      // Find column indices
-      const headerCells = Array.from(headerRow.querySelectorAll("th, td"));
-      const headers = headerCells.map(
-        (h) => (h as Element).textContent?.toLowerCase().trim() || ""
-      );
-      
-      const colIndices = {
-        company: headers.findIndex((h) => 
-          h.includes("company") || h.includes("portfolio") || h.includes("name") || h.includes("issuer")
-        ),
-        investmentType: headers.findIndex((h) => 
-          h.includes("type") || h.includes("instrument")
-        ),
-        industry: headers.findIndex((h) => 
-          h.includes("industry") || h.includes("sector")
-        ),
-        description: headers.findIndex((h) => 
-          h.includes("description") || h.includes("investment")
-        ),
-        interestRate: headers.findIndex((h) => 
-          h.includes("interest") || h.includes("rate") || h.includes("coupon")
-        ),
-        maturity: headers.findIndex((h) => 
-          h.includes("maturity") || h.includes("expiration")
-        ),
-        par: headers.findIndex((h) => 
-          h.includes("par") || h.includes("principal") || h.includes("face")
-        ),
-        cost: headers.findIndex((h) => 
-          h.includes("cost") || h.includes("amortized")
-        ),
-        fairValue: headers.findIndex((h) => 
-          h.includes("fair value") || h.includes("market value")
-        ),
-      };
-      
-      // Must have at least company and fair value columns
-      if (colIndices.company === -1 || colIndices.fairValue === -1) continue;
-      
-      // Parse data rows
-      const rows = (table as Element).querySelectorAll("tr");
-      
-      // Cap the number of rows we process per table to prevent blowup
-      const maxRowsPerTable = 1000;
-      const rowsToProcess = Math.min(rows.length, maxRowsPerTable + 1);
-      
-      for (let i = 1; i < rowsToProcess; i++) {
-        const row = rows[i] as Element;
-        const cellNodes = Array.from(row.querySelectorAll("td"));
-        const cells = cellNodes.map(c => c as Element);
-        
-        if (cells.length === 0) continue;
-        
-        const companyName = cells[colIndices.company]?.textContent?.trim();
-        if (!companyName || companyName.length < 2) continue;
-        
-        // Skip subtotal/total rows
-        if (
-          companyName.toLowerCase().includes("total") ||
-          companyName.toLowerCase().includes("subtotal")
-        ) {
-          continue;
-        }
-        
-        const interestRateText = 
-          colIndices.interestRate >= 0 
-            ? cells[colIndices.interestRate]?.textContent?.trim() || ""
-            : "";
-        
-        const { rate, reference } = extractInterestRate(interestRateText);
-        
-        const holding: Holding = {
-          company_name: companyName,
-          investment_type: 
-            colIndices.investmentType >= 0 
-              ? cells[colIndices.investmentType]?.textContent?.trim() || null
-              : null,
-          industry: 
-            colIndices.industry >= 0 
-              ? cells[colIndices.industry]?.textContent?.trim() || null
-              : null,
-          description: 
-            colIndices.description >= 0 
-              ? cells[colIndices.description]?.textContent?.trim() || null
-              : null,
-          interest_rate: rate,
-          reference_rate: reference,
-          maturity_date: parseDate(
-            colIndices.maturity >= 0 
-              ? cells[colIndices.maturity]?.textContent?.trim()
-              : null
-          ),
-          par_amount: parseNumeric(
-            colIndices.par >= 0 
-              ? cells[colIndices.par]?.textContent?.trim()
-              : null
-          ),
-          cost: parseNumeric(
-            colIndices.cost >= 0 
-              ? cells[colIndices.cost]?.textContent?.trim()
-              : null
-          ),
-          fair_value: parseNumeric(
-            cells[colIndices.fairValue]?.textContent?.trim()
-          ),
-        };
-        
-        // Only add if we have fair value (required field)
-        if (holding.fair_value !== null) {
-          holdings.push(holding);
-        }
-        
-        // Cap total holdings to prevent excessive memory usage
-        if (holdings.length >= 2000) {
-          console.log("Reached max holdings cap (2000), stopping parse");
-          break;
-        }
-      }
-      
-      // If we found holdings in this snippet, no need to check others
-      if (holdings.length > 0) {
-        console.log(`Found ${holdings.length} holdings in snippet, stopping search`);
+    const colIndices = {
+      company: headers.findIndex((h) => 
+        h.includes("company") || h.includes("portfolio") || h.includes("name") || h.includes("issuer")
+      ),
+      investmentType: headers.findIndex((h) => 
+        h.includes("type") || h.includes("instrument")
+      ),
+      industry: headers.findIndex((h) => 
+        h.includes("industry") || h.includes("sector")
+      ),
+      description: headers.findIndex((h) => 
+        h.includes("description") || h.includes("investment")
+      ),
+      interestRate: headers.findIndex((h) => 
+        h.includes("interest") || h.includes("rate") || h.includes("coupon")
+      ),
+      maturity: headers.findIndex((h) => 
+        h.includes("maturity") || h.includes("expiration")
+      ),
+      par: headers.findIndex((h) => 
+        h.includes("par") || h.includes("principal") || h.includes("face")
+      ),
+      cost: headers.findIndex((h) => 
+        h.includes("cost") || h.includes("amortized")
+      ),
+      fairValue: headers.findIndex((h) => 
+        h.includes("fair value") || h.includes("market value")
+      ),
+    };
+    
+    // Must have at least company and fair value columns
+    if (colIndices.company === -1 || colIndices.fairValue === -1) continue;
+    
+    // Parse data rows
+    const rows = (table as Element).querySelectorAll("tr");
+    
+    // Find the index of the header row
+    let headerRowIndex = 0;
+    for (let idx = 0; idx < rows.length; idx++) {
+      if (rows[idx] === headerRow) {
+        headerRowIndex = idx;
         break;
       }
     }
     
-    // If we found holdings in this snippet, no need to check other snippets
-    if (holdings.length > 0) {
-      break;
+    // Cap the number of rows we process per table to prevent blowup
+    const rowsToProcess = Math.min(rows.length, headerRowIndex + maxRowsPerTable + 1);
+    
+    for (let i = headerRowIndex + 1; i < rowsToProcess; i++) {
+      const row = rows[i] as Element;
+      const cellNodes = Array.from(row.querySelectorAll("td"));
+      const cells = cellNodes.map(c => c as Element);
+      
+      if (cells.length === 0) continue;
+      
+      const companyName = cells[colIndices.company]?.textContent?.trim();
+      if (!companyName || companyName.length < 2) continue;
+      
+      // Skip subtotal/total rows
+      if (
+        companyName.toLowerCase().includes("total") ||
+        companyName.toLowerCase().includes("subtotal")
+      ) {
+        continue;
+      }
+      
+      const interestRateText = 
+        colIndices.interestRate >= 0 
+          ? cells[colIndices.interestRate]?.textContent?.trim() || ""
+          : "";
+      
+      const { rate, reference } = extractInterestRate(interestRateText);
+      
+      const holding: Holding = {
+        company_name: companyName,
+        investment_type: 
+          colIndices.investmentType >= 0 
+            ? cells[colIndices.investmentType]?.textContent?.trim() || null
+            : null,
+        industry: 
+          colIndices.industry >= 0 
+            ? cells[colIndices.industry]?.textContent?.trim() || null
+            : null,
+        description: 
+          colIndices.description >= 0 
+            ? cells[colIndices.description]?.textContent?.trim() || null
+            : null,
+        interest_rate: rate,
+        reference_rate: reference,
+        maturity_date: parseDate(
+          colIndices.maturity >= 0 
+            ? cells[colIndices.maturity]?.textContent?.trim()
+            : null
+        ),
+        par_amount: parseNumeric(
+          colIndices.par >= 0 
+            ? cells[colIndices.par]?.textContent?.trim()
+            : null
+        ),
+        cost: parseNumeric(
+          colIndices.cost >= 0 
+            ? cells[colIndices.cost]?.textContent?.trim()
+            : null
+        ),
+        fair_value: parseNumeric(
+          cells[colIndices.fairValue]?.textContent?.trim()
+        ),
+      };
+      
+      // Only add if we have fair value (required field)
+      if (holding.fair_value !== null) {
+        holdings.push(holding);
+      }
+      
+      // Cap total holdings to prevent excessive memory usage
+      if (holdings.length >= maxHoldings) {
+        console.log(`Reached max holdings cap (${maxHoldings}), stopping parse`);
+        return holdings;
+      }
     }
-  }
-  } catch (error) {
-    console.error("Error parsing HTML:", error);
+    
+    // If we found holdings in this table, stop searching
+    if (holdings.length > 0) {
+      return holdings;
+    }
   }
   
   return holdings;
+}
+
+// Parse HTML Schedule of Investments table from snippets
+function parseHtmlScheduleOfInvestments(html: string): Holding[] {
+  const maxRowsPerTable = 1000;
+  const maxHoldings = 2000;
+  
+  try {
+    // First try: Extract only relevant HTML snippets
+    const snippets = extractCandidateTableHtml(html);
+    
+    for (const snippet of snippets) {
+      const doc = new DOMParser().parseFromString(snippet, "text/html");
+      if (!doc) continue;
+      
+      const tables = Array.from(doc.querySelectorAll("table")) as Element[];
+      const holdings = parseTables(tables, maxRowsPerTable, maxHoldings);
+      
+      if (holdings.length > 0) {
+        console.log(`Found ${holdings.length} holdings in snippet`);
+        return holdings;
+      }
+    }
+    
+    // Fallback: If snippets returned 0 holdings, do a full-table scan
+    console.log("No holdings found in snippets, falling back to full-table scan");
+    const fullDoc = new DOMParser().parseFromString(html, "text/html");
+    if (fullDoc) {
+      const allTables = Array.from(fullDoc.querySelectorAll("table")) as Element[];
+      const holdings = parseTables(allTables, maxRowsPerTable, maxHoldings);
+      
+      if (holdings.length > 0) {
+        console.log(`Found ${holdings.length} holdings in full-table fallback`);
+        return holdings;
+      }
+    }
+  }
+  catch (error) {
+    console.error("Error parsing HTML:", error);
+  }
+  
+  return [];
 }
 
 // Main serve function
@@ -347,8 +398,9 @@ serve(async (req) => {
 
     const cik = filing.bdcs.cik;
     const accessionNo = filing.sec_accession_no;
+    const bdcName = filing.bdcs.bdc_name;
 
-    console.log(`Extracting holdings for filing ${accessionNo} (CIK: ${cik})`);
+    console.log(`Extracting holdings for filing ${accessionNo} (CIK: ${cik}, BDC: ${bdcName})`);
 
     // Build filing document URL
     const accessionNoNoDashes = accessionNo.replace(/-/g, "");
@@ -359,6 +411,7 @@ serve(async (req) => {
     
     let holdings: Holding[] = [];
     const warnings: string[] = [];
+    let docUrl = "";
     
     try {
       // Fetch the filing index to find the primary document
@@ -376,7 +429,7 @@ serve(async (req) => {
       );
       
       if (primaryDoc) {
-        const docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/${primaryDoc.name}`;
+        docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/${primaryDoc.name}`;
         console.log(`Fetching primary document: ${docUrl}`);
         
         const html = await fetchSecFile(docUrl);
@@ -430,7 +483,10 @@ serve(async (req) => {
       );
     } else {
       // No holdings found - mark as failed parse
-      warnings.push("No holdings found in filing");
+      warnings.push("No holdings found in filing (after snippets + full-table fallback)");
+      
+      console.log(`No holdings found. Index URL: ${indexUrl}`);
+      console.log(`Doc URL: ${docUrl}`);
       
       return new Response(
         JSON.stringify({
