@@ -239,7 +239,12 @@ const BdcDetail = () => {
                         {holdings.map((holding) => (
                           <TableRow key={holding.id}>
                             <TableCell className="font-medium">
-                              {holding.company_name}
+                              <Link 
+                                to={`/company/${encodeURIComponent(holding.company_name)}`}
+                                className="hover:underline text-primary"
+                              >
+                                {holding.company_name}
+                              </Link>
                             </TableCell>
                             <TableCell>{holding.investment_type || "—"}</TableCell>
                             <TableCell>{holding.industry || "—"}</TableCell>
