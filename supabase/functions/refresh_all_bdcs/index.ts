@@ -19,6 +19,9 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
+    // Parse request body for offset and limit
+    const { offset = 0, limit = 10 } = await req.json().catch(() => ({}));
+
     // Fetch all BDCs
     const { data: bdcs, error: bdcsError } = await supabaseClient
       .from("bdcs")
@@ -33,9 +36,9 @@ serve(async (req) => {
     let totalHoldingsInserted = 0;
     const errors: string[] = [];
 
-    // Limit to first 10 BDCs to avoid timeout (can be increased later)
-    const bdcsToProcess = bdcs.slice(0, 10);
-    console.log(`Processing ${bdcsToProcess.length} of ${bdcs.length} BDCs`);
+    // Process BDCs in batches using offset and limit
+    const bdcsToProcess = bdcs.slice(offset, offset + limit);
+    console.log(`Processing ${bdcsToProcess.length} BDCs (offset ${offset}, limit ${limit}) of ${bdcs.length} total`);
 
     for (const bdc of bdcsToProcess) {
       try {
@@ -120,12 +123,18 @@ serve(async (req) => {
       }
     }
 
+    // Calculate nextOffset
+    const nextOffset = (offset + bdcsToProcess.length < bdcs.length) 
+      ? offset + bdcsToProcess.length 
+      : null;
+
     return new Response(
       JSON.stringify({
         totalBdcs: bdcs.length,
         bdcCount: bdcsToProcess.length,
         totalFilingsInserted,
         totalHoldingsInserted,
+        nextOffset,
         errors,
       }),
       {

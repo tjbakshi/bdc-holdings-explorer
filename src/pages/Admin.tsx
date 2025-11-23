@@ -237,22 +237,55 @@ export default function Admin() {
 
   const handleRefreshAll = async () => {
     setLoading("all");
-    try {
-      const { data, error } = await supabase.functions.invoke("refresh_all_bdcs");
+    
+    let offset = 0;
+    const limit = 10;
+    let totalFilings = 0;
+    let totalHoldings = 0;
+    let totalBdcsProcessed = 0;
+    let allErrors: string[] = [];
+    const maxBatches = 10; // Safety limit to avoid infinite loops
+    let batchCount = 0;
 
-      if (error) {
-        console.error("Edge function error:", error);
-        throw error;
+    try {
+      while (batchCount < maxBatches) {
+        batchCount++;
+        
+        const { data, error } = await supabase.functions.invoke("refresh_all_bdcs", {
+          body: { offset, limit },
+        });
+
+        if (error) {
+          console.error("Edge function error:", error);
+          throw error;
+        }
+
+        totalFilings += data.totalFilingsInserted || 0;
+        totalHoldings += data.totalHoldingsInserted || 0;
+        totalBdcsProcessed += data.bdcCount || 0;
+        allErrors = [...allErrors, ...(data.errors || [])];
+
+        addLog(
+          "refresh_all_bdcs",
+          `Batch processed: offset ${offset} to ${offset + data.bdcCount} – inserted ${data.totalFilingsInserted} filings, ${data.totalHoldingsInserted} holdings`
+        );
+
+        // Check if there are more BDCs to process
+        if (data.nextOffset === null) {
+          break;
+        }
+
+        offset = data.nextOffset;
       }
 
       addLog(
         "refresh_all_bdcs",
-        `Processed ${data.bdcCount} of ${data.totalBdcs} BDCs, inserted ${data.totalFilingsInserted} filings, ${data.totalHoldingsInserted} holdings`
+        `All batches complete: Processed ${totalBdcsProcessed} BDCs, inserted ${totalFilings} total filings, ${totalHoldings} total holdings${allErrors.length > 0 ? `, ${allErrors.length} errors` : ""}`
       );
 
       toast({
         title: "Success",
-        description: `Refreshed ${data.bdcCount} of ${data.totalBdcs} BDCs with ${data.totalFilingsInserted} new filings`,
+        description: `Refreshed all ${totalBdcsProcessed} BDCs with ${totalFilings} new filings and ${totalHoldings} holdings`,
       });
 
       refetchFilings();
