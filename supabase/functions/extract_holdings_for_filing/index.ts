@@ -373,8 +373,8 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
 
 // Parse HTML Schedule of Investments table from snippets
 function parseHtmlScheduleOfInvestments(html: string, debugMode = false): Holding[] {
-  const maxRowsPerTable = 1000;
-  const maxHoldings = 2000;
+  const maxRowsPerTable = 500;
+  const maxHoldings = 1000;
   
   try {
     // First try: Extract only relevant HTML snippets
@@ -393,18 +393,8 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): Holdin
       }
     }
     
-    // Fallback: If snippets returned 0 holdings, do a full-table scan
-    console.log("No holdings found in snippets, falling back to full-table scan");
-    const fullDoc = new DOMParser().parseFromString(html, "text/html");
-    if (fullDoc) {
-      const allTables = Array.from(fullDoc.querySelectorAll("table")) as Element[];
-      const holdings = parseTables(allTables, maxRowsPerTable, maxHoldings, debugMode);
-      
-      if (holdings.length > 0) {
-        console.log(`Found ${holdings.length} holdings in full-table fallback`);
-        return holdings;
-      }
-    }
+    // No full-document fallback to avoid WORKER_LIMIT on large filings
+    console.log("No holdings found in snippets; returning empty result without full-document fallback");
   }
   catch (error) {
     console.error("Error parsing HTML:", error);
@@ -530,6 +520,13 @@ serve(async (req) => {
           const html = await fetchSecFile(docUrl);
           console.log(`   Size: ${(html.length / 1024).toFixed(0)} KB`);
           
+          // Hard limit: Skip documents over 1MB to avoid WORKER_LIMIT
+          if (html.length > 1_000_000) {
+            warnings.push(`Document ${doc.name} too large to safely parse (${(html.length / 1024).toFixed(0)} KB > 1MB). Skipping.`);
+            console.log(`   ⚠️ Document too large, skipping`);
+            continue;
+          }
+          
           holdings = parseHtmlScheduleOfInvestments(html, debugMode);
           
           console.log(`   Result: ${holdings.length} holdings found`);
@@ -590,8 +587,8 @@ serve(async (req) => {
         }
       );
     } else {
-      // No holdings found - mark as failed parse
-      warnings.push("No holdings found in filing (after snippets + full-table fallback)");
+      // No holdings found - return 200 with warnings
+      warnings.push("No holdings found in filing (snippet-based parsing only)");
       
       console.log(`No holdings found. Index URL: ${indexUrl}`);
       console.log(`Doc URL: ${docUrl}`);
