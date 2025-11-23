@@ -196,25 +196,34 @@ export default function Admin() {
     }
   };
 
-  const handleParseFiling = async (filingId: string, accessionNo: string) => {
+  const handleParseFiling = async (filingId: string, accessionNo: string, mode: "default" | "local" = "default") => {
     setParsingFilingIds((prev) => new Set(prev).add(filingId));
     
     try {
+      const modeStr = mode === "local" ? " (local parser)" : " (via Lambda)";
+      
       const { data, error } = await supabase.functions.invoke(
         "extract_holdings_for_filing",
-        { body: { filingId } }
+        { 
+          body: { 
+            filingId,
+            ...(mode === "local" ? { mode: "local" } : {})
+          } 
+        }
       );
 
       if (error) throw error;
 
+      const warningsStr = data?.warnings?.length > 0 ? ` (Warnings: ${data.warnings.join(", ")})` : "";
+
       addLog(
         "extract_holdings_for_filing",
-        `Filing ${accessionNo}: ${data.holdingsInserted} holdings inserted${data?.warnings?.length > 0 ? ` (Warnings: ${data.warnings.join(", ")})` : ""}`
+        `Filing ${accessionNo}${modeStr}: ${data.holdingsInserted} holdings inserted${warningsStr}`
       );
 
       toast({
         title: "Success",
-        description: `Parsed filing ${accessionNo}. Inserted ${data.holdingsInserted} holdings${data?.warnings?.length > 0 ? ". " + data.warnings.join(", ") : ""}.`,
+        description: `Parsed filing ${accessionNo}${modeStr}. Inserted ${data.holdingsInserted} holdings${data?.warnings?.length > 0 ? ". " + data.warnings.join(", ") : ""}.`,
       });
 
       refetchFilings();
@@ -485,21 +494,34 @@ export default function Admin() {
                     {new Date(filing.created_at!).toLocaleDateString()}
                   </TableCell>
                   <TableCell>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => handleParseFiling(filing.id, filing.sec_accession_no || filing.id)}
-                      disabled={parsingFilingIds.has(filing.id)}
-                    >
-                      {parsingFilingIds.has(filing.id) ? (
-                        <>
-                          <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                          Parsing...
-                        </>
-                      ) : (
-                        "Parse holdings"
-                      )}
-                    </Button>
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => handleParseFiling(filing.id, filing.sec_accession_no || filing.id, "default")}
+                        disabled={parsingFilingIds.has(filing.id)}
+                        title="Parse using Lambda (default, for large filings)"
+                      >
+                        {parsingFilingIds.has(filing.id) ? (
+                          <>
+                            <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                            Parsing...
+                          </>
+                        ) : (
+                          "Parse holdings"
+                        )}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => handleParseFiling(filing.id, filing.sec_accession_no || filing.id, "local")}
+                        disabled={parsingFilingIds.has(filing.id)}
+                        title="Debug: parse locally (only for small filings)"
+                        className="text-xs"
+                      >
+                        🔧 Local
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
