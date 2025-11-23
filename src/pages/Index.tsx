@@ -161,6 +161,12 @@ const Index = () => {
         <div className="mt-4 text-sm text-muted-foreground">
           Showing {filteredBdcs?.length || 0} of {bdcs?.length || 0} BDCs
         </div>
+
+        <div className="mt-12 pt-6 border-t border-border text-center">
+          <Link to="/admin" className="text-sm text-muted-foreground hover:text-foreground transition-colors">
+            Admin / Data Updates (Internal)
+          </Link>
+        </div>
       </div>
     </div>
   );
