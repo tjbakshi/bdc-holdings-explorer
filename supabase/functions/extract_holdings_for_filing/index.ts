@@ -109,16 +109,55 @@ function extractInterestRate(text: string): { rate: string | null; reference: st
   return { rate: text.trim(), reference: null };
 }
 
-// Parse HTML Schedule of Investments table
+// Extract candidate HTML snippets containing Schedule of Investments
+function extractCandidateTableHtml(html: string): string[] {
+  const lower = html.toLowerCase();
+  
+  // Prefer regions around "schedule of investments"
+  const keywords = [
+    "consolidated schedule of investments",
+    "schedule of investments",
+    "schedule of investments (continued)",
+  ];
+  
+  const snippets: string[] = [];
+  
+  for (const keyword of keywords) {
+    const idx = lower.indexOf(keyword);
+    if (idx !== -1) {
+      // Take a window around the keyword (±150kb)
+      const start = Math.max(0, idx - 150_000);
+      const end = Math.min(html.length, idx + 150_000);
+      snippets.push(html.slice(start, end));
+    }
+  }
+  
+  // If we didn't find any keyword, fall back to the first ~300kb of the file
+  if (snippets.length === 0) {
+    console.log("No SOI keywords found, using first 300KB");
+    snippets.push(html.slice(0, 300_000));
+  } else {
+    console.log(`Found ${snippets.length} candidate SOI regions`);
+  }
+  
+  return snippets;
+}
+
+// Parse HTML Schedule of Investments table from snippets
 function parseHtmlScheduleOfInvestments(html: string): Holding[] {
   const holdings: Holding[] = [];
   
   try {
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    if (!doc) return holdings;
+    // Extract only relevant HTML snippets instead of parsing entire document
+    const snippets = extractCandidateTableHtml(html);
     
-    // Find tables that might contain Schedule of Investments
-    const tables = doc.querySelectorAll("table");
+    for (const snippet of snippets) {
+      // Parse only this snippet
+      const doc = new DOMParser().parseFromString(snippet, "text/html");
+      if (!doc) continue;
+      
+      // Find tables that might contain Schedule of Investments
+      const tables = doc.querySelectorAll("table");
     
     for (const table of tables) {
       // Look for table headers that indicate this is a Schedule of Investments
@@ -178,7 +217,11 @@ function parseHtmlScheduleOfInvestments(html: string): Holding[] {
       // Parse data rows
       const rows = (table as Element).querySelectorAll("tr");
       
-      for (let i = 1; i < rows.length; i++) {
+      // Cap the number of rows we process per table to prevent blowup
+      const maxRowsPerTable = 1000;
+      const rowsToProcess = Math.min(rows.length, maxRowsPerTable + 1);
+      
+      for (let i = 1; i < rowsToProcess; i++) {
         const row = rows[i] as Element;
         const cellNodes = Array.from(row.querySelectorAll("td"));
         const cells = cellNodes.map(c => c as Element);
@@ -243,8 +286,26 @@ function parseHtmlScheduleOfInvestments(html: string): Holding[] {
         if (holding.fair_value !== null) {
           holdings.push(holding);
         }
+        
+        // Cap total holdings to prevent excessive memory usage
+        if (holdings.length >= 2000) {
+          console.log("Reached max holdings cap (2000), stopping parse");
+          break;
+        }
+      }
+      
+      // If we found holdings in this snippet, no need to check others
+      if (holdings.length > 0) {
+        console.log(`Found ${holdings.length} holdings in snippet, stopping search`);
+        break;
       }
     }
+    
+    // If we found holdings in this snippet, no need to check other snippets
+    if (holdings.length > 0) {
+      break;
+    }
+  }
   } catch (error) {
     console.error("Error parsing HTML:", error);
   }
