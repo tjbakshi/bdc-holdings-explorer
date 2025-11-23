@@ -233,6 +233,7 @@ const BdcDetail = () => {
                           <TableHead className="text-right">Fair Value</TableHead>
                           <TableHead className="text-right">FMV % Par</TableHead>
                           <TableHead className="text-right">FMV % Cost</TableHead>
+                          <TableHead>Actions</TableHead>
                         </TableRow>
                       </TableHeader>
                       <TableBody>
@@ -244,6 +245,36 @@ const BdcDetail = () => {
                                 className="hover:underline text-primary"
                               >
                                 {holding.company_name}
+                              </Link>
+                            </TableCell>
+                            <TableCell>{holding.investment_type || "—"}</TableCell>
+                            <TableCell>{holding.industry || "—"}</TableCell>
+                            <TableCell className="text-sm">
+                              {holding.description || "—"}
+                            </TableCell>
+                            <TableCell>{holding.interest_rate || "—"}</TableCell>
+                            <TableCell>{holding.reference_rate || "—"}</TableCell>
+                            <TableCell>{formatDate(holding.maturity_date)}</TableCell>
+                            <TableCell className="text-right font-mono">
+                              {formatCurrency(holding.par_amount)}
+                            </TableCell>
+                            <TableCell className="text-right font-mono">
+                              {formatCurrency(holding.cost)}
+                            </TableCell>
+                            <TableCell className="text-right font-mono">
+                              {formatCurrency(holding.fair_value)}
+                            </TableCell>
+                            <TableCell className="text-right font-medium">
+                              {calculateFmvPar(holding.fair_value, holding.par_amount)}
+                            </TableCell>
+                            <TableCell className="text-right font-medium">
+                              {calculateFmvCost(holding.fair_value, holding.cost)}
+                            </TableCell>
+                            <TableCell>
+                              <Link to={`/holding/${holding.id}`}>
+                                <Button variant="outline" size="sm">
+                                  View Details
+                                </Button>
                               </Link>
                             </TableCell>
                             <TableCell>{holding.investment_type || "—"}</TableCell>
