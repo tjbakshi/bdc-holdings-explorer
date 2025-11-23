@@ -162,22 +162,27 @@ export default function Admin() {
     try {
       const { data, error } = await supabase.functions.invoke("refresh_all_bdcs");
 
-      if (error) throw error;
+      if (error) {
+        console.error("Edge function error:", error);
+        throw error;
+      }
 
       addLog(
         "refresh_all_bdcs",
-        `Processed ${data.bdcCount} BDCs, inserted ${data.totalFilingsInserted} filings, ${data.totalHoldingsInserted} holdings`
+        `Processed ${data.bdcCount} of ${data.totalBdcs} BDCs, inserted ${data.totalFilingsInserted} filings, ${data.totalHoldingsInserted} holdings`
       );
 
       toast({
         title: "Success",
-        description: `Refreshed ${data.bdcCount} BDCs with ${data.totalFilingsInserted} new filings`,
+        description: `Refreshed ${data.bdcCount} of ${data.totalBdcs} BDCs with ${data.totalFilingsInserted} new filings`,
       });
 
       refetchFilings();
     } catch (error: any) {
-      toast({ title: "Error", description: error.message, variant: "destructive" });
-      addLog("refresh_all_bdcs", `Error: ${error.message}`);
+      console.error("Full error:", error);
+      const errorMsg = error?.message || "Failed to send a request to the Edge Function";
+      toast({ title: "Error", description: errorMsg, variant: "destructive" });
+      addLog("refresh_all_bdcs", `Error: ${errorMsg}`);
     } finally {
       setLoading(null);
     }
