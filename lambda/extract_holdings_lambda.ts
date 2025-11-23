@@ -1,15 +1,6 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { DOMParser, Element } from "https://deno.land/x/deno_dom@v0.1.38/deno-dom-wasm.ts";
+import { Handler } from 'aws-lambda';
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
-
-const SEC_USER_AGENT = "BDCTrackerApp/1.0 (contact@bdctracker.com)";
-const LAMBDA_PARSER_URL = Deno.env.get("LAMBDA_PARSER_URL");
-
+// Types
 interface Holding {
   company_name: string;
   investment_type?: string | null;
@@ -22,6 +13,18 @@ interface Holding {
   cost?: number | null;
   fair_value?: number | null;
 }
+
+interface LambdaEvent {
+  body: string;
+}
+
+interface RequestBody {
+  filingId: string;
+}
+
+const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "BDCTrackerApp/1.0 (contact@bdctracker.com)";
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 // Helper to fetch SEC files with retry
 async function fetchSecFile(url: string, retries = 2): Promise<string> {
@@ -46,14 +49,13 @@ async function fetchSecFile(url: string, retries = 2): Promise<string> {
   throw new Error("Failed to fetch after retries");
 }
 
-// Parse numeric value from string (handles $, commas, parentheses for negatives)
+// Parse numeric value from string
 function parseNumeric(value: string | null | undefined): number | null {
   if (!value) return null;
   
   const cleaned = value.replace(/[$,\s]/g, "").trim();
   if (!cleaned || cleaned === "-" || cleaned === "—") return null;
   
-  // Handle parentheses as negative
   const isNegative = cleaned.startsWith("(") && cleaned.endsWith(")");
   const numStr = isNegative ? cleaned.slice(1, -1) : cleaned;
   
@@ -70,7 +72,6 @@ function parseDate(value: string | null | undefined): string | null {
   const cleaned = value.trim();
   if (!cleaned || cleaned === "-" || cleaned === "—") return null;
   
-  // Try parsing common date formats
   const date = new Date(cleaned);
   if (!isNaN(date.getTime())) {
     return date.toISOString().split("T")[0];
@@ -85,7 +86,6 @@ function extractInterestRate(text: string): { rate: string | null; reference: st
   
   const lowerText = text.toLowerCase();
   
-  // Common reference rates
   const referenceRates = ["sofr", "libor", "prime", "euribor"];
   let reference = null;
   
@@ -96,12 +96,10 @@ function extractInterestRate(text: string): { rate: string | null; reference: st
     }
   }
   
-  // If we found a reference rate, return the full text as rate
   if (reference) {
     return { rate: text.trim(), reference };
   }
   
-  // Check for fixed rate (e.g., "8.5%", "10.00%")
   const fixedRateMatch = text.match(/(\d+\.?\d*)\s*%/);
   if (fixedRateMatch) {
     return { rate: text.trim(), reference: null };
@@ -112,11 +110,9 @@ function extractInterestRate(text: string): { rate: string | null; reference: st
 
 // Extract candidate HTML snippets containing Schedule of Investments
 function extractCandidateTableHtml(html: string): string[] {
-  // Normalize HTML to handle &nbsp; and extra whitespace
   const normalized = html.replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
   const lower = normalized.toLowerCase();
   
-  // Broaden keywords to catch more variations
   const keywords = [
     "consolidated schedule of investments",
     "schedule of investments (unaudited)",
@@ -133,18 +129,15 @@ function extractCandidateTableHtml(html: string): string[] {
       const idx = lower.indexOf(keyword, searchStart);
       if (idx === -1) break;
       
-      // Take a window around the keyword (±150kb)
       const start = Math.max(0, idx - 150_000);
       const end = Math.min(html.length, idx + 150_000);
       snippets.push(html.slice(start, end));
       
       searchStart = idx + keyword.length;
-      // Only find first occurrence per keyword to avoid too many snippets
       break;
     }
   }
   
-  // If we didn't find any keyword, fall back to the first ~300kb of the file
   if (snippets.length === 0) {
     console.log("No SOI keywords found, using first 300KB");
     snippets.push(html.slice(0, 300_000));
@@ -156,32 +149,28 @@ function extractCandidateTableHtml(html: string): string[] {
 }
 
 // Helper to find header row in a table
-function findHeaderRow(table: Element, debugMode = false): Element | null {
-  const rows = (table as Element).querySelectorAll("tr");
+function findHeaderRow(table: any, debugMode = false): any | null {
+  const rows = table.querySelectorAll("tr");
   
-  // Scan first ~5 rows to find the header
   const maxHeaderScan = Math.min(5, rows.length);
   
   for (let i = 0; i < maxHeaderScan; i++) {
-    const row = rows[i] as Element;
+    const row = rows[i];
     const rowText = row.textContent?.toLowerCase() || "";
     
-    // Header must contain fair value/market value (relaxed: cost is optional)
     const hasFairValue = rowText.includes("fair value") || 
                         rowText.includes("market value") ||
                         rowText.includes("fair");
-    const hasCost = rowText.includes("cost") || rowText.includes("amortized");
     const hasCompany = rowText.includes("company") || 
                        rowText.includes("portfolio") || 
                        rowText.includes("name") ||
                        rowText.includes("issuer") ||
                        rowText.includes("investment");
     
-    // Accept header if it has fair value + company, cost is optional
     if (hasFairValue && hasCompany) {
       if (debugMode) {
         const headerCells = Array.from(row.querySelectorAll("th, td"));
-        const headers = headerCells.map(h => (h as Element).textContent?.trim() || "");
+        const headers = headerCells.map((h: any) => h.textContent?.trim() || "");
         console.log("✓ Found candidate header row:", headers);
       }
       return row;
@@ -192,15 +181,14 @@ function findHeaderRow(table: Element, debugMode = false): Element | null {
 }
 
 // Parse tables looking for Schedule of Investments
-function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number, debugMode = false): Holding[] {
+function parseTables(tables: any[], maxRowsPerTable: number, maxHoldings: number, debugMode = false): Holding[] {
   const holdings: Holding[] = [];
   
   let tableIndex = 0;
   for (const table of tables) {
     tableIndex++;
     
-    // Find the header row (don't assume it's the first row)
-    const headerRow = findHeaderRow(table as Element, debugMode);
+    const headerRow = findHeaderRow(table, debugMode);
     if (!headerRow) {
       if (debugMode && tableIndex <= 10) {
         console.log(`⊗ Table ${tableIndex}: No valid header row found`);
@@ -208,10 +196,9 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       continue;
     }
     
-    // Find column indices
     const headerCells = Array.from(headerRow.querySelectorAll("th, td"));
     const headers = headerCells.map(
-      (h) => (h as Element).textContent?.toLowerCase().trim() || ""
+      (h: any) => h.textContent?.toLowerCase().trim() || ""
     );
     
     if (debugMode) {
@@ -263,10 +250,9 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       console.log("Column indices:", colIndices);
     }
     
-    // Must have at least company and fair value columns
     if (colIndices.company === -1 || colIndices.fairValue === -1) {
       if (debugMode) {
-        console.log(`⊗ Table ${tableIndex}: Missing required columns (company: ${colIndices.company}, fairValue: ${colIndices.fairValue})`);
+        console.log(`⊗ Table ${tableIndex}: Missing required columns`);
       }
       continue;
     }
@@ -275,10 +261,8 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       console.log(`✓ Table ${tableIndex}: Valid structure, attempting to parse rows...`);
     }
     
-    // Parse data rows
-    const rows = (table as Element).querySelectorAll("tr");
+    const rows = table.querySelectorAll("tr");
     
-    // Find the index of the header row
     let headerRowIndex = 0;
     for (let idx = 0; idx < rows.length; idx++) {
       if (rows[idx] === headerRow) {
@@ -287,20 +271,18 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       }
     }
     
-    // Cap the number of rows we process per table to prevent blowup
     const rowsToProcess = Math.min(rows.length, headerRowIndex + maxRowsPerTable + 1);
     
     for (let i = headerRowIndex + 1; i < rowsToProcess; i++) {
-      const row = rows[i] as Element;
+      const row = rows[i];
       const cellNodes = Array.from(row.querySelectorAll("td"));
-      const cells = cellNodes.map(c => c as Element);
+      const cells = cellNodes.map((c: any) => c);
       
       if (cells.length === 0) continue;
       
       const companyName = cells[colIndices.company]?.textContent?.trim();
       if (!companyName || companyName.length < 2) continue;
       
-      // Skip subtotal/total rows
       if (
         companyName.toLowerCase().includes("total") ||
         companyName.toLowerCase().includes("subtotal")
@@ -351,19 +333,16 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
         ),
       };
       
-      // Only add if we have fair value (required field)
       if (holding.fair_value !== null) {
         holdings.push(holding);
       }
       
-      // Cap total holdings to prevent excessive memory usage
       if (holdings.length >= maxHoldings) {
         console.log(`Reached max holdings cap (${maxHoldings}), stopping parse`);
         return holdings;
       }
     }
     
-    // If we found holdings in this table, stop searching
     if (holdings.length > 0) {
       return holdings;
     }
@@ -374,18 +353,20 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
 
 // Parse HTML Schedule of Investments table from snippets
 function parseHtmlScheduleOfInvestments(html: string, debugMode = false): Holding[] {
-  const maxRowsPerTable = 500;
-  const maxHoldings = 1000;
+  const maxRowsPerTable = 1000;
+  const maxHoldings = 5000;
+  
+  // Import JSDOM for Lambda environment
+  const { JSDOM } = require('jsdom');
   
   try {
-    // First try: Extract only relevant HTML snippets
     const snippets = extractCandidateTableHtml(html);
     
     for (const snippet of snippets) {
-      const doc = new DOMParser().parseFromString(snippet, "text/html");
-      if (!doc) continue;
+      const dom = new JSDOM(snippet);
+      const doc = dom.window.document;
       
-      const tables = Array.from(doc.querySelectorAll("table")) as Element[];
+      const tables = Array.from(doc.querySelectorAll("table"));
       const holdings = parseTables(tables, maxRowsPerTable, maxHoldings, debugMode);
       
       if (holdings.length > 0) {
@@ -394,8 +375,7 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): Holdin
       }
     }
     
-    // No full-document fallback to avoid WORKER_LIMIT on large filings
-    console.log("No holdings found in snippets; returning empty result without full-document fallback");
+    console.log("No holdings found in snippets");
   }
   catch (error) {
     console.error("Error parsing HTML:", error);
@@ -404,98 +384,62 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): Holdin
   return [];
 }
 
-// Main serve function
-serve(async (req) => {
-  if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
-  }
-
+export const handler: Handler = async (event: LambdaEvent) => {
   try {
-    const { filingId, mode } = await req.json();
+    const body: RequestBody = JSON.parse(event.body);
+    const { filingId } = body;
 
     if (!filingId) {
-      throw new Error("filingId is required");
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ error: "filingId is required" }),
+      };
     }
 
-    const supabaseClient = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return {
+        statusCode: 500,
+        body: JSON.stringify({ error: "Missing Supabase configuration" }),
+      };
+    }
+
+    console.log(`Processing filing: ${filingId}`);
+
+    // Fetch filing details from Supabase
+    const filingResponse = await fetch(
+      `${SUPABASE_URL}/rest/v1/filings?id=eq.${filingId}&select=*,bdcs(cik,bdc_name)`,
+      {
+        headers: {
+          'apikey': SUPABASE_SERVICE_ROLE_KEY,
+          'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+        },
+      }
     );
 
-    // Fetch filing details
-    const { data: filing, error: filingError } = await supabaseClient
-      .from("filings")
-      .select(`
-        *,
-        bdcs (cik, bdc_name)
-      `)
-      .eq("id", filingId)
-      .single();
-
-    if (filingError) {
-      throw new Error(`Filing not found: ${filingError.message}`);
+    if (!filingResponse.ok) {
+      throw new Error(`Failed to fetch filing: ${filingResponse.statusText}`);
     }
 
+    const filings = await filingResponse.json();
+    if (!filings || filings.length === 0) {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: "Filing not found" }),
+      };
+    }
+
+    const filing = filings[0];
     const cik = filing.bdcs.cik;
     const accessionNo = filing.sec_accession_no;
     const bdcName = filing.bdcs.bdc_name;
 
     console.log(`Extracting holdings for filing ${accessionNo} (CIK: ${cik}, BDC: ${bdcName})`);
-    
-    // Decide whether to use Lambda or local parsing
-    const useLocal = mode === "local";
-    const useLambda = !useLocal && LAMBDA_PARSER_URL;
-    
-    if (useLambda) {
-      console.log(`Delegating to Lambda parser: ${LAMBDA_PARSER_URL}`);
-      
-      try {
-        const lambdaResponse = await fetch(LAMBDA_PARSER_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ filingId }),
-        });
-        
-        if (!lambdaResponse.ok) {
-          const errorText = await lambdaResponse.text();
-          throw new Error(`Lambda parser failed (${lambdaResponse.status}): ${errorText}`);
-        }
-        
-        const lambdaResult = await lambdaResponse.json();
-        
-        console.log(`Lambda returned: ${lambdaResult.holdingsInserted} holdings inserted`);
-        
-        return new Response(
-          JSON.stringify(lambdaResult),
-          {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      } catch (lambdaError) {
-        console.error("Error calling Lambda parser:", lambdaError);
-        return new Response(
-          JSON.stringify({ 
-            error: `Lambda parser error: ${lambdaError instanceof Error ? lambdaError.message : "Unknown error"}` 
-          }),
-          {
-            status: 500,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-    }
-    
-    // Fall back to local parsing (for debugging or if Lambda not configured)
-    console.log(`Using local parser (mode: ${mode || "default"})`);
-    console.log(`⚠️ Local parsing is limited to small filings to avoid WORKER_LIMIT`);
 
     // Build filing document URL
     const accessionNoNoDashes = accessionNo.replace(/-/g, "");
-    const paddedCik = cik.replace(/^0+/, ""); // Remove leading zeros for URL
+    const paddedCik = cik.replace(/^0+/, "");
     
-    // Try to fetch the primary filing document (usually the .htm file)
     const indexUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/index.json`;
     console.log(`Index URL: ${indexUrl}`);
     
@@ -503,47 +447,26 @@ serve(async (req) => {
     const warnings: string[] = [];
     let docUrl = "";
     
-    // Enable debug mode for specific test filing
-    const debugMode = accessionNo === "0001104659-25-108820";
-    if (debugMode) {
-      console.log("\n🔍 DEBUG MODE ENABLED for test filing 0001104659-25-108820\n");
-    }
-    
     try {
-      // Fetch the filing index to find the primary document
       const indexJson = await fetchSecFile(indexUrl);
       const index = JSON.parse(indexJson);
       
-      // Log all available documents for debugging
-      if (debugMode && index.directory?.item) {
-        console.log("\n=== Available documents in index.json ===");
-        index.directory.item.forEach((item: any, idx: number) => {
-          console.log(`${idx + 1}. ${item.name} (type: ${item.type || 'N/A'})`);
-        });
-        console.log("=====================================\n");
-      }
-      
-      // Find all .htm documents (not just primary)
       const htmDocs = (index.directory?.item || []).filter(
         (item: any) => item.name.endsWith(".htm") || item.name.endsWith(".html")
       );
       
-      // Prioritize documents that might contain schedules
       const prioritizedDocs = [...htmDocs].sort((a: any, b: any) => {
         const aName = a.name.toLowerCase();
         const bName = b.name.toLowerCase();
         
-        // Highest priority: documents with "schedule", "soi", "portfolio" in name
         const aIsSchedule = aName.includes("schedule") || aName.includes("soi") || aName.includes("portfolio");
         const bIsSchedule = bName.includes("schedule") || bName.includes("soi") || bName.includes("portfolio");
         if (aIsSchedule && !bIsSchedule) return -1;
         if (!aIsSchedule && bIsSchedule) return 1;
         
-        // Next priority: primary document
         if (a.type === "primary" && b.type !== "primary") return -1;
         if (a.type !== "primary" && b.type === "primary") return 1;
         
-        // Deprioritize documents with underscores (usually graphics/exhibits)
         const aHasUnderscore = aName.includes("_");
         const bHasUnderscore = bName.includes("_");
         if (!aHasUnderscore && bHasUnderscore) return -1;
@@ -552,42 +475,27 @@ serve(async (req) => {
         return 0;
       });
       
-      if (debugMode) {
-        console.log("\n=== Document processing order ===");
-        prioritizedDocs.forEach((doc: any, idx: number) => {
-          console.log(`${idx + 1}. ${doc.name} (type: ${doc.type || 'N/A'})`);
-        });
-        console.log("=================================\n");
-      }
+      console.log(`Processing ${prioritizedDocs.length} documents`);
       
-      // Try parsing each document until we find holdings
       for (const doc of prioritizedDocs) {
         docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/${doc.name}`;
         console.log(`\n📄 Trying document: ${doc.name}`);
-        console.log(`   URL: ${docUrl}`);
         
         try {
           const html = await fetchSecFile(docUrl);
           console.log(`   Size: ${(html.length / 1024).toFixed(0)} KB`);
           
-          // Hard limit: Skip documents over 1MB to avoid WORKER_LIMIT
-          if (html.length > 1_000_000) {
-            warnings.push(`Document ${doc.name} too large to safely parse (${(html.length / 1024).toFixed(0)} KB > 1MB). Skipping.`);
-            console.log(`   ⚠️ Document too large, skipping`);
-            continue;
-          }
-          
-          holdings = parseHtmlScheduleOfInvestments(html, debugMode);
+          holdings = parseHtmlScheduleOfInvestments(html, false);
           
           console.log(`   Result: ${holdings.length} holdings found`);
           
           if (holdings.length > 0) {
             console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name}`);
-            break; // Stop trying more documents
+            break;
           }
         } catch (docError) {
           console.error(`   Error parsing ${doc.name}:`, docError);
-          continue; // Try next document
+          continue;
         }
       }
       
@@ -599,71 +507,81 @@ serve(async (req) => {
       warnings.push(`Parsing error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
     
-    // If we found holdings, insert them
+    // Insert holdings into Supabase
     if (holdings.length > 0) {
       const holdingsToInsert = holdings.map((h) => ({
         filing_id: filingId,
         ...h,
       }));
 
-      const { error: insertError } = await supabaseClient
-        .from("holdings")
-        .insert(holdingsToInsert);
+      const insertResponse = await fetch(
+        `${SUPABASE_URL}/rest/v1/holdings`,
+        {
+          method: 'POST',
+          headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            'Prefer': 'return=minimal',
+          },
+          body: JSON.stringify(holdingsToInsert),
+        }
+      );
 
-      if (insertError) {
-        throw new Error(`Error inserting holdings: ${insertError.message}`);
+      if (!insertResponse.ok) {
+        const errorText = await insertResponse.text();
+        throw new Error(`Error inserting holdings: ${errorText}`);
       }
 
       // Mark filing as parsed successfully
-      const { error: updateError } = await supabaseClient
-        .from("filings")
-        .update({ parsed_successfully: true })
-        .eq("id", filingId);
+      const updateResponse = await fetch(
+        `${SUPABASE_URL}/rest/v1/filings?id=eq.${filingId}`,
+        {
+          method: 'PATCH',
+          headers: {
+            'apikey': SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ parsed_successfully: true }),
+        }
+      );
 
-      if (updateError) {
-        console.error("Error updating filing status:", updateError);
+      if (!updateResponse.ok) {
+        console.error("Error updating filing status:", await updateResponse.text());
       }
 
       console.log(`Inserted ${holdingsToInsert.length} holdings for filing ${accessionNo}`);
 
-      return new Response(
-        JSON.stringify({
+      return {
+        statusCode: 200,
+        body: JSON.stringify({
           filingId,
           holdingsInserted: holdingsToInsert.length,
           warnings: warnings.length > 0 ? warnings : undefined,
         }),
-        {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        }
-      );
+      };
     } else {
-      // No holdings found - return 200 with warnings
-      warnings.push("No holdings found in filing (snippet-based parsing only)");
+      warnings.push("No holdings found in filing");
       
       console.log(`No holdings found. Index URL: ${indexUrl}`);
       console.log(`Doc URL: ${docUrl}`);
       
-      return new Response(
-        JSON.stringify({
+      return {
+        statusCode: 200,
+        body: JSON.stringify({
           filingId,
           holdingsInserted: 0,
           warnings,
         }),
-        {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-          status: 200,
-        }
-      );
+      };
     }
   } catch (error) {
-    console.error("Error in extract_holdings_for_filing:", error);
+    console.error("Error in Lambda handler:", error);
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    return new Response(
-      JSON.stringify({ error: errorMessage }),
-      {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: errorMessage }),
+    };
   }
-});
+};
