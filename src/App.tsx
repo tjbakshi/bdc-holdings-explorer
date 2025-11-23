@@ -7,6 +7,7 @@ import Index from "./pages/Index";
 import BdcDetail from "./pages/BdcDetail";
 import CompanyDetail from "./pages/CompanyDetail";
 import HoldingDetail from "./pages/HoldingDetail";
+import Admin from "./pages/Admin";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -22,6 +23,7 @@ const App = () => (
           <Route path="/bdc/:bdcId" element={<BdcDetail />} />
           <Route path="/company/:companyName" element={<CompanyDetail />} />
           <Route path="/holding/:holdingId" element={<HoldingDetail />} />
+          <Route path="/admin" element={<Admin />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
         </Routes>
