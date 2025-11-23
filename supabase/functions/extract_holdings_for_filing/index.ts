@@ -155,7 +155,7 @@ function extractCandidateTableHtml(html: string): string[] {
 }
 
 // Helper to find header row in a table
-function findHeaderRow(table: Element): Element | null {
+function findHeaderRow(table: Element, debugMode = false): Element | null {
   const rows = (table as Element).querySelectorAll("tr");
   
   // Scan first ~5 rows to find the header
@@ -165,11 +165,24 @@ function findHeaderRow(table: Element): Element | null {
     const row = rows[i] as Element;
     const rowText = row.textContent?.toLowerCase() || "";
     
-    // Header must contain BOTH fair value/market value AND cost/amortized
-    const hasFairValue = rowText.includes("fair value") || rowText.includes("market value");
+    // Header must contain fair value/market value (relaxed: cost is optional)
+    const hasFairValue = rowText.includes("fair value") || 
+                        rowText.includes("market value") ||
+                        rowText.includes("fair");
     const hasCost = rowText.includes("cost") || rowText.includes("amortized");
+    const hasCompany = rowText.includes("company") || 
+                       rowText.includes("portfolio") || 
+                       rowText.includes("name") ||
+                       rowText.includes("issuer") ||
+                       rowText.includes("investment");
     
-    if (hasFairValue && hasCost) {
+    // Accept header if it has fair value + company, cost is optional
+    if (hasFairValue && hasCompany) {
+      if (debugMode) {
+        const headerCells = Array.from(row.querySelectorAll("th, td"));
+        const headers = headerCells.map(h => (h as Element).textContent?.trim() || "");
+        console.log("✓ Found candidate header row:", headers);
+      }
       return row;
     }
   }
@@ -178,13 +191,21 @@ function findHeaderRow(table: Element): Element | null {
 }
 
 // Parse tables looking for Schedule of Investments
-function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number): Holding[] {
+function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number, debugMode = false): Holding[] {
   const holdings: Holding[] = [];
   
+  let tableIndex = 0;
   for (const table of tables) {
+    tableIndex++;
+    
     // Find the header row (don't assume it's the first row)
-    const headerRow = findHeaderRow(table as Element);
-    if (!headerRow) continue;
+    const headerRow = findHeaderRow(table as Element, debugMode);
+    if (!headerRow) {
+      if (debugMode && tableIndex <= 10) {
+        console.log(`⊗ Table ${tableIndex}: No valid header row found`);
+      }
+      continue;
+    }
     
     // Find column indices
     const headerCells = Array.from(headerRow.querySelectorAll("th, td"));
@@ -192,38 +213,66 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       (h) => (h as Element).textContent?.toLowerCase().trim() || ""
     );
     
+    if (debugMode) {
+      console.log(`\n=== Table ${tableIndex} Headers ===`);
+      console.log("Raw headers:", headers);
+    }
+    
     const colIndices = {
       company: headers.findIndex((h) => 
-        h.includes("company") || h.includes("portfolio") || h.includes("name") || h.includes("issuer")
+        h.includes("company") || 
+        h.includes("portfolio") || 
+        h.includes("name") || 
+        h.includes("issuer") ||
+        h.includes("borrower") ||
+        h.includes("investment")
       ),
       investmentType: headers.findIndex((h) => 
-        h.includes("type") || h.includes("instrument")
+        h.includes("type") || h.includes("instrument") || h.includes("class")
       ),
       industry: headers.findIndex((h) => 
         h.includes("industry") || h.includes("sector")
       ),
       description: headers.findIndex((h) => 
-        h.includes("description") || h.includes("investment")
+        h.includes("description") || h.includes("notes")
       ),
       interestRate: headers.findIndex((h) => 
-        h.includes("interest") || h.includes("rate") || h.includes("coupon")
+        h.includes("interest") || h.includes("rate") || h.includes("coupon") || h.includes("spread")
       ),
       maturity: headers.findIndex((h) => 
-        h.includes("maturity") || h.includes("expiration")
+        h.includes("maturity") || h.includes("expiration") || h.includes("due")
       ),
       par: headers.findIndex((h) => 
-        h.includes("par") || h.includes("principal") || h.includes("face")
+        h.includes("par") || 
+        h.includes("principal") || 
+        h.includes("face") ||
+        (h.includes("amount") && !h.includes("fair") && !h.includes("cost"))
       ),
       cost: headers.findIndex((h) => 
         h.includes("cost") || h.includes("amortized")
       ),
       fairValue: headers.findIndex((h) => 
-        h.includes("fair value") || h.includes("market value")
+        h.includes("fair") || 
+        h.includes("market") ||
+        (h.includes("value") && !h.includes("par"))
       ),
     };
     
+    if (debugMode) {
+      console.log("Column indices:", colIndices);
+    }
+    
     // Must have at least company and fair value columns
-    if (colIndices.company === -1 || colIndices.fairValue === -1) continue;
+    if (colIndices.company === -1 || colIndices.fairValue === -1) {
+      if (debugMode) {
+        console.log(`⊗ Table ${tableIndex}: Missing required columns (company: ${colIndices.company}, fairValue: ${colIndices.fairValue})`);
+      }
+      continue;
+    }
+    
+    if (debugMode) {
+      console.log(`✓ Table ${tableIndex}: Valid structure, attempting to parse rows...`);
+    }
     
     // Parse data rows
     const rows = (table as Element).querySelectorAll("tr");
@@ -323,7 +372,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
 }
 
 // Parse HTML Schedule of Investments table from snippets
-function parseHtmlScheduleOfInvestments(html: string): Holding[] {
+function parseHtmlScheduleOfInvestments(html: string, debugMode = false): Holding[] {
   const maxRowsPerTable = 1000;
   const maxHoldings = 2000;
   
@@ -336,7 +385,7 @@ function parseHtmlScheduleOfInvestments(html: string): Holding[] {
       if (!doc) continue;
       
       const tables = Array.from(doc.querySelectorAll("table")) as Element[];
-      const holdings = parseTables(tables, maxRowsPerTable, maxHoldings);
+      const holdings = parseTables(tables, maxRowsPerTable, maxHoldings, debugMode);
       
       if (holdings.length > 0) {
         console.log(`Found ${holdings.length} holdings in snippet`);
@@ -349,7 +398,7 @@ function parseHtmlScheduleOfInvestments(html: string): Holding[] {
     const fullDoc = new DOMParser().parseFromString(html, "text/html");
     if (fullDoc) {
       const allTables = Array.from(fullDoc.querySelectorAll("table")) as Element[];
-      const holdings = parseTables(allTables, maxRowsPerTable, maxHoldings);
+      const holdings = parseTables(allTables, maxRowsPerTable, maxHoldings, debugMode);
       
       if (holdings.length > 0) {
         console.log(`Found ${holdings.length} holdings in full-table fallback`);
@@ -408,36 +457,95 @@ serve(async (req) => {
     
     // Try to fetch the primary filing document (usually the .htm file)
     const indexUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/index.json`;
+    console.log(`Index URL: ${indexUrl}`);
     
     let holdings: Holding[] = [];
     const warnings: string[] = [];
     let docUrl = "";
+    
+    // Enable debug mode for specific test filing
+    const debugMode = accessionNo === "0001104659-25-108820";
+    if (debugMode) {
+      console.log("\n🔍 DEBUG MODE ENABLED for test filing 0001104659-25-108820\n");
+    }
     
     try {
       // Fetch the filing index to find the primary document
       const indexJson = await fetchSecFile(indexUrl);
       const index = JSON.parse(indexJson);
       
-      // Find the primary document (usually the main .htm file)
-      const primaryDoc = index.directory?.item?.find(
-        (item: any) => 
-          item.name.endsWith(".htm") && 
-          !item.name.includes("_") && 
-          item.type === "primary"
-      ) || index.directory?.item?.find(
-        (item: any) => item.name.endsWith(".htm")
+      // Log all available documents for debugging
+      if (debugMode && index.directory?.item) {
+        console.log("\n=== Available documents in index.json ===");
+        index.directory.item.forEach((item: any, idx: number) => {
+          console.log(`${idx + 1}. ${item.name} (type: ${item.type || 'N/A'})`);
+        });
+        console.log("=====================================\n");
+      }
+      
+      // Find all .htm documents (not just primary)
+      const htmDocs = (index.directory?.item || []).filter(
+        (item: any) => item.name.endsWith(".htm") || item.name.endsWith(".html")
       );
       
-      if (primaryDoc) {
-        docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/${primaryDoc.name}`;
-        console.log(`Fetching primary document: ${docUrl}`);
+      // Prioritize documents that might contain schedules
+      const prioritizedDocs = [...htmDocs].sort((a: any, b: any) => {
+        const aName = a.name.toLowerCase();
+        const bName = b.name.toLowerCase();
         
-        const html = await fetchSecFile(docUrl);
-        holdings = parseHtmlScheduleOfInvestments(html);
+        // Highest priority: documents with "schedule", "soi", "portfolio" in name
+        const aIsSchedule = aName.includes("schedule") || aName.includes("soi") || aName.includes("portfolio");
+        const bIsSchedule = bName.includes("schedule") || bName.includes("soi") || bName.includes("portfolio");
+        if (aIsSchedule && !bIsSchedule) return -1;
+        if (!aIsSchedule && bIsSchedule) return 1;
         
-        console.log(`Parsed ${holdings.length} holdings from HTML`);
-      } else {
-        warnings.push("Could not locate primary filing document");
+        // Next priority: primary document
+        if (a.type === "primary" && b.type !== "primary") return -1;
+        if (a.type !== "primary" && b.type === "primary") return 1;
+        
+        // Deprioritize documents with underscores (usually graphics/exhibits)
+        const aHasUnderscore = aName.includes("_");
+        const bHasUnderscore = bName.includes("_");
+        if (!aHasUnderscore && bHasUnderscore) return -1;
+        if (aHasUnderscore && !bHasUnderscore) return 1;
+        
+        return 0;
+      });
+      
+      if (debugMode) {
+        console.log("\n=== Document processing order ===");
+        prioritizedDocs.forEach((doc: any, idx: number) => {
+          console.log(`${idx + 1}. ${doc.name} (type: ${doc.type || 'N/A'})`);
+        });
+        console.log("=================================\n");
+      }
+      
+      // Try parsing each document until we find holdings
+      for (const doc of prioritizedDocs) {
+        docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/${doc.name}`;
+        console.log(`\n📄 Trying document: ${doc.name}`);
+        console.log(`   URL: ${docUrl}`);
+        
+        try {
+          const html = await fetchSecFile(docUrl);
+          console.log(`   Size: ${(html.length / 1024).toFixed(0)} KB`);
+          
+          holdings = parseHtmlScheduleOfInvestments(html, debugMode);
+          
+          console.log(`   Result: ${holdings.length} holdings found`);
+          
+          if (holdings.length > 0) {
+            console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name}`);
+            break; // Stop trying more documents
+          }
+        } catch (docError) {
+          console.error(`   Error parsing ${doc.name}:`, docError);
+          continue; // Try next document
+        }
+      }
+      
+      if (holdings.length === 0 && prioritizedDocs.length === 0) {
+        warnings.push("Could not locate any HTML documents in filing");
       }
     } catch (error) {
       console.error("Error fetching/parsing filing:", error);
