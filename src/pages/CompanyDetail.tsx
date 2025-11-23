@@ -287,6 +287,7 @@ const CompanyDetail = () => {
                     <TableHead className="text-right">Fair Value</TableHead>
                     <TableHead className="text-right">FMV % Par</TableHead>
                     <TableHead className="text-right">FMV % Cost</TableHead>
+                    <TableHead>Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -322,6 +323,13 @@ const CompanyDetail = () => {
                       </TableCell>
                       <TableCell className="text-right font-medium">
                         {calculateFmvCost(holding.fair_value, holding.cost)?.toFixed(2) + "%" || "—"}
+                      </TableCell>
+                      <TableCell>
+                        <Link to={`/holding/${holding.id}`}>
+                          <Button variant="outline" size="sm">
+                            View Details
+                          </Button>
+                        </Link>
                       </TableCell>
                     </TableRow>
                   ))}
