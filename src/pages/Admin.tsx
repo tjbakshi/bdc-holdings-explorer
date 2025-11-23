@@ -23,6 +23,7 @@ export default function Admin() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
   const [logs, setLogs] = useState<IngestLog[]>([]);
+  const [parsingFilingIds, setParsingFilingIds] = useState<Set<string>>(new Set());
 
   const { data: bdcs } = useQuery({
     queryKey: ["bdcs-admin"],
@@ -120,31 +121,68 @@ export default function Admin() {
         filingsData.cik
       );
 
-      // Extract holdings for the most recent new filing if any were inserted
-      if (filingsData.filingsInserted > 0 && filingsData.newFilingIds?.length > 0) {
-        const mostRecentFilingId = filingsData.newFilingIds[0];
-        
-        const { data: holdingsData, error: holdingsError } = await supabase.functions.invoke(
-          "extract_holdings_for_filing",
-          { body: { filingId: mostRecentFilingId } }
-        );
+      // Query for existing unparsed filings for this BDC
+      const { data: unparsedFilings, error: unparsedError } = await supabase
+        .from("filings")
+        .select("id, sec_accession_no")
+        .eq("bdc_id", selectedBdcId)
+        .eq("parsed_successfully", false)
+        .order("period_end", { ascending: false })
+        .limit(5);
 
-        if (holdingsError) throw holdingsError;
+      if (unparsedError) throw unparsedError;
 
-        addLog(
-          "extract_holdings_for_filing",
-          `Inserted ${holdingsData.holdingsInserted} holdings for filing`,
-          filingsData.cik
-        );
+      // Parse unparsed filings
+      let totalHoldingsInserted = 0;
+      let filingsParsed = 0;
 
+      if (unparsedFilings && unparsedFilings.length > 0) {
+        for (const filing of unparsedFilings) {
+          try {
+            const { data: holdingsData, error: holdingsError } = await supabase.functions.invoke(
+              "extract_holdings_for_filing",
+              { body: { filingId: filing.id } }
+            );
+
+            if (holdingsError) {
+              console.error(`Error parsing filing ${filing.sec_accession_no}:`, holdingsError);
+              addLog(
+                "extract_holdings_for_filing",
+                `Error for filing ${filing.sec_accession_no}: ${holdingsError.message}`,
+                filingsData.cik
+              );
+              continue;
+            }
+
+            totalHoldingsInserted += holdingsData.holdingsInserted || 0;
+            filingsParsed += 1;
+
+            addLog(
+              "extract_holdings_for_filing",
+              `Filing ${filing.sec_accession_no}: ${holdingsData.holdingsInserted} holdings`,
+              filingsData.cik
+            );
+          } catch (error: any) {
+            console.error(`Error parsing filing ${filing.sec_accession_no}:`, error);
+            addLog(
+              "extract_holdings_for_filing",
+              `Error for filing ${filing.sec_accession_no}: ${error.message}`,
+              filingsData.cik
+            );
+          }
+        }
+      }
+
+      // Show summary toast
+      if (filingsParsed > 0) {
         toast({
           title: "Success",
-          description: `Inserted ${filingsData.filingsInserted} filings and ${holdingsData.holdingsInserted} holdings`,
+          description: `Inserted ${filingsData.filingsInserted} new filing(s). Parsed ${filingsParsed} filing(s) with ${totalHoldingsInserted} total holdings.`,
         });
       } else {
         toast({
           title: "Complete",
-          description: `Found ${filingsData.filingsFound} filings, inserted ${filingsData.filingsInserted}`,
+          description: `Found ${filingsData.filingsFound} filings, inserted ${filingsData.filingsInserted}. No unparsed filings found.`,
         });
       }
 
@@ -154,6 +192,45 @@ export default function Admin() {
       addLog("refresh_single_bdc", `Error: ${error.message}`);
     } finally {
       setLoading(null);
+    }
+  };
+
+  const handleParseFiling = async (filingId: string, accessionNo: string) => {
+    setParsingFilingIds((prev) => new Set(prev).add(filingId));
+    
+    try {
+      const { data, error } = await supabase.functions.invoke(
+        "extract_holdings_for_filing",
+        { body: { filingId } }
+      );
+
+      if (error) throw error;
+
+      addLog(
+        "extract_holdings_for_filing",
+        `Filing ${accessionNo}: ${data.holdingsInserted} holdings inserted`
+      );
+
+      toast({
+        title: "Success",
+        description: `Parsed filing ${accessionNo}. Inserted ${data.holdingsInserted} holdings.`,
+      });
+
+      refetchFilings();
+    } catch (error: any) {
+      console.error(`Error parsing filing ${accessionNo}:`, error);
+      toast({ 
+        title: "Error", 
+        description: `Failed to parse filing: ${error.message}`, 
+        variant: "destructive" 
+      });
+      addLog("extract_holdings_for_filing", `Error for ${accessionNo}: ${error.message}`);
+    } finally {
+      setParsingFilingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(filingId);
+        return next;
+      });
     }
   };
 
@@ -352,6 +429,7 @@ export default function Admin() {
                 <TableHead>Accession No</TableHead>
                 <TableHead>Parsed</TableHead>
                 <TableHead>Created</TableHead>
+                <TableHead>Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -371,6 +449,23 @@ export default function Admin() {
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {new Date(filing.created_at!).toLocaleDateString()}
+                  </TableCell>
+                  <TableCell>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handleParseFiling(filing.id, filing.sec_accession_no || filing.id)}
+                      disabled={parsingFilingIds.has(filing.id)}
+                    >
+                      {parsingFilingIds.has(filing.id) ? (
+                        <>
+                          <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                          Parsing...
+                        </>
+                      ) : (
+                        "Parse holdings"
+                      )}
+                    </Button>
                   </TableCell>
                 </TableRow>
               ))}
