@@ -33,9 +33,11 @@ serve(async (req) => {
     let totalHoldingsInserted = 0;
     const errors: string[] = [];
 
-    console.log(`Processing ${bdcs.length} BDCs`);
+    // Limit to first 10 BDCs to avoid timeout (can be increased later)
+    const bdcsToProcess = bdcs.slice(0, 10);
+    console.log(`Processing ${bdcsToProcess.length} of ${bdcs.length} BDCs`);
 
-    for (const bdc of bdcs) {
+    for (const bdc of bdcsToProcess) {
       try {
         console.log(`Processing BDC: ${bdc.bdc_name} (CIK: ${bdc.cik})`);
 
@@ -120,7 +122,8 @@ serve(async (req) => {
 
     return new Response(
       JSON.stringify({
-        bdcCount: bdcs.length,
+        totalBdcs: bdcs.length,
+        bdcCount: bdcsToProcess.length,
         totalFilingsInserted,
         totalHoldingsInserted,
         errors,
