@@ -7,7 +7,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Loader2, Upload, RefreshCw, Database } from "lucide-react";
+import { Loader2, Upload, RefreshCw, Database, Download } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 interface IngestLog {
@@ -24,6 +24,7 @@ export default function Admin() {
   const [loading, setLoading] = useState<string | null>(null);
   const [logs, setLogs] = useState<IngestLog[]>([]);
   const [parsingFilingIds, setParsingFilingIds] = useState<Set<string>>(new Set());
+  const [backfillCik, setBackfillCik] = useState<string>("");
 
   const { data: bdcs } = useQuery({
     queryKey: ["bdcs-admin"],
@@ -308,6 +309,46 @@ export default function Admin() {
     }
   };
 
+  const handleBackfillSec = async () => {
+    if (!backfillCik.trim()) {
+      toast({ title: "Error", description: "Please enter a CIK", variant: "destructive" });
+      return;
+    }
+
+    setLoading("backfill");
+    try {
+      const { data, error } = await supabase.functions.invoke("sec-ingest", {
+        body: { cik: backfillCik.trim() },
+      });
+
+      if (error) throw error;
+
+      if (data.error) {
+        throw new Error(data.error);
+      }
+
+      addLog(
+        "sec-ingest",
+        `${data.companyName}: Found ${data.filingsFound} filings, inserted ${data.filingsInserted}`,
+        data.cik
+      );
+
+      toast({
+        title: "Success",
+        description: `Ingested ${data.filingsInserted} new filings for ${data.companyName}`,
+      });
+
+      setBackfillCik("");
+      refetchFilings();
+    } catch (error: unknown) {
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      toast({ title: "Error", description: errorMsg, variant: "destructive" });
+      addLog("sec-ingest", `Error: ${errorMsg}`, backfillCik);
+    } finally {
+      setLoading(null);
+    }
+  };
+
   return (
     <div className="container mx-auto py-8 space-y-8">
       <div className="flex items-center justify-between">
@@ -320,7 +361,43 @@ export default function Admin() {
       </div>
 
       {/* Actions Panel */}
-      <div className="grid gap-6 md:grid-cols-3">
+      <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
+        {/* Backfill SEC Filings */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Download className="h-5 w-5" />
+              Backfill SEC Filings
+            </CardTitle>
+            <CardDescription>
+              Enter a CIK to fetch all 10-K/10-Q filings from SEC
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Input
+              type="text"
+              placeholder="e.g. 0001287750"
+              value={backfillCik}
+              onChange={(e) => setBackfillCik(e.target.value)}
+              disabled={loading === "backfill"}
+            />
+            <Button
+              onClick={handleBackfillSec}
+              disabled={!backfillCik.trim() || loading === "backfill"}
+              className="w-full"
+            >
+              {loading === "backfill" ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Fetching...
+                </>
+              ) : (
+                "Backfill SEC Filings"
+              )}
+            </Button>
+          </CardContent>
+        </Card>
+
         {/* Upload BDC Universe */}
         <Card>
           <CardHeader>

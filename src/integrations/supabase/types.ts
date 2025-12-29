@@ -151,6 +151,39 @@ export type Database = {
           },
         ]
       }
+      ingestion_runs: {
+        Row: {
+          cik: string
+          created_at: string | null
+          error_message: string | null
+          finished_at: string | null
+          id: string
+          inserted_count: number | null
+          started_at: string
+          status: string
+        }
+        Insert: {
+          cik: string
+          created_at?: string | null
+          error_message?: string | null
+          finished_at?: string | null
+          id?: string
+          inserted_count?: number | null
+          started_at?: string
+          status?: string
+        }
+        Update: {
+          cik?: string
+          created_at?: string | null
+          error_message?: string | null
+          finished_at?: string | null
+          id?: string
+          inserted_count?: number | null
+          started_at?: string
+          status?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       latest_filings: {

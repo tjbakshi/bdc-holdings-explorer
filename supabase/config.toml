@@ -1,1 +1,4 @@
 project_id = "qswmkujzegjchwllecgo"
+
+[functions.sec-ingest]
+verify_jwt = false
