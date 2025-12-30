@@ -644,9 +644,12 @@ function isInvestmentTypeLabel(text: string): boolean {
 function hasCompanySuffix(name: string): boolean {
   const lowerName = name.toLowerCase();
   
-  // Check for company suffix
+  // Check for company suffix - handle both word boundaries and end-of-string
+  // The word boundary \b doesn't work well after periods (e.g., "L.P." at end of string)
   const hasSuffix = COMPANY_SUFFIXES.some(suffix => {
-    const regex = new RegExp(`\\b${suffix.replace(/\./g, "\\.")}\\b`, "i");
+    const escapedSuffix = suffix.replace(/\./g, "\\.");
+    // Match suffix at word boundary OR at end of string (with optional trailing whitespace)
+    const regex = new RegExp(`\\b${escapedSuffix}(?:\\b|\\s*$)`, "i");
     return regex.test(lowerName);
   });
   
