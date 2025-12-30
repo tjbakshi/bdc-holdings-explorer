@@ -624,6 +624,9 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       const companyCell = getCellAtPosition(cells, colIndices.company);
       const companyCellText = companyCell?.textContent?.trim() || "";
       
+      // Check for rowspan - if the company cell has rowspan, subsequent rows won't have a company cell
+      const companyRowspan = companyCell ? parseInt(companyCell.getAttribute("rowspan") || "1", 10) : 1;
+      
       // Get the industry/business description cell (may also serve as industry indicator)
       const industryCell = colIndices.industry >= 0 ? getCellAtPosition(cells, colIndices.industry) : null;
       const industryCellText = industryCell?.textContent?.trim() || "";
@@ -654,6 +657,10 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
           // Industry can come from: the industry/business column OR the current section header
           effectiveIndustry = industryCellText || currentIndustry;
           currentIndustry = effectiveIndustry || currentIndustry;
+          
+          if (debugMode && companyRowspan > 1) {
+            console.log(`🔗 Company ${cleanedCompanyName} has rowspan=${companyRowspan}`);
+          }
         } else {
           // Might be an investment type label or subtotal - skip as company
           if (debugRejected.length < 10) {
@@ -863,10 +870,10 @@ serve(async (req) => {
     const warnings: string[] = [];
     let docUrl = "";
     
-    // Enable debug mode for specific test filing
-    const debugMode = accessionNo === "0001104659-25-108820";
+    // Enable debug mode for ARCC or specific test filings
+    const debugMode = accessionNo === "0001287750-25-000046" || accessionNo === "0001104659-25-108820";
     if (debugMode) {
-      console.log("\n🔍 DEBUG MODE ENABLED for test filing 0001104659-25-108820\n");
+      console.log(`\n🔍 DEBUG MODE ENABLED for filing ${accessionNo}\n`);
     }
     
     try {
