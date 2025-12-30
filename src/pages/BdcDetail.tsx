@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { ArrowLeft } from "lucide-react";
 
 const BdcDetail = () => {
@@ -89,14 +90,15 @@ const BdcDetail = () => {
     return ((fairValue / cost) * 100).toFixed(2) + "%";
   };
 
-  const formatCurrency = (value: number | null) => {
+  // Format currency values in millions with "M" suffix
+  const formatCurrencyMillions = (value: number | null) => {
     if (value === null || value === undefined) return "—";
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(value);
+    // Values are already in millions, format with 1 decimal and M suffix
+    if (Math.abs(value) >= 1000) {
+      // If >= 1000M, show as $X.XB
+      return `$${(value / 1000).toFixed(1)}B`;
+    }
+    return `$${value.toFixed(1)}M`;
   };
 
   const formatDate = (dateStr: string | null) => {
@@ -214,97 +216,92 @@ const BdcDetail = () => {
                   <CardTitle>Portfolio Holdings</CardTitle>
                   <CardDescription>
                     Showing {holdings.length} holdings for the selected filing period
+                    <span className="ml-2 text-xs text-muted-foreground">(Values in millions USD)</span>
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <div className="rounded-lg border overflow-x-auto">
-                    <Table>
-                      <TableHeader>
-                        <TableRow>
-                          <TableHead className="min-w-[200px]">Portfolio Company</TableHead>
-                          <TableHead>Investment Type</TableHead>
-                          <TableHead>Industry</TableHead>
-                          <TableHead className="min-w-[250px]">Description</TableHead>
-                          <TableHead>Interest Rate</TableHead>
-                          <TableHead>Reference Rate</TableHead>
-                          <TableHead>Maturity</TableHead>
-                          <TableHead className="text-right">Par Amount</TableHead>
-                          <TableHead className="text-right">Cost</TableHead>
-                          <TableHead className="text-right">Fair Value</TableHead>
-                          <TableHead className="text-right">FMV % Par</TableHead>
-                          <TableHead className="text-right">FMV % Cost</TableHead>
-                          <TableHead>Actions</TableHead>
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {holdings.map((holding) => (
-                          <TableRow key={holding.id}>
-                            <TableCell className="font-medium">
-                              <Link 
-                                to={`/company/${encodeURIComponent(holding.company_name)}`}
-                                className="hover:underline text-primary"
-                              >
-                                {holding.company_name}
-                              </Link>
-                            </TableCell>
-                            <TableCell>{holding.investment_type || "—"}</TableCell>
-                            <TableCell>{holding.industry || "—"}</TableCell>
-                            <TableCell className="text-sm">
-                              {holding.description || "—"}
-                            </TableCell>
-                            <TableCell>{holding.interest_rate || "—"}</TableCell>
-                            <TableCell>{holding.reference_rate || "—"}</TableCell>
-                            <TableCell>{formatDate(holding.maturity_date)}</TableCell>
-                            <TableCell className="text-right font-mono">
-                              {formatCurrency(holding.par_amount)}
-                            </TableCell>
-                            <TableCell className="text-right font-mono">
-                              {formatCurrency(holding.cost)}
-                            </TableCell>
-                            <TableCell className="text-right font-mono">
-                              {formatCurrency(holding.fair_value)}
-                            </TableCell>
-                            <TableCell className="text-right font-medium">
-                              {calculateFmvPar(holding.fair_value, holding.par_amount)}
-                            </TableCell>
-                            <TableCell className="text-right font-medium">
-                              {calculateFmvCost(holding.fair_value, holding.cost)}
-                            </TableCell>
-                            <TableCell>
-                              <Link to={`/holding/${holding.id}`}>
-                                <Button variant="outline" size="sm">
-                                  View Details
-                                </Button>
-                              </Link>
-                            </TableCell>
-                            <TableCell>{holding.investment_type || "—"}</TableCell>
-                            <TableCell>{holding.industry || "—"}</TableCell>
-                            <TableCell className="text-sm">
-                              {holding.description || "—"}
-                            </TableCell>
-                            <TableCell>{holding.interest_rate || "—"}</TableCell>
-                            <TableCell>{holding.reference_rate || "—"}</TableCell>
-                            <TableCell>{formatDate(holding.maturity_date)}</TableCell>
-                            <TableCell className="text-right font-mono">
-                              {formatCurrency(holding.par_amount)}
-                            </TableCell>
-                            <TableCell className="text-right font-mono">
-                              {formatCurrency(holding.cost)}
-                            </TableCell>
-                            <TableCell className="text-right font-mono">
-                              {formatCurrency(holding.fair_value)}
-                            </TableCell>
-                            <TableCell className="text-right font-medium">
-                              {calculateFmvPar(holding.fair_value, holding.par_amount)}
-                            </TableCell>
-                            <TableCell className="text-right font-medium">
-                              {calculateFmvCost(holding.fair_value, holding.cost)}
-                            </TableCell>
+                  <TooltipProvider>
+                    <div className="rounded-lg border overflow-x-auto">
+                      <Table>
+                        <TableHeader>
+                          <TableRow>
+                            <TableHead className="min-w-[200px]">Portfolio Company</TableHead>
+                            <TableHead>Investment Type</TableHead>
+                            <TableHead>Industry</TableHead>
+                            <TableHead className="min-w-[250px]">Description</TableHead>
+                            <TableHead>Interest Rate</TableHead>
+                            <TableHead>Reference Rate</TableHead>
+                            <TableHead>Maturity</TableHead>
+                            <TableHead className="text-right">
+                              <Tooltip>
+                                <TooltipTrigger>Par Amount</TooltipTrigger>
+                                <TooltipContent>Values in millions USD</TooltipContent>
+                              </Tooltip>
+                            </TableHead>
+                            <TableHead className="text-right">
+                              <Tooltip>
+                                <TooltipTrigger>Cost</TooltipTrigger>
+                                <TooltipContent>Values in millions USD</TooltipContent>
+                              </Tooltip>
+                            </TableHead>
+                            <TableHead className="text-right">
+                              <Tooltip>
+                                <TooltipTrigger>Fair Value</TooltipTrigger>
+                                <TooltipContent>Values in millions USD</TooltipContent>
+                              </Tooltip>
+                            </TableHead>
+                            <TableHead className="text-right">FMV % Par</TableHead>
+                            <TableHead className="text-right">FMV % Cost</TableHead>
+                            <TableHead>Actions</TableHead>
                           </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </div>
+                        </TableHeader>
+                        <TableBody>
+                          {holdings.map((holding) => (
+                            <TableRow key={holding.id}>
+                              <TableCell className="font-medium">
+                                <Link 
+                                  to={`/company/${encodeURIComponent(holding.company_name)}`}
+                                  className="hover:underline text-primary"
+                                >
+                                  {holding.company_name}
+                                </Link>
+                              </TableCell>
+                              <TableCell>{holding.investment_type || "—"}</TableCell>
+                              <TableCell>{holding.industry || "—"}</TableCell>
+                              <TableCell className="text-sm">
+                                {holding.description || "—"}
+                              </TableCell>
+                              <TableCell>{holding.interest_rate || "—"}</TableCell>
+                              <TableCell>{holding.reference_rate || "—"}</TableCell>
+                              <TableCell>{formatDate(holding.maturity_date)}</TableCell>
+                              <TableCell className="text-right font-mono">
+                                {formatCurrencyMillions(holding.par_amount)}
+                              </TableCell>
+                              <TableCell className="text-right font-mono">
+                                {formatCurrencyMillions(holding.cost)}
+                              </TableCell>
+                              <TableCell className="text-right font-mono">
+                                {formatCurrencyMillions(holding.fair_value)}
+                              </TableCell>
+                              <TableCell className="text-right font-medium">
+                                {calculateFmvPar(holding.fair_value, holding.par_amount)}
+                              </TableCell>
+                              <TableCell className="text-right font-medium">
+                                {calculateFmvCost(holding.fair_value, holding.cost)}
+                              </TableCell>
+                              <TableCell>
+                                <Link to={`/holding/${holding.id}`}>
+                                  <Button variant="outline" size="sm">
+                                    View Details
+                                  </Button>
+                                </Link>
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  </TooltipProvider>
                 </CardContent>
               </Card>
             )}

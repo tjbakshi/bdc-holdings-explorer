@@ -55,6 +55,7 @@ export type Database = {
           parsed_successfully: boolean | null
           period_end: string
           sec_accession_no: string | null
+          value_scale: string | null
         }
         Insert: {
           bdc_id: string
@@ -66,6 +67,7 @@ export type Database = {
           parsed_successfully?: boolean | null
           period_end: string
           sec_accession_no?: string | null
+          value_scale?: string | null
         }
         Update: {
           bdc_id?: string
@@ -77,6 +79,7 @@ export type Database = {
           parsed_successfully?: boolean | null
           period_end?: string
           sec_accession_no?: string | null
+          value_scale?: string | null
         }
         Relationships: [
           {
