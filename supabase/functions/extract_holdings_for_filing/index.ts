@@ -2255,7 +2255,7 @@ serve(async (req) => {
                                            candidateIndustry.includes('&#') ||
                                            /^[\s\u00A0—–-]+$/.test(candidateIndustry);
                       
-                      // FILTER OUT: False positive industry names (SEC form fields, table headers)
+                      // FILTER OUT: False positive industry names (SEC form fields, table headers, financial statement sections)
                       const falsePositivePatterns = [
                         /^(date|filer|accelerated|small|emerging|shell|registrant|exchange|trading|file|securities)/i,
                         /^(amortized|fair value|cost|shares|units|principal|percent|interest)/i,
@@ -2263,6 +2263,12 @@ serve(async (req) => {
                         /^(beginning|ending|balance|change|net|gross)/i,
                         /^(large|non-|smaller|accelerated filer)/i,
                         /^(unsecured|secured|senior|junior|subordinated)\s+(notes?|loans?|debt)/i,
+                        // Financial statement section headers (NOT SOI industries)
+                        /^(liabilities|assets|operating|investing|financing|stockholders|cash flow)/i,
+                        /^(less:|plus:|add:|supplemental|adjustment)/i,
+                        /^(income|expense|revenue|depreciation|amortization)/i,
+                        /^(equity|debt|credit|borrowing|dividend|distribution)/i,
+                        /^(current|non-current|long-term|short-term)/i,
                       ];
                       const isFalsePositive = falsePositivePatterns.some(p => p.test(candidateIndustry));
                       
