@@ -742,8 +742,10 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     const colIndices = {
       company: findHeader(["company", "portfolio", "name", "issuer", "borrower"]),
       investmentType: findHeader(["investment", "type", "instrument", "class"]),
-      industry: findHeader(["industry", "sector", "business"]),
-      description: findHeader(["description", "notes"]),
+      // NOTE: Industry is detected from section HEADERS (rows with empty other cells)
+      // NOT from "business description" columns which contain company descriptions
+      industry: -1, // Disabled - use section headers only via universal detection
+      description: findHeader(["description", "notes", "business"]), // Business description moved here
       interestRate: findHeader(["interest", "rate", "coupon"]),
       spread: findHeader(["spread"]),
       maturity: findHeader(["maturity date", "maturity", "expiration", "due date", "due"]),
@@ -921,9 +923,9 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
         // Check if it has a company suffix before accepting as new company
         if (hasCompanySuffix(cleanedCompanyName)) {
           currentCompany = cleanedCompanyName;
-          // Industry can come from: the industry/business column OR the current section header
-          effectiveIndustry = industryCellText || currentIndustry;
-          currentIndustry = effectiveIndustry || currentIndustry;
+          // Industry comes ONLY from section headers (currentIndustry) detected via universal detection
+          // NOT from the "business description" column which contains company-specific descriptions
+          effectiveIndustry = currentIndustry;
           
           if (debugMode && companyRowspan > 1) {
             console.log(`🔗 Company ${cleanedCompanyName} has rowspan=${companyRowspan}`);
