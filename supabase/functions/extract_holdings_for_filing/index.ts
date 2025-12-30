@@ -8,7 +8,6 @@ const corsHeaders = {
 };
 
 const SEC_USER_AGENT = "BDCTrackerApp/1.0 (contact@bdctracker.com)";
-const LAMBDA_PARSER_URL = Deno.env.get("LAMBDA_PARSER_URL");
 
 interface Holding {
   company_name: string;
@@ -441,55 +440,7 @@ serve(async (req) => {
     const bdcName = filing.bdcs.bdc_name;
 
     console.log(`Extracting holdings for filing ${accessionNo} (CIK: ${cik}, BDC: ${bdcName})`);
-    
-    // Decide whether to use Lambda or local parsing
-    const useLocal = mode === "local";
-    const useLambda = !useLocal && LAMBDA_PARSER_URL;
-    
-    if (useLambda) {
-      console.log(`Delegating to Lambda parser: ${LAMBDA_PARSER_URL}`);
-      
-      try {
-        const lambdaResponse = await fetch(LAMBDA_PARSER_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ filingId }),
-        });
-        
-        if (!lambdaResponse.ok) {
-          const errorText = await lambdaResponse.text();
-          throw new Error(`Lambda parser failed (${lambdaResponse.status}): ${errorText}`);
-        }
-        
-        const lambdaResult = await lambdaResponse.json();
-        
-        console.log(`Lambda returned: ${lambdaResult.holdingsInserted} holdings inserted`);
-        
-        return new Response(
-          JSON.stringify(lambdaResult),
-          {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      } catch (lambdaError) {
-        console.error("Error calling Lambda parser:", lambdaError);
-        return new Response(
-          JSON.stringify({ 
-            error: `Lambda parser error: ${lambdaError instanceof Error ? lambdaError.message : "Unknown error"}` 
-          }),
-          {
-            status: 500,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-    }
-    
-    // Fall back to local parsing (for debugging or if Lambda not configured)
-    console.log(`Using local parser (mode: ${mode || "default"})`);
-    console.log(`⚠️ Local parsing is limited to small filings to avoid WORKER_LIMIT`);
+    console.log(`Using local parser`);
 
     // Build filing document URL
     const accessionNoNoDashes = accessionNo.replace(/-/g, "");
