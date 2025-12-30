@@ -1715,6 +1715,20 @@ serve(async (req) => {
               } else {
                 console.log(`   📦 RESUMING extraction (${existingCount} holdings already exist)`);
               }
+
+              // Establish a stable row_number counter (so ordering matches the filing)
+              let nextRowNumber = 1;
+              if (isResume) {
+                const { data: maxRowNumberRows } = await supabaseClient
+                  .from("holdings")
+                  .select("row_number")
+                  .eq("filing_id", filingId)
+                  .order("row_number", { ascending: false, nullsFirst: false })
+                  .limit(1);
+
+                const maxExistingRowNumber = maxRowNumberRows?.[0]?.row_number ?? 0;
+                nextRowNumber = maxExistingRowNumber + 1;
+              }
               
               // Detect scale from the first part of the document
               const segmentScaleResult = detectScale(html.slice(soiStart, Math.min(soiStart + 100_000, soiEnd)));
@@ -1790,7 +1804,7 @@ serve(async (req) => {
                         par_amount: h.par_amount != null ? Math.round((h.par_amount * scale) * 10) / 10 : null,
                         cost: h.cost != null ? Math.round((h.cost * scale) * 10) / 10 : null,
                         fair_value: h.fair_value != null ? Math.round((h.fair_value * scale) * 10) / 10 : null,
-                        row_number: totalInserted + idx + 1,
+                        row_number: nextRowNumber + idx,
                       }));
                       
                       const { error: insertError } = await supabaseClient
@@ -1799,6 +1813,7 @@ serve(async (req) => {
                       
                       if (!insertError) {
                         totalInserted += holdingsToInsert.length;
+                        nextRowNumber += holdingsToInsert.length;
                         runningTotalValue += holdingsToInsert.reduce((sum, h) => sum + (h.fair_value || 0), 0);
                       }
                     }
