@@ -210,6 +210,63 @@ Deno.serve(async (req) => {
 
     console.log(`Inserted ${insertedCount} new filings`);
 
+    // Get recent filings (last 2 years) that haven't been parsed yet
+    const twoYearsAgo = new Date();
+    twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+    
+    const { data: recentFilings, error: recentError } = await supabase
+      .from("filings")
+      .select("id, sec_accession_no, filing_type, period_end")
+      .eq("bdc_id", bdcId)
+      .gte("period_end", twoYearsAgo.toISOString().split("T")[0])
+      .or("parsed_successfully.is.null,parsed_successfully.eq.false")
+      .order("period_end", { ascending: false })
+      .limit(5); // Process up to 5 recent filings
+
+    if (recentError) {
+      console.error("Failed to fetch recent filings:", recentError);
+    }
+
+    // Extract holdings from recent filings
+    let holdingsExtracted = 0;
+    const extractedFilings: string[] = [];
+
+    if (recentFilings && recentFilings.length > 0) {
+      console.log(`Found ${recentFilings.length} recent filings to extract holdings from`);
+
+      for (const filing of recentFilings) {
+        try {
+          console.log(`Extracting holdings for filing ${filing.sec_accession_no} (${filing.filing_type}, ${filing.period_end})`);
+          
+          // Call the extract_holdings_for_filing function
+          const { data: extractResult, error: extractError } = await supabase.functions.invoke(
+            "extract_holdings_for_filing",
+            {
+              body: { filingId: filing.id },
+            }
+          );
+
+          if (extractError) {
+            console.error(`Failed to extract holdings for ${filing.sec_accession_no}:`, extractError);
+            continue;
+          }
+
+          if (extractResult?.holdingsInserted) {
+            holdingsExtracted += extractResult.holdingsInserted;
+            extractedFilings.push(filing.sec_accession_no);
+            console.log(`Extracted ${extractResult.holdingsInserted} holdings from ${filing.sec_accession_no}`);
+          } else {
+            console.log(`No holdings found in ${filing.sec_accession_no}`);
+          }
+
+          // Brief delay between SEC requests
+          await new Promise((r) => setTimeout(r, 500));
+        } catch (error) {
+          console.error(`Error extracting holdings for ${filing.sec_accession_no}:`, error);
+        }
+      }
+    }
+
     // Update ingestion run as success
     await supabase
       .from("ingestion_runs")
@@ -228,6 +285,8 @@ Deno.serve(async (req) => {
         bdcId,
         filingsFound: filings.length,
         filingsInserted: insertedCount,
+        holdingsExtracted,
+        extractedFilings,
         runId,
       }),
       {
