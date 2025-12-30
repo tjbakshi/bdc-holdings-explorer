@@ -9,6 +9,12 @@ const corsHeaders = {
 
 const SEC_USER_AGENT = "BDCTrackerApp/1.0 (contact@bdctracker.com)";
 
+// Constants for resumable parsing
+const CHUNK_SIZE = 500_000; // 500KB chunks for Range header fetching
+const CPU_TIME_LIMIT_MS = 35; // Stop if we've used 35ms of CPU time
+const SEGMENT_SIZE = 150_000; // 150KB parsing segments
+const OVERLAP_SIZE = 15_000; // 15KB overlap
+
 interface Holding {
   company_name: string;
   investment_type?: string | null;
@@ -27,6 +33,12 @@ interface ScaleDetectionResult {
   scale: number; // Multiplier to convert to millions (e.g., 0.001 for thousands, 1 for millions)
   detected: 'thousands' | 'millions' | 'unknown';
   confidence: 'high' | 'medium' | 'low';
+}
+
+interface ResumableState {
+  byteOffset: number;
+  industryState: string | null;
+  totalFileSize: number | null;
 }
 
 // Detect the scale of values in a filing (thousands vs millions)
@@ -112,20 +124,39 @@ function validateScale(holdings: Holding[], scale: ScaleDetectionResult): { vali
   return { valid: true };
 }
 
-// Helper to fetch SEC files with retry
-async function fetchSecFile(url: string, retries = 2): Promise<string> {
+// Helper to fetch SEC files with retry - supports Range headers for partial fetching
+async function fetchSecFile(url: string, retries = 2, rangeStart?: number, rangeEnd?: number): Promise<{ text: string; totalSize?: number }> {
   for (let i = 0; i <= retries; i++) {
     try {
-      console.log(`Fetching: ${url}`);
-      const response = await fetch(url, {
-        headers: { "User-Agent": SEC_USER_AGENT },
-      });
+      const headers: Record<string, string> = { "User-Agent": SEC_USER_AGENT };
+      
+      if (rangeStart !== undefined && rangeEnd !== undefined) {
+        headers["Range"] = `bytes=${rangeStart}-${rangeEnd}`;
+        console.log(`Fetching range: bytes=${rangeStart}-${rangeEnd} from ${url}`);
+      } else {
+        console.log(`Fetching: ${url}`);
+      }
+      
+      const response = await fetch(url, { headers });
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      // Handle 206 Partial Content for range requests
+      if (response.status === 206 || response.ok) {
+        const text = await response.text();
+        
+        // Parse Content-Range header if present to get total size
+        const contentRange = response.headers.get("Content-Range");
+        let totalSize: number | undefined;
+        if (contentRange) {
+          const match = contentRange.match(/bytes \d+-\d+\/(\d+)/);
+          if (match) {
+            totalSize = parseInt(match[1], 10);
+          }
+        }
+        
+        return { text, totalSize };
       }
 
-      return await response.text();
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     } catch (error) {
       if (i === retries) throw error;
       console.log(`Retry ${i + 1}/${retries} for ${url}`);
@@ -145,7 +176,7 @@ function cleanCompanyName(name: string | null | undefined): string {
     // Remove superscript HTML tags if present
     .replace(/<sup>.*?<\/sup>/g, '')
     // Remove other footnote indicators like *, †, ‡, §, ¶, #
-    .replace(/\s*[\*†‡§¶#]+\s*$/g, '')
+    .replace(/\s*[\\*†‡§¶#]+\s*$/g, '')
     // Trim any trailing whitespace
     .trim();
   
@@ -493,154 +524,93 @@ function normalizeIndustryName(industryText: string): string {
 // Check if text is an exact ARCC industry category
 function isExactIndustryCategory(text: string): boolean {
   const lower = text.toLowerCase().trim();
-  return ARCC_INDUSTRY_CATEGORIES.some(cat => cat.toLowerCase() === lower) ||
-         Object.keys(INDUSTRY_NAME_MAPPINGS).includes(lower);
-}
-
-// Investment type labels that indicate this is a type description, not a company
-const INVESTMENT_TYPE_LABELS = [
-  "first lien", "second lien", "senior secured", "subordinated",
-  "mezzanine", "equity", "preferred", "common stock", "warrants",
-  "senior subordinated loans", "other equity", "preferred equity",
-  "subordinated certificates", "unitranche",
-];
-
-// Patterns that indicate the row is NOT a real holding
-const SKIP_PATTERNS = [
-  /^\d+\.?\d*\s*%/, // Starts with percentage
-  /^\$[\d,]+/, // Starts with dollar amount
-  /^\(\d/, // Starts with parenthetical number
-  /^[\d,]+$/, // Just a number
-  /^-+$/, // Just dashes
-  /^—+$/, // Just em-dashes
-  /^\s*$/, // Empty or whitespace
-  /^\d{1,2}\/\d{1,2}\/\d{2,4}/, // Starts with date
-  /^[A-Za-z]+ \d{1,2}, \d{4}/, // Date format like "September 30, 2025"
-];
-
-// Company suffixes that strongly indicate a real holding
-const COMPANY_SUFFIXES = [
-  "inc.", "inc", "llc", "l.l.c.", "lp", "l.p.", "corp.", "corp",
-  "corporation", "company", "co.", "ltd.", "ltd", "limited",
-];
-
-// Check if text is an industry section header
-function isIndustrySectionHeader(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed || trimmed.length < 3) return false;
   
-  // First check for exact ARCC industry category match
-  if (isExactIndustryCategory(trimmed)) {
-    return true;
-  }
-  
-  // Industry headers don't have company entity suffixes
-  const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Co\.|Company|Enterprises|Partners|Group)\b/i.test(trimmed);
-  if (hasCompanyEntity) return false;
-  
-  // Industry headers typically don't have $ amounts or percentages
-  const hasNumericValues = /\$[\d,]+|\d+\.\d+%|\d{1,3}(?:,\d{3})+/.test(trimmed);
-  if (hasNumericValues) return false;
-  
-  // Additional pattern matching for industries not in the exact list
-  const industryPatterns = [
-    /^software/i, /^technology/i, /^health care/i, /^healthcare/i,
-    /^financial/i, /^consumer/i, /^commercial/i, /^capital goods/i,
-    /^transportation/i, /^materials/i, /^energy/i, /^utilities/i,
-    /^media/i, /^telecommunication/i, /^insurance/i, /^banks/i,
-    /^real estate/i, /^automobiles/i, /^food/i, /^retail/i,
-    /^pharmaceuticals/i, /^semiconductors/i, /^household/i,
-  ];
-  
-  for (const pattern of industryPatterns) {
-    if (pattern.test(trimmed)) {
+  // Check exact match to known categories
+  for (const category of ARCC_INDUSTRY_CATEGORIES) {
+    if (lower === category.toLowerCase()) {
       return true;
     }
+  }
+  
+  // Check mappings
+  if (INDUSTRY_NAME_MAPPINGS[lower]) {
+    return true;
   }
   
   return false;
 }
 
-// UNIVERSAL industry header detection based on ROW STRUCTURE
-// Key insight: Industry headers have text in first cell and NOTHING else in the row
-// This works for any BDC regardless of industry naming conventions
-function isUniversalIndustryHeader(cells: Element[], firstCellText: string): boolean {
-  // Must have at least 2 cells to compare
-  if (cells.length < 2) return false;
+// Check if text matches universal industry pattern
+// Returns normalized industry name if it's a valid industry, null otherwise
+function matchUniversalIndustryPattern(text: string): string | null {
+  const lower = text.toLowerCase().trim();
   
-  // Must have text in first cell
-  if (!firstCellText || firstCellText.length === 0) return false;
+  // Check exact match to known categories first
+  for (const category of ARCC_INDUSTRY_CATEGORIES) {
+    if (lower === category.toLowerCase()) {
+      return category;
+    }
+  }
   
-  // First cell text should be reasonable length (not too long like a description)
-  if (firstCellText.length > 100) return false;
+  // Check mappings
+  if (INDUSTRY_NAME_MAPPINGS[lower]) {
+    return INDUSTRY_NAME_MAPPINGS[lower];
+  }
   
-  // Check if ALL other cells are empty or contain only whitespace/non-breaking spaces
-  const otherCellsEmpty = cells.slice(1).every(cell => {
-    const content = cell.textContent?.trim() || '';
-    // Empty or just contains whitespace/non-breaking spaces
-    return content === '' || 
-           content === '\u00A0' || 
-           content === '-' ||
-           content === '—' ||
-           /^[\s\u00A0—-]*$/.test(content);
-  });
-  
-  // If other cells have content, it's not an industry header
-  if (!otherCellsEmpty) return false;
-  
-  // Exclude known non-industry patterns
-  const excludePatterns = [
-    /^Total/i,
-    /^Subtotal/i,
-    /^Sub-total/i,
-    /^Net\b/i,
-    /^See accompanying/i,
-    /^The accompanying/i,
-    /^Notes?\s*(to|$)/i,
-    /^\(/,  // Starts with parenthesis (likely a note)
-    /^\d+$/,  // Just a number
-    /^Page \d+/i,  // Page numbers
-    /^Portfolio/i,
-    /^Balance/i,
-    /^Investments\s+at/i,
-    /^\$[\d,]+/,  // Starts with dollar amount
-    /^\d+\.?\d*\s*%/,  // Starts with percentage
-    /^(First|Second|Third|Senior|Junior|Subordinated|Mezzanine|Equity|Preferred|Common)/i, // Investment types
-    /^(As of|For the|During)/i,  // Date/period phrases
-    /^Schedule of Investments/i,  // Table title
-    /^Consolidated/i,  // Table title
+  // Skip if it has characteristics of a company name, not an industry
+  // Industry headers typically don't have these patterns:
+  const companyPatterns = [
+    /\b(inc|llc|llp|corp|corporation|company|co|ltd|limited|lp|l\.p\.|holdings?|partners?|group)\b/i,
+    /\bfirst lien\b/i,
+    /\bsecond lien\b/i,
+    /\bsenior\b/i,
+    /\bsubordinated\b/i,
+    /\bequity\b/i,
+    /\bpreferred\b/i,
+    /\bunits?\b/i,
+    /\bclass [a-z]\b/i,
+    /\bwarrants?\b/i,
+    /\brevolv/i,
+    /\bterm loan\b/i,
+    /\$\d/,  // Dollar amounts
+    /\d{1,2}\/\d{1,2}\/\d{2,4}/, // Dates
+    /\bS\+\d/i, // SOFR spread patterns
   ];
   
-  const shouldExclude = excludePatterns.some(pattern => pattern.test(firstCellText));
-  if (shouldExclude) return false;
+  for (const pattern of companyPatterns) {
+    if (pattern.test(text)) {
+      return null;
+    }
+  }
   
-  // Exclude if it has a company entity suffix (it's a company, not an industry)
-  const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Co\.|Company|Enterprises|Partners|Group)\b/i.test(firstCellText);
-  if (hasCompanyEntity) return false;
+  // Industry-like patterns (broad categories)
+  const industryPatterns = [
+    /^(software|healthcare|health care|consumer|commercial|financial|capital|technology|media|energy|utilities|insurance|banks?|transportation|materials|real estate|retail|food|pharma|telecom)/i,
+    /services$/i,
+    /equipment$/i,
+    /products$/i,
+    /retail$/i,
+  ];
   
-  // Passed all checks - this is likely an industry header
-  return true;
+  for (const pattern of industryPatterns) {
+    if (pattern.test(lower)) {
+      // This looks like an industry category - return normalized name
+      return normalizeIndustryName(text);
+    }
+  }
+  
+  return null;
 }
 
-// Legacy function for backward compatibility - now calls universal detection
-function isRowAnIndustrySectionHeader(cells: Element[], companyCellText: string, expectedCellCount: number): boolean {
-  // First try exact match (highest confidence)
-  if (isExactIndustryCategory(companyCellText)) return true;
-  
-  // Then try legacy text-based detection
-  if (isIndustrySectionHeader(companyCellText)) return true;
-  
-  // Finally use universal structure-based detection
-  return isUniversalIndustryHeader(cells, companyCellText);
-}
+// Common company suffixes that indicate we've seen a complete company name
+const COMPANY_SUFFIXES = [
+  "Inc", "Inc.", "LLC", "L.L.C.", "LP", "L.P.", "Corp", "Corp.", "Corporation",
+  "Co", "Co.", "Company", "Ltd", "Ltd.", "Limited", "LLP", "L.L.P.",
+  "Holdings", "Holding", "Partners", "Group", "Fund", "Trust",
+  "Capital", "Acquisition", "Investments", "Investment"
+];
 
-// Check if text is an investment type label (not a company name)
-function isInvestmentTypeLabel(text: string): boolean {
-  const lower = text.toLowerCase().trim();
-  return INVESTMENT_TYPE_LABELS.some(t => lower.startsWith(t) && lower.length < 50);
-}
-
-// Check if a company name appears valid (has legal suffix or entity pattern)
+// Check if text has a company suffix (to detect end of multi-line company names)
 function hasCompanySuffix(name: string): boolean {
   const lowerName = name.toLowerCase();
   
@@ -653,964 +623,528 @@ function hasCompanySuffix(name: string): boolean {
     return regex.test(lowerName);
   });
   
-  if (hasSuffix) return true;
-  
-  // Special case: names ending with common company name patterns
-  const endsWithEntityWord = /\b(enterprises|industries|technologies|systems|group|capital|solutions|services|holdings)\s*$/i.test(lowerName);
-  return endsWithEntityWord;
+  return hasSuffix;
 }
 
-// Check if a row represents an actual portfolio holding
-function isRealHolding(companyName: string, fairValue: number | null, cost: number | null): { valid: boolean; reason: string } {
-  const name = companyName.trim();
-  const lowerName = name.toLowerCase();
-  
-  // Must have a non-empty name
-  if (!name || name.length < 5) {
-    return { valid: false, reason: "Name too short" };
-  }
-  
-  // Skip if it's an industry section header
-  if (isIndustrySectionHeader(name)) {
-    return { valid: false, reason: "Industry section header" };
-  }
-  
-  // Skip if it's an investment type label
-  if (isInvestmentTypeLabel(name)) {
-    return { valid: false, reason: "Investment type label" };
-  }
-  
-  // Skip if matches any skip keywords
-  for (const keyword of SKIP_KEYWORDS) {
-    if (lowerName.includes(keyword)) {
-      return { valid: false, reason: `Contains skip keyword: "${keyword}"` };
-    }
-  }
-  
-  // Skip if matches skip patterns
-  for (const pattern of SKIP_PATTERNS) {
-    if (pattern.test(name)) {
-      return { valid: false, reason: `Matches skip pattern: ${pattern}` };
-    }
-  }
-  
-  // Must have fair value
-  if (fairValue === null) {
-    return { valid: false, reason: "No fair value" };
-  }
-  
-  // Skip if fair value is exactly 0 (usually summary rows)
-  if (fairValue === 0) {
-    return { valid: false, reason: "Fair value is 0" };
-  }
-  
-  // Check for company suffix
-  if (!hasCompanySuffix(name)) {
-    return { valid: false, reason: "No company suffix found" };
-  }
-  
-  // Additional sanity check: name should have at least 2 words
-  const wordCount = name.split(/\s+/).filter(w => w.length > 0).length;
-  if (wordCount < 2) {
-    return { valid: false, reason: "Single word name" };
-  }
-  
-  return { valid: true, reason: "Has company suffix" };
-}
-
-// Parse tables looking for Schedule of Investments with multi-line investment support
-// Optional initialIndustry parameter allows carrying industry state from previous segments
-function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number, debugMode = false, initialIndustry: string | null = null): { holdings: Holding[]; lastIndustry: string | null } {
+// Parse the Schedule of Investments from HTML
+// Returns holdings and the last industry seen (for carry-forward between segments)
+function parseHtmlScheduleOfInvestments(
+  html: string, 
+  debugMode = false, 
+  carryIndustry: string | null = null
+): { holdings: Holding[]; scaleResult: ScaleDetectionResult; lastIndustry: string | null } {
   const holdings: Holding[] = [];
+  const scaleResult = detectScale(html);
+  
+  // Parse HTML
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  if (!doc) {
+    console.log("Failed to parse HTML");
+    return { holdings, scaleResult, lastIndustry: carryIndustry };
+  }
+  
+  // Find all tables
+  const tables = doc.querySelectorAll("table");
+  console.log(`Found ${tables.length} tables in HTML`);
+  
+  // Track current industry context (for associating companies with industries)
+  let currentIndustry: string | null = carryIndustry;
+  let currentCompany: string | null = null;
+  
+  // Debug tracking
   const debugAccepted: string[] = [];
   const debugRejected: { name: string; reason: string }[] = [];
+  const industryCompanyMap = new Map<string, Set<string>>();
+  const industriesFound = new Set<string>();
   
-  // Track industry state across ALL tables in this segment
-  let persistentIndustry: string | null = initialIndustry;
-  
-  let tableIndex = 0;
-  for (const table of tables) {
-    tableIndex++;
+  // Process each table
+  for (let tableIdx = 0; tableIdx < tables.length; tableIdx++) {
+    const table = tables[tableIdx] as Element;
     
-    // Find the header row (don't assume it's the first row)
-    const headerRow = findHeaderRow(table as Element, debugMode);
+    // Find header row
+    const headerRow = findHeaderRow(table, debugMode && tableIdx === 0);
     if (!headerRow) {
-      if (debugMode && tableIndex <= 10) {
-        console.log(`⊗ Table ${tableIndex}: No valid header row found`);
-      }
-      continue;
-    }
-    
-    // Find column indices - handle colspan by tracking actual cell positions
-    const headerCells = Array.from(headerRow.querySelectorAll("th, td"));
-    
-    // Build a position-aware header map that accounts for colspan
-    interface HeaderInfo {
-      text: string;
-      position: number;
-    }
-    const headerMap: HeaderInfo[] = [];
-    let position = 0;
-    for (const cell of headerCells) {
-      const el = cell as Element;
-      const text = el.textContent?.toLowerCase().trim() || "";
-      const colspan = parseInt(el.getAttribute("colspan") || "1", 10);
-      
-      // Only add non-empty headers
-      if (text) {
-        headerMap.push({ text, position });
-      }
-      
-      position += colspan;
-    }
-    
-    if (debugMode) {
-      console.log(`\n=== Table ${tableIndex} Headers ===`);
-      console.log("Header map:", headerMap.map(h => `${h.text}@${h.position}`));
-    }
-    
-    // Find column positions using the header map
-    const findHeader = (patterns: string[]): number => {
-      for (const h of headerMap) {
-        for (const p of patterns) {
-          if (h.text.includes(p)) return h.position;
-        }
-      }
-      return -1;
-    };
-    
-    const colIndices = {
-      company: findHeader(["company", "portfolio", "name", "issuer", "borrower"]),
-      investmentType: findHeader(["investment", "type", "instrument", "class"]),
-      // NOTE: Industry is detected from section HEADERS (rows with empty other cells)
-      // NOT from "business description" columns which contain company descriptions
-      industry: -1, // Disabled - use section headers only via universal detection
-      description: findHeader(["description", "notes", "business"]), // Business description moved here
-      interestRate: findHeader(["interest", "rate", "coupon"]),
-      spread: findHeader(["spread"]),
-      maturity: findHeader(["maturity date", "maturity", "expiration", "due date", "due"]),
-      par: findHeader(["par", "principal", "face"]),
-      sharesUnits: findHeader(["shares", "unit"]), // Track shares/units column to exclude from value parsing
-      cost: findHeader(["cost", "amortized"]),
-      fairValue: findHeader(["fair value", "fairvalue", "fair", "market"]),
-    };
-    
-    if (debugMode) {
-      console.log("Column indices:", colIndices);
-    }
-    
-    // Must have at least company and fair value columns
-    if (colIndices.company === -1 || colIndices.fairValue === -1) {
       if (debugMode) {
-        console.log(`⊗ Table ${tableIndex}: Missing required columns (company: ${colIndices.company}, fairValue: ${colIndices.fairValue})`);
+        console.log(`⊗ Table ${tableIdx + 1}: No valid header row found`);
       }
       continue;
     }
     
+    // Map header columns
+    const headerCells = Array.from(headerRow.querySelectorAll("th, td"));
+    const headers = headerCells.map(h => (h as Element).textContent?.toLowerCase().trim() || "");
+    
+    // Find column indices for fields we care about
+    let companyIdx = -1;
+    let investmentTypeIdx = -1;
+    let industryIdx = -1;
+    let interestRateIdx = -1;
+    let maturityIdx = -1;
+    let parIdx = -1;
+    let costIdx = -1;
+    let fairValueIdx = -1;
+    let sharesUnitsIdx = -1;
+    
+    headers.forEach((h, idx) => {
+      if (companyIdx === -1 && (h.includes("company") || h.includes("portfolio") || h.includes("name") || h.includes("issuer") || h.includes("borrower") || h.includes("investment"))) {
+        companyIdx = idx;
+      }
+      if (investmentTypeIdx === -1 && (h.includes("type") || h.includes("instrument"))) {
+        investmentTypeIdx = idx;
+      }
+      if (industryIdx === -1 && h.includes("industry")) {
+        industryIdx = idx;
+      }
+      if (interestRateIdx === -1 && (h.includes("rate") || h.includes("interest") || h.includes("coupon"))) {
+        interestRateIdx = idx;
+      }
+      if (maturityIdx === -1 && (h.includes("maturity") || h.includes("matur"))) {
+        maturityIdx = idx;
+      }
+      if (parIdx === -1 && (h.includes("par") || h.includes("principal") || h.includes("commitment"))) {
+        parIdx = idx;
+      }
+      if (costIdx === -1 && (h.includes("cost") || h.includes("amortized"))) {
+        costIdx = idx;
+      }
+      if (fairValueIdx === -1 && (h.includes("fair value") || h.includes("fair") || h.includes("market value") || h.includes("value"))) {
+        fairValueIdx = idx;
+      }
+      if (sharesUnitsIdx === -1 && (h.includes("shares") || h.includes("units") || h.includes("quantity") || h.includes("number of"))) {
+        sharesUnitsIdx = idx;
+      }
+    });
+    
     if (debugMode) {
-      console.log(`✓ Table ${tableIndex}: Valid structure, attempting to parse rows...`);
+      console.log(`Table ${tableIdx + 1} column mapping:`, {
+        company: companyIdx,
+        investmentType: investmentTypeIdx,
+        industry: industryIdx,
+        interestRate: interestRateIdx,
+        maturity: maturityIdx,
+        par: parIdx,
+        cost: costIdx,
+        fairValue: fairValueIdx,
+        sharesUnits: sharesUnitsIdx,
+      });
     }
     
-    // Parse data rows with multi-line investment tracking
-    const rows = (table as Element).querySelectorAll("tr");
+    // Process data rows
+    const rows = Array.from(table.querySelectorAll("tr"));
+    let headerRowIdx = rows.findIndex(r => r === headerRow);
+    if (headerRowIdx === -1) headerRowIdx = 0;
     
-    // Find the index of the header row
-    let headerRowIndex = 0;
-    for (let idx = 0; idx < rows.length; idx++) {
-      if (rows[idx] === headerRow) {
-        headerRowIndex = idx;
-        break;
-      }
-    }
+    // Track row context for multi-line entries
+    let pendingHolding: Partial<Holding> | null = null;
     
-    // State for tracking current company across multi-line investments
-    let currentCompany: string | null = null;
-    let currentIndustry: string | null = persistentIndustry;
-    
-    // Helper to get cell at a given column position (accounting for colspan)
-    // Also supports fallback to cell index if position-based lookup fails
-    const getCellAtPosition = (cells: Element[], pos: number, fallbackIndex?: number): Element | null => {
-      let currentPos = 0;
-      for (const cell of cells) {
-        const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
-        if (currentPos <= pos && pos < currentPos + colspan) {
-          return cell;
-        }
-        currentPos += colspan;
-      }
-      // If position-based lookup failed, try fallback index
-      if (fallbackIndex !== undefined && fallbackIndex >= 0 && fallbackIndex < cells.length) {
-        return cells[fallbackIndex];
-      }
-      return null;
-    };
-    
-    // Helper to calculate cell position accounting for colspan
-    const getCellPosition = (cells: Element[], cellIndex: number): number => {
-      let pos = 0;
-      for (let i = 0; i < cellIndex && i < cells.length; i++) {
-        pos += parseInt(cells[i].getAttribute("colspan") || "1", 10);
-      }
-      return pos;
-    };
-    
-    // Helper to find cell by searching for numeric value near expected position
-    const findValueCell = (cells: Element[], expectedPos: number, searchLabel?: string): Element | null => {
-      // First try exact position
-      const exactCell = getCellAtPosition(cells, expectedPos);
-      if (exactCell) {
-        const value = parseNumeric(exactCell.textContent?.trim());
-        if (value !== null) return exactCell;
-      }
-      
-      // If exact position fails, search backwards from end for numeric values
-      // Fair value, cost, par are typically the last few columns
-      if (searchLabel === 'fairValue' || searchLabel === 'cost' || searchLabel === 'par') {
-        for (let i = cells.length - 1; i >= Math.max(0, cells.length - 5); i--) {
-          const cell = cells[i];
-          
-          // CRITICAL: Skip the shares/units column - contains share counts, not dollar values
-          // This prevents 37,020 (share count) from being picked as fair value
-          if (colIndices.sharesUnits >= 0) {
-            const cellPos = getCellPosition(cells, i);
-            if (cellPos === colIndices.sharesUnits) {
-              continue;
-            }
-          }
-          
-          const value = parseNumeric(cell.textContent?.trim());
-          if (value !== null && value > 0) {
-            // For fairValue, check if this is the last numeric cell (excluding shares/units)
-            if (searchLabel === 'fairValue') {
-              // Verify no more numeric cells after this (excluding shares/units column)
-              let isLast = true;
-              for (let j = i + 1; j < cells.length; j++) {
-                // Skip shares/units column when checking
-                if (colIndices.sharesUnits >= 0) {
-                  const jPos = getCellPosition(cells, j);
-                  if (jPos === colIndices.sharesUnits) continue;
-                }
-                if (parseNumeric(cells[j].textContent?.trim()) !== null) {
-                  isLast = false;
-                  break;
-                }
-              }
-              if (isLast) return cell;
-            } else if (searchLabel === 'cost') {
-              // Cost is typically second to last numeric (excluding shares/units)
-              let numericCount = 0;
-              for (let j = i; j < cells.length; j++) {
-                if (colIndices.sharesUnits >= 0) {
-                  const jPos = getCellPosition(cells, j);
-                  if (jPos === colIndices.sharesUnits) continue;
-                }
-                if (parseNumeric(cells[j].textContent?.trim()) !== null) numericCount++;
-              }
-              if (numericCount === 2) return cell;
-            }
-          }
-        }
-      }
-      
-      return exactCell;
-    };
-    
-    // Cap the number of rows we process per table to prevent blowup
-    const rowsToProcess = Math.min(rows.length, headerRowIndex + maxRowsPerTable + 1);
-    
-    // Track expected cell count for structure-based industry header detection
-    let expectedCellCount = headerCells.length;
-    
-    // Debug: Log first few rows to understand structure
-    let debugRowsLogged = 0;
-    const maxDebugRows = 15;
-    
-    for (let i = headerRowIndex + 1; i < rowsToProcess; i++) {
-      const row = rows[i] as Element;
-      // Check for both td and th cells (industry headers may use th)
-      const tdCells = Array.from(row.querySelectorAll("td"));
-      const thCells = Array.from(row.querySelectorAll("th"));
-      const allCellNodes = tdCells.length > 0 ? tdCells : thCells;
-      const cells = allCellNodes.map(c => c as Element);
+    for (let rowIdx = headerRowIdx + 1; rowIdx < rows.length; rowIdx++) {
+      const row = rows[rowIdx] as Element;
+      const cells = Array.from(row.querySelectorAll("td, th"));
       
       if (cells.length === 0) continue;
       
-      // Get the first cell text (could be in first td or th)
-      const firstCellText = cells[0]?.textContent?.trim() || "";
+      // Get cell at specific positions, accounting for colspan
+      const getCellPosition = (targetIdx: number): number => {
+        let position = 0;
+        for (let i = 0; i < cells.length; i++) {
+          const colspan = parseInt((cells[i] as Element).getAttribute("colspan") || "1", 10);
+          if (position <= targetIdx && targetIdx < position + colspan) {
+            return i;
+          }
+          position += colspan;
+        }
+        return -1;
+      };
       
-      // Debug logging for first few rows - show universal detection results
-      if (debugRowsLogged < maxDebugRows && firstCellText) {
-        const nonEmptyCells = cells.filter(c => {
-          const txt = c.textContent?.trim() || '';
-          return txt !== '' && txt !== '\u00A0' && txt !== '-' && txt !== '—';
-        }).length;
-        const isUniversal = isUniversalIndustryHeader(cells, firstCellText);
-        const isExactMatch = isExactIndustryCategory(firstCellText);
-        console.log(`Row ${i - headerRowIndex}: total_cells=${cells.length}, non_empty=${nonEmptyCells}, universal_industry=${isUniversal}, exact_match=${isExactMatch}, first="${firstCellText.substring(0, 60)}"`);
-        debugRowsLogged++;
-      }
+      const getCellText = (idx: number): string => {
+        if (idx < 0) return "";
+        const cellIdx = getCellPosition(cells, idx);
+        if (cellIdx < 0 || cellIdx >= cells.length) return "";
+        return (cells[cellIdx] as Element).textContent?.trim().replace(/\s+/g, ' ') || "";
+      };
       
-      // Check if this is an industry section header FIRST (before company parsing)
-      // PRIMARY METHOD: Universal detection based on row structure (text only in first cell)
-      if (firstCellText && firstCellText.length >= 3) {
-        // Try universal structure-based detection FIRST (most reliable)
-        if (isUniversalIndustryHeader(cells, firstCellText)) {
-          currentIndustry = normalizeIndustryName(firstCellText);
-          persistentIndustry = currentIndustry; // Persist across tables/segments
-          currentCompany = null;
-          console.log(`📂 Industry section (universal): ${currentIndustry}`);
-          continue;
+      // Find value cells (numeric cells that likely contain amounts)
+      const findValueCell = (preferredIdx: number, cellType: 'fairValue' | 'cost' | 'par'): number | null => {
+        // First try preferred index
+        if (preferredIdx >= 0) {
+          const cellIdx = getCellPosition(cells, preferredIdx);
+          if (cellIdx >= 0 && cellIdx < cells.length) {
+            const text = getCellText(preferredIdx);
+            if (text && /[\d,]+\.?\d*/.test(text)) {
+              return parseNumeric(text);
+            }
+          }
         }
         
-        // Fallback: Check if it's an exact known industry category
-        if (isExactIndustryCategory(firstCellText)) {
-          currentIndustry = normalizeIndustryName(firstCellText);
-          persistentIndustry = currentIndustry; // Persist across tables/segments
-          currentCompany = null;
-          console.log(`📂 Industry section (exact match): ${currentIndustry}`);
-          continue;
-        }
-      }
-      
-      const companyCell = getCellAtPosition(cells, colIndices.company);
-      const companyCellText = companyCell?.textContent?.trim() || "";
-      
-      // Check for rowspan - if the company cell has rowspan, subsequent rows won't have a company cell
-      const companyRowspan = companyCell ? parseInt(companyCell.getAttribute("rowspan") || "1", 10) : 1;
-      
-      // Get the industry/business description cell (may also serve as industry indicator)
-      const industryCell = colIndices.industry >= 0 ? getCellAtPosition(cells, colIndices.industry) : null;
-      const industryCellText = industryCell?.textContent?.trim() || "";
-      
-      // Check if the first cell has a company name (new company) or is empty (continuation of previous)
-      let effectiveCompanyName: string;
-      let effectiveIndustry: string | null;
-      
-      if (companyCellText && companyCellText.length >= 5) {
-        // Non-empty company cell - this is a new company
-        // Clean footnotes from the company name
-        const cleanedCompanyName = cleanCompanyName(companyCellText);
-        
-        // Check if it has a company suffix before accepting as new company
-        if (hasCompanySuffix(cleanedCompanyName)) {
-          currentCompany = cleanedCompanyName;
-          // Industry comes ONLY from section headers (currentIndustry) detected via universal detection
-          // NOT from the "business description" column which contains company-specific descriptions
-          effectiveIndustry = currentIndustry;
+        // For fair value and cost, search from the end but skip sharesUnitsIdx
+        if (cellType === 'fairValue' || cellType === 'cost') {
+          // Get the actual cell index for shares/units to exclude it
+          const sharesUnitsCellIdx = sharesUnitsIdx >= 0 ? getCellPosition(cells, sharesUnitsIdx) : -1;
           
-          if (debugMode && companyRowspan > 1) {
-            console.log(`🔗 Company ${cleanedCompanyName} has rowspan=${companyRowspan}`);
+          for (let i = cells.length - 1; i >= 0; i--) {
+            // Skip the shares/units column
+            if (i === sharesUnitsCellIdx) continue;
+            
+            const text = (cells[i] as Element).textContent?.trim() || "";
+            if (/[\d,]+\.?\d*/.test(text)) {
+              const val = parseNumeric(text);
+              if (val !== null) {
+                // For fair value, make sure we're getting the LAST numeric cell (not shares/units)
+                // Skip if this is the cell at sharesUnitsIdx position
+                const cellLogicalPos = cells.slice(0, i).reduce((sum, c) => 
+                  sum + parseInt((c as Element).getAttribute("colspan") || "1", 10), 0);
+                if (sharesUnitsIdx >= 0 && Math.abs(cellLogicalPos - sharesUnitsIdx) <= 1) continue;
+                
+                return val;
+              }
+            }
           }
-        } else {
-          // Might be an investment type label or subtotal - skip as company
-          if (debugRejected.length < 10) {
-            debugRejected.push({ name: cleanedCompanyName.substring(0, 50), reason: "No company suffix (continuation row handling)" });
-          }
-          // Don't update currentCompany, treat as potential investment line for current company
-          effectiveIndustry = currentIndustry;
         }
-        effectiveCompanyName = currentCompany || cleanedCompanyName;
+        
+        return null;
+      };
+      
+      // Get all cell text for pattern matching
+      const allCellText = cells.map(c => (c as Element).textContent?.trim() || "");
+      const firstCellText = allCellText[0] || "";
+      const rowText = allCellText.join(" ").toLowerCase();
+      
+      // Count non-empty cells (excluding pure whitespace)
+      const nonEmptyCells = allCellText.filter(t => t.replace(/\s/g, '').length > 0).length;
+      
+      // Check if this is a "universal" industry row (single cell spanning most of the table)
+      // These appear as section headers between different industry groups
+      const isUniversalIndustry = cells.length === 1 || 
+        (nonEmptyCells === 1 && firstCellText.length > 3 && !firstCellText.includes("$"));
+      
+      // Check for exact industry match
+      const exactIndustryMatch = isExactIndustryCategory(firstCellText);
+      
+      // Check for universal industry pattern match
+      const universalIndustryName = matchUniversalIndustryPattern(firstCellText);
+      
+      // Debug row info (sample rows only to avoid log spam)
+      if (debugMode && rowIdx - headerRowIdx <= 25 && rowIdx - headerRowIdx > 0) {
+        console.log(`Row ${rowIdx - headerRowIdx}: total_cells=${cells.length}, non_empty=${nonEmptyCells}, universal_industry=${isUniversalIndustry}, exact_match=${exactIndustryMatch}, first="${firstCellText.slice(0, 60)}"`);
+      }
+      
+      // Industry row detection
+      if ((isUniversalIndustry && universalIndustryName) || exactIndustryMatch) {
+        const industryName = exactIndustryMatch ? normalizeIndustryName(firstCellText) : universalIndustryName!;
+        currentIndustry = industryName;
+        industriesFound.add(industryName);
+        if (debugMode) {
+          console.log(`📂 Industry section (${exactIndustryMatch ? 'exact' : 'universal'}): ${industryName}`);
+        }
+        continue;
+      }
+      
+      // Skip rows that are clearly not holdings
+      const lowerFirstCell = firstCellText.toLowerCase();
+      
+      // Skip empty rows
+      if (!firstCellText || nonEmptyCells < 2) continue;
+      
+      // Skip skip-keyword rows
+      if (SKIP_KEYWORDS.some(kw => lowerFirstCell.startsWith(kw))) {
+        if (debugMode && rowIdx - headerRowIdx <= 10) {
+          debugRejected.push({ name: firstCellText.slice(0, 40), reason: "Skip keyword" });
+        }
+        continue;
+      }
+      
+      // Try to extract holding data
+      let companyName = companyIdx >= 0 ? getCellText(companyIdx) : firstCellText;
+      companyName = cleanCompanyName(companyName);
+      
+      if (!companyName || companyName.length < 3) continue;
+      
+      // Check if this looks like a company name vs an investment type continuation
+      const looksLikeCompany = hasCompanySuffix(companyName) || 
+        /^[A-Z][a-zA-Z\s,\.&\-']+/.test(companyName);
+      
+      // If the row has a new company, update current company context
+      if (looksLikeCompany) {
+        currentCompany = companyName;
       } else if (currentCompany) {
-        // Empty or short company cell - this is a continuation row for the current company
-        effectiveCompanyName = currentCompany;
-        effectiveIndustry = currentIndustry;
-      } else {
-        // No current company and no company name - skip this row
-        continue;
+        // This might be a continuation row - use current company
+        companyName = currentCompany;
       }
       
-      // Parse numeric values for validation - use smart cell finding for key values
-      let fairValueCell = findValueCell(cells, colIndices.fairValue, 'fairValue');
-      let fairValue = parseNumeric(fairValueCell?.textContent?.trim());
-      let costCell = colIndices.cost >= 0 ? findValueCell(cells, colIndices.cost, 'cost') : null;
-      let cost = parseNumeric(costCell?.textContent?.trim());
+      // Extract investment type
+      let investmentType = investmentTypeIdx >= 0 ? getCellText(investmentTypeIdx) : null;
       
-      // If position-based lookup failed, try finding values from the end of the row
-      // SEC filings typically have: ... Shares/Units | Principal | Amortized Cost | Fair Value | % of Net Assets
-      if (fairValue === null && cells.length > 0) {
-        // Collect all numeric values from the last 6 cells, excluding percentage columns and shares/units column
-        const numericCells: { index: number; value: number; text: string; position: number }[] = [];
-        
-        // Calculate position for each cell to compare against sharesUnits column position
-        let currentPos = 0;
-        const cellPositions: number[] = [];
-        for (const cell of cells) {
-          cellPositions.push(currentPos);
-          currentPos += parseInt(cell.getAttribute("colspan") || "1", 10);
-        }
-        
-        for (let j = cells.length - 1; j >= Math.max(0, cells.length - 6); j--) {
-          const cellText = cells[j].textContent?.trim() || "";
-          const cellPosition = cellPositions[j];
-          
-          // Skip cells that contain % or are likely percentage values
-          if (cellText.includes('%') || cellText.includes('(') && cellText.includes(')') && cellText.length < 10) {
-            continue;
-          }
-          
-          // CRITICAL FIX: Skip the shares/units column - this contains share counts, not dollar values
-          // The shares/units column can have large values (e.g., 37,020) that get mistaken for fair value
-          if (colIndices.sharesUnits >= 0 && cellPosition === colIndices.sharesUnits) {
-            continue;
-          }
-          
-          const value = parseNumeric(cellText);
-          // Only accept positive values that look like dollar amounts
-          if (value !== null && value > 0) {
-            numericCells.push({ index: j, value, text: cellText, position: cellPosition });
-          }
-        }
-        
-        // Fair value is typically the last positive number before % of Net Assets
-        // Cost is typically the second to last positive number
-        // Sort by index (ascending) to get order: principal, cost, fair_value
-        numericCells.sort((a, b) => a.index - b.index);
-        
-        if (numericCells.length >= 1) {
-          // Last numeric cell is fair value
-          const fvCell = numericCells[numericCells.length - 1];
-          fairValue = fvCell.value;
-          fairValueCell = cells[fvCell.index];
-          
-          if (numericCells.length >= 2) {
-            // Second to last is cost
-            const costData = numericCells[numericCells.length - 2];
-            cost = costData.value;
-            costCell = cells[costData.index];
+      // If no dedicated investment type column, look for type keywords in other cells
+      if (!investmentType) {
+        for (const cellText of allCellText.slice(1)) { // Skip first cell (company name)
+          const lower = cellText.toLowerCase();
+          if (lower.includes("first lien") || lower.includes("second lien") || 
+              lower.includes("senior") || lower.includes("subordinated") ||
+              lower.includes("equity") || lower.includes("preferred") ||
+              lower.includes("class ") || lower.includes("units") ||
+              lower.includes("warrant") || lower.includes("membership") ||
+              lower.includes("limited partnership")) {
+            investmentType = cellText;
+            break;
           }
         }
       }
       
-      // Debug logging for first few rows
-      if (debugMode && i <= headerRowIndex + 20) {
-        const totalCellSpan = cells.reduce((sum, c) => sum + parseInt(c.getAttribute("colspan") || "1", 10), 0);
-        console.log(`Row ${i - headerRowIndex}: cells=${cells.length}, span=${totalCellSpan}, company="${companyCellText.substring(0, 30)}", FV=${fairValue}, cost=${cost}`);
-      }
+      // Get fair value - this is required
+      const fairValue = findValueCell(fairValueIdx, 'fairValue');
       
-      // Skip rows without fair value (could be subtotals, headers, or empty lines)
-      if (fairValue === null || fairValue === 0) {
-        // Don't log as rejected - these are expected empty rows in multi-line format
-        continue;
-      }
-      
-      // Validate the effective company name for the holding
-      const validation = isRealHolding(effectiveCompanyName, fairValue, cost);
-      
-      if (!validation.valid) {
-        // Log first 10 rejected for debugging
-        if (debugRejected.length < 10) {
-          debugRejected.push({ name: effectiveCompanyName.substring(0, 50), reason: validation.reason });
+      // Skip if no fair value found
+      if (fairValue === null) {
+        // This might be a subtotal row or header row
+        if (debugMode && rowIdx - headerRowIdx <= 30) {
+          debugRejected.push({ name: `${companyName.slice(0, 40)} (FV=null)`, reason: "No fair value" });
         }
         continue;
       }
       
-      // Extract investment details
-      const interestRateCell = colIndices.interestRate >= 0 ? getCellAtPosition(cells, colIndices.interestRate) : null;
-      const interestRateText = interestRateCell?.textContent?.trim() || "";
-      
-      const { rate, reference } = extractInterestRate(interestRateText);
-      
-      // Get spread column value for reference_rate
-      const spreadCell = colIndices.spread >= 0 ? getCellAtPosition(cells, colIndices.spread) : null;
-      const spreadText = spreadCell?.textContent?.trim() || "";
-      const referenceRate = spreadText || reference;
-      
-      const investmentTypeCell = colIndices.investmentType >= 0 ? getCellAtPosition(cells, colIndices.investmentType) : null;
-      const investmentType = investmentTypeCell?.textContent?.trim() || null;
-      
-      // Skip subtotal rows - these have fair value but no investment type
-      // Real investment rows should have an investment type like "First lien senior secured loan"
-      // Exception: equity positions may not have investment type in some filings
-      if (!investmentType && colIndices.investmentType >= 0) {
-        // This is likely a subtotal row - skip it
-        if (debugRejected.length < 10) {
-          debugRejected.push({ name: `${effectiveCompanyName.substring(0, 40)} (FV=$${fairValue})`, reason: "Subtotal row (no investment type)" });
+      // Skip subtotal rows (company name with fair value but no investment type)
+      // These are lines like "Company ABC    $100" without investment details
+      if (!investmentType && fairValue > 0) {
+        // Check if this is a subtotal by seeing if the next few rows are also this company
+        // For now, be more lenient - only reject if it's clearly a subtotal pattern
+        if (rowText.includes("subtotal") || rowText.includes("total")) {
+          debugRejected.push({ name: `${companyName.slice(0, 40)} (FV=$${fairValue})`, reason: "Subtotal row" });
+          continue;
         }
+        // This is a valid case for equity positions that don't have "type" specified
+        // Skip the row but continue (could be company subtotal row in ARCC format)
+        debugRejected.push({ name: `${companyName.slice(0, 40)} (FV=$${fairValue})`, reason: "Subtotal row (no investment type)" });
         continue;
       }
       
-      const descriptionCell = colIndices.description >= 0 ? getCellAtPosition(cells, colIndices.description) : null;
-      const maturityCell = colIndices.maturity >= 0 ? getCellAtPosition(cells, colIndices.maturity) : null;
-      const parCell = colIndices.par >= 0 ? getCellAtPosition(cells, colIndices.par) : null;
+      // Get optional fields
+      const cost = findValueCell(costIdx, 'cost');
+      const par = findValueCell(parIdx, 'par');
+      const maturityText = maturityIdx >= 0 ? getCellText(maturityIdx) : null;
+      const maturityDate = parseDate(maturityText);
       
+      // Get interest rate
+      let interestRateText = interestRateIdx >= 0 ? getCellText(interestRateIdx) : null;
+      if (!interestRateText) {
+        // Look for rate patterns in cells
+        for (const cellText of allCellText) {
+          if (/\d+\.?\d*\s*%/.test(cellText) || /s\+\d/i.test(cellText) || /sofr|libor|prime/i.test(cellText)) {
+            interestRateText = cellText;
+            break;
+          }
+        }
+      }
+      const { rate: interestRate, reference: referenceRate } = extractInterestRate(interestRateText || "");
+      
+      // Create holding
       const holding: Holding = {
-        company_name: effectiveCompanyName,
+        company_name: companyName,
         investment_type: investmentType,
-        industry: effectiveIndustry,
-        description: descriptionCell?.textContent?.trim() || null,
-        interest_rate: rate,
-        reference_rate: referenceRate || null,
-        maturity_date: parseDate(maturityCell?.textContent?.trim()),
-        par_amount: parseNumeric(parCell?.textContent?.trim()),
-        cost,
+        industry: currentIndustry,
+        interest_rate: interestRate,
+        reference_rate: referenceRate,
+        maturity_date: maturityDate,
+        par_amount: par,
+        cost: cost,
         fair_value: fairValue,
       };
       
       holdings.push(holding);
       
-      // Log first 10 accepted for debugging
-      if (debugAccepted.length < 10) {
-        const investType = holding.investment_type || 'unknown';
-        debugAccepted.push(`${effectiveCompanyName.substring(0, 40)} [${investType.substring(0, 20)}] FV=$${fairValue}`);
-      }
+      // Track for debug output
+      debugAccepted.push(`${companyName.slice(0, 40)} [${(investmentType || '').slice(0, 20)}] FV=$${fairValue}`);
       
-      // Cap total holdings to prevent excessive memory usage
-      if (holdings.length >= maxHoldings) {
-        console.log(`Reached max holdings cap (${maxHoldings}), stopping parse`);
-        break;
-      }
-    }
-    
-    // If we found holdings in this table, log debug info and stop searching
-    if (holdings.length > 0) {
-      // Count unique companies and industries
-      const uniqueCompanies = new Set(holdings.map(h => h.company_name)).size;
-      const uniqueIndustries = new Set(holdings.filter(h => h.industry).map(h => h.industry));
-      
-      // Group companies by industry for logging
-      const industryGroups: Record<string, string[]> = {};
-      for (const h of holdings) {
-        const ind = h.industry || 'Unknown';
-        if (!industryGroups[ind]) industryGroups[ind] = [];
-        if (!industryGroups[ind].includes(h.company_name)) {
-          industryGroups[ind].push(h.company_name);
+      // Track industry mapping
+      if (currentIndustry) {
+        if (!industryCompanyMap.has(currentIndustry)) {
+          industryCompanyMap.set(currentIndustry, new Set());
         }
+        industryCompanyMap.get(currentIndustry)!.add(companyName);
       }
-      
-      console.log(`\n=== Parsing Results ===`);
-      console.log(`✅ Accepted ${holdings.length} investment records from ${uniqueCompanies} unique companies`);
-      console.log(`📂 Industries found (${uniqueIndustries.size}): ${Array.from(uniqueIndustries).join(', ')}`);
-      console.log(`📊 Companies by industry:`);
-      for (const [ind, companies] of Object.entries(industryGroups)) {
-        console.log(`   ${ind}: ${companies.length} companies (${companies.slice(0, 3).join(', ')}${companies.length > 3 ? '...' : ''})`);
-      }
-      
-      // Validate expected major industries for ARCC
-      const expectedMajorIndustries = [
-        'Software and Services',
-        'Health Care Equipment and Services',
-        'Financial Services',
-        'Consumer Services',
-        'Capital Goods',
-      ];
-      const foundIndustryNames = Array.from(uniqueIndustries) as string[];
-      const missingIndustries = expectedMajorIndustries.filter(exp => 
-        !foundIndustryNames.some(found => found?.toLowerCase() === exp.toLowerCase())
-      );
-      if (missingIndustries.length > 0 && missingIndustries.length < expectedMajorIndustries.length) {
-        console.log(`⚠️ Some expected industries not found: ${missingIndustries.join(', ')}`);
-      }
-      
-      console.log(`First 10 accepted:`, debugAccepted);
-      console.log(`First 10 rejected:`, debugRejected);
-      console.log(`========================\n`);
-      return { holdings, lastIndustry: persistentIndustry };
     }
   }
   
-  // Log debug info even if no holdings found
-  if (debugRejected.length > 0) {
-    console.log(`\n=== Parsing Results (no holdings found) ===`);
-    console.log(`First 10 rejected:`, debugRejected);
-    console.log(`============================================\n`);
-  }
-  
-  return { holdings, lastIndustry: persistentIndustry };
-}
-
-// Parse HTML Schedule of Investments table from snippets
-// Optional initialIndustry parameter allows carrying industry state from previous calls
-function parseHtmlScheduleOfInvestments(html: string, debugMode = false, initialIndustry: string | null = null): { holdings: Holding[]; scaleResult: ScaleDetectionResult; lastIndustry: string | null } {
-  // ARCC and other large BDCs can have 500+ companies with 2-5 investment lines each
-  // Need to process at least 3000 rows to capture the full Schedule of Investments
-  const maxRowsPerTable = 3000;
-  const maxHoldings = 2000;
-  
-  // Detect scale from the HTML (look for "in thousands" or "in millions")
-  const scaleResult = detectScale(html);
-  
-  // Accumulate holdings from ALL snippets instead of returning on first match
-  const allHoldings: Holding[] = [];
-  
-  // Track industry state across snippets
-  let carryIndustry: string | null = initialIndustry;
-  
-  try {
-    // Extract only relevant HTML snippets
-    const snippets = extractCandidateTableHtml(html);
-    console.log(`Found ${snippets.length} candidate snippets to parse`);
+  // Debug output summary
+  if (debugMode || holdings.length > 0) {
+    console.log(`\n=== Parsing Results ===`);
+    console.log(`✅ Accepted ${holdings.length} investment records from ${new Set(holdings.map(h => h.company_name)).size} unique companies`);
+    console.log(`📂 Industries found (${industriesFound.size}): ${Array.from(industriesFound).join(', ')}`);
     
-    for (let i = 0; i < snippets.length; i++) {
-      const snippet = snippets[i];
-      const doc = new DOMParser().parseFromString(snippet, "text/html");
-      if (!doc) continue;
-      
-      // Calculate remaining capacity
-      const remainingCapacity = maxHoldings - allHoldings.length;
-      if (remainingCapacity <= 0) {
-        console.log(`Reached max holdings cap (${maxHoldings}), stopping snippet processing`);
-        break;
-      }
-      
-      const tables = Array.from(doc.querySelectorAll("table")) as Element[];
-      const parseResult = parseTables(tables, maxRowsPerTable, remainingCapacity, debugMode, carryIndustry);
-      const snippetHoldings = parseResult.holdings;
-      carryIndustry = parseResult.lastIndustry; // Carry forward industry state
-      
-      if (snippetHoldings.length > 0) {
-        console.log(`Snippet ${i + 1}/${snippets.length}: Found ${snippetHoldings.length} holdings`);
-        allHoldings.push(...snippetHoldings);
-      }
+    // Warn if expected industries are missing
+    const expectedIndustries = ['Health Care Equipment and Services', 'Financial Services', 'Consumer Services', 'Capital Goods'];
+    const missingIndustries = expectedIndustries.filter(i => !industriesFound.has(i));
+    if (missingIndustries.length > 0 && holdings.length > 0) {
+      console.log(`⚠️ Some expected industries not found: ${missingIndustries.join(', ')}`);
     }
     
-    // Deduplicate holdings in case of overlapping chunks
-    // Use company_name + investment_type + fair_value as a composite key
-    if (allHoldings.length > 0) {
-      const seen = new Set<string>();
-      const deduplicatedHoldings: Holding[] = [];
-      
-      for (const h of allHoldings) {
-        const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          deduplicatedHoldings.push(h);
-        }
-      }
-      
-      if (deduplicatedHoldings.length < allHoldings.length) {
-        console.log(`Deduplicated: ${allHoldings.length} -> ${deduplicatedHoldings.length} holdings`);
-      }
-      console.log(`Total unique holdings from all snippets: ${deduplicatedHoldings.length}`);
-      return { holdings: deduplicatedHoldings, scaleResult, lastIndustry: carryIndustry };
-    } else {
-      console.log("No holdings found in any snippets");
-    }
-  }
-  catch (error) {
-    console.error("Error parsing HTML:", error);
-  }
-  
-  return { holdings: allHoldings, scaleResult, lastIndustry: carryIndustry };
-}
-
-// ======================================================================
-// LIGHTWEIGHT REGEX-BASED PARSER FOR LARGE FILINGS
-// ======================================================================
-// This parser avoids DOM parsing entirely to minimize CPU usage.
-// It uses regex to extract table rows and parse holdings directly from HTML strings.
-
-function parseLargeFilingSegment(htmlSegment: string): Holding[] {
-  const holdings: Holding[] = [];
-  
-  // Find all table rows in this segment
-  const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-  let rowMatch;
-  
-  // Track current industry from section headers
-  let currentIndustry: string | null = null;
-  let currentCompany: string | null = null;
-  
-  while ((rowMatch = rowRegex.exec(htmlSegment)) !== null) {
-    const rowHtml = rowMatch[1];
-    
-    // Extract all cell contents - handle both td and th
-    const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
-    const cells: string[] = [];
-    let cellMatch;
-    
-    while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
-      // Clean HTML tags from cell content
-      const text = cellMatch[1]
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;/g, ' ')
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/\s+/g, ' ')
-        .trim();
-      cells.push(text);
-    }
-    
-    if (cells.length < 3) continue;
-    
-    const firstCell = cells[0];
-    
-    // Skip empty rows
-    if (!firstCell || firstCell.length < 2) continue;
-    
-    // Check if this is an industry section header (text in first cell, mostly empty after)
-    const nonEmptyCells = cells.filter(c => c && c.length > 1 && !/^[-—\s]*$/.test(c));
-    if (nonEmptyCells.length === 1 && firstCell.length > 5 && firstCell.length < 80) {
-      // Potential industry header
-      const isIndustryHeader = !/(LLC|Inc\.|Corp\.|L\.P\.|Ltd\.|Holdings|Company|Total|Subtotal)/i.test(firstCell);
-      if (isIndustryHeader) {
-        currentIndustry = firstCell;
-        continue;
-      }
-    }
-    
-    // Skip summary/total rows
-    if (/^(Total|Subtotal|Sub-total|Net\s|Balance|See accompanying|Notes to)/i.test(firstCell)) {
-      continue;
-    }
-    
-    // Try to find numeric values (fair value, cost) - typically in last few cells
-    const numericCells: { index: number; value: number; text: string }[] = [];
-    for (let i = cells.length - 1; i >= 0 && numericCells.length < 5; i--) {
-      const cellText = cells[i];
-      // Parse numeric: handle $, commas, parentheses for negatives
-      const cleaned = cellText.replace(/[$,\s]/g, '').trim();
-      if (cleaned && cleaned !== '-' && cleaned !== '—') {
-        const isNegative = cleaned.startsWith('(') && cleaned.endsWith(')');
-        const numStr = isNegative ? cleaned.slice(1, -1) : cleaned;
-        const parsed = parseFloat(numStr);
-        if (!isNaN(parsed) && parsed !== 0) {
-          numericCells.unshift({ index: i, value: isNegative ? -parsed : parsed, text: cellText });
-        }
-      }
-    }
-    
-    // Need at least one numeric value (fair value)
-    if (numericCells.length === 0) continue;
-    
-    // Determine company name - first cell or carry forward from previous row
-    let companyName = firstCell;
-    
-    // Check if first cell looks like a company name
-    const hasCompanyEntity = /(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Company|Partners|Group)\b/i.test(firstCell);
-    
-    if (hasCompanyEntity || firstCell.length > 10) {
-      // Clean footnotes
-      companyName = firstCell
-        .replace(/\(\d+(?:,\s*\d+)*\)\s*$/g, '')
-        .replace(/\s*[\*†‡§¶#]+\s*$/g, '')
-        .trim();
-      currentCompany = companyName;
-    } else if (currentCompany) {
-      // This might be a continuation row for the same company
-      companyName = currentCompany;
-    }
-    
-    // Skip if company name is too short or invalid
-    if (!companyName || companyName.length < 5) continue;
-    if (/^[\d\s$%.,()-]+$/.test(companyName)) continue; // Just numbers/symbols
-    
-    // Extract investment type from second cell if it looks like one
-    let investmentType: string | null = null;
-    if (cells.length > 1) {
-      const secondCell = cells[1];
-      if (/(first lien|second lien|senior|subordinated|mezzanine|equity|preferred|common|warrant|unitranche|loan|note|bond)/i.test(secondCell)) {
-        investmentType = secondCell.slice(0, 100);
-      }
-    }
-    
-    // Get fair value (last numeric), cost (second to last if exists)
-    const fairValue = numericCells[numericCells.length - 1]?.value || null;
-    const cost = numericCells.length > 1 ? numericCells[numericCells.length - 2]?.value : null;
-    const parAmount = numericCells.length > 2 ? numericCells[numericCells.length - 3]?.value : null;
-    
-    // Skip if fair value is null or zero
-    if (!fairValue || fairValue === 0) continue;
-    
-    // Try to find maturity date - look for date patterns in cells
-    let maturityDate: string | null = null;
-    for (const cell of cells) {
-      // MM/YYYY or MM/DD/YYYY patterns
-      const dateMatch = cell.match(/(\d{1,2}\/\d{1,2}\/\d{4}|\d{1,2}\/\d{4})/);
-      if (dateMatch) {
-        maturityDate = parseDate(dateMatch[1]);
-        break;
-      }
-    }
-    
-    // Try to find interest rate - look for rate patterns
-    let interestRate: string | null = null;
-    let referenceRate: string | null = null;
-    for (const cell of cells) {
-      if (/(SOFR|LIBOR|Prime)/i.test(cell)) {
-        interestRate = cell.slice(0, 100);
-        referenceRate = cell.match(/(SOFR|LIBOR|Prime)/i)?.[1]?.toUpperCase() || null;
-        break;
-      }
-      if (/\d+\.?\d*\s*%/.test(cell) && !interestRate) {
-        interestRate = cell.slice(0, 50);
-      }
-    }
-    
-    holdings.push({
-      company_name: companyName,
-      investment_type: investmentType,
-      industry: currentIndustry,
-      description: null,
-      interest_rate: interestRate,
-      reference_rate: referenceRate,
-      maturity_date: maturityDate,
-      par_amount: parAmount,
-      cost: cost,
-      fair_value: fairValue,
+    console.log(`📊 Companies by industry:`);
+    industryCompanyMap.forEach((companies, industry) => {
+      const companyList = Array.from(companies).slice(0, 3).join(', ');
+      const more = companies.size > 3 ? '...' : '';
+      console.log(`   ${industry}: ${companies.size} companies (${companyList}${more})`);
     });
+    
+    if (debugMode) {
+      console.log(`First 10 accepted:`, JSON.stringify(debugAccepted.slice(0, 10), null, 2));
+      console.log(`First 10 rejected:`, JSON.stringify(debugRejected.slice(0, 10), null, 2));
+    }
+    console.log(`========================\n`);
   }
   
-  return holdings;
+  return { holdings, scaleResult, lastIndustry: currentIndustry };
 }
 
-// Main serve function
 serve(async (req) => {
+  // Handle CORS preflight
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
+  const startTime = performance.now();
+
   try {
-    const { filingId, mode } = await req.json();
-
-    if (!filingId) {
-      throw new Error("filingId is required");
-    }
-
     const supabaseClient = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
-    // Fetch filing details
-    const { data: filing, error: filingError } = await supabaseClient
-      .from("filings")
-      .select(`
-        *,
-        bdcs (cik, bdc_name)
-      `)
-      .eq("id", filingId)
-      .single();
+    const { filingId, debugMode = false, resumeFromOffset } = await req.json();
 
-    if (filingError) {
-      throw new Error(`Filing not found: ${filingError.message}`);
+    if (!filingId) {
+      return new Response(
+        JSON.stringify({ error: "filingId is required" }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
     }
 
-    const cik = filing.bdcs.cik;
+    // Fetch filing details including resumable state
+    const { data: filing, error: filingError } = await supabaseClient
+      .from("filings")
+      .select("*, bdcs!inner(cik)")
+      .eq("id", filingId)
+      .maybeSingle();
+
+    if (filingError || !filing) {
+      throw new Error(`Filing not found: ${filingId}`);
+    }
+
     const accessionNo = filing.sec_accession_no;
-    const bdcName = filing.bdcs.bdc_name;
-
-    console.log(`Extracting holdings for filing ${accessionNo} (CIK: ${cik}, BDC: ${bdcName})`);
-    console.log(`Using local parser`);
-
-    // Build filing document URL
-    const accessionNoNoDashes = accessionNo.replace(/-/g, "");
-    const paddedCik = cik.replace(/^0+/, ""); // Remove leading zeros for URL
-    
-    // Try to fetch the primary filing document (usually the .htm file)
-    const indexUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/index.json`;
-    console.log(`Index URL: ${indexUrl}`);
-    
-    let holdings: Holding[] = [];
-    let scaleResult: ScaleDetectionResult = { scale: 0.001, detected: 'thousands', confidence: 'low' };
+    const cik = filing.bdcs.cik.padStart(10, "0");
     const warnings: string[] = [];
-    let docUrl = "";
+
+    // Get resumable state from database or request
+    const currentOffset = resumeFromOffset ?? filing.current_byte_offset ?? 0;
+    const currentIndustry = filing.current_industry_state ?? null;
+    const totalFileSize = filing.total_file_size ?? null;
+
+    console.log(`Processing filing ${accessionNo}, offset=${currentOffset}, industry=${currentIndustry || 'none'}`);
+
+    // Construct URLs
+    const indexUrl = `https://www.sec.gov/Archives/edgar/data/${cik}/${accessionNo.replace(/-/g, "")}/index.json`;
     
-    // Enable debug mode for ARCC or specific test filings
-    const debugMode = accessionNo === "0001287750-25-000046" || accessionNo === "0001104659-25-108820";
     if (debugMode) {
       console.log(`\n🔍 DEBUG MODE ENABLED for filing ${accessionNo}\n`);
     }
+
+    console.log(`Index URL: ${indexUrl}`);
+
+    let holdings: Holding[] = [];
+    let scaleResult: ScaleDetectionResult = { scale: 0.001, detected: 'thousands', confidence: 'low' };
+
+    // Use local parser
+    console.log("Using local parser");
     
     try {
-      // Fetch the filing index to find the primary document
-      const indexJson = await fetchSecFile(indexUrl);
-      const index = JSON.parse(indexJson);
+      // Fetch filing index
+      const { text: indexJson } = await fetchSecFile(indexUrl);
+      const indexData = JSON.parse(indexJson);
       
-      // Quick summary of documents (don't log all to save time)
-      const totalDocs = index.directory?.item?.length || 0;
-      const primaryDoc = index.directory?.item?.find((i: any) => i.type === "primary");
-      console.log(`\n📁 Found ${totalDocs} documents. Primary: ${primaryDoc?.name || 'none'}`);
-      
-      // Find all .htm documents (not just primary)
-      const htmDocs = (index.directory?.item || []).filter(
-        (item: any) => item.name.endsWith(".htm") || item.name.endsWith(".html")
+      // Find all HTML/HTM documents
+      const documents = indexData.directory?.item || [];
+      const htmlDocs = documents.filter((doc: { name: string }) => 
+        doc.name.toLowerCase().endsWith('.htm') || 
+        doc.name.toLowerCase().endsWith('.html')
       );
       
-      // Prioritize documents that might contain schedules
-      const prioritizedDocs = [...htmDocs].sort((a: any, b: any) => {
+      console.log(`\n📁 Found ${documents.length} documents. Primary: ${indexData.directory?.['primary-doc'] || 'none'}`);
+      console.log(`   Total HTM docs: ${htmlDocs.length}`);
+      
+      // Prioritize documents that are likely to contain the Schedule of Investments
+      const prioritizedDocs = [...htmlDocs].sort((a: { name: string }, b: { name: string }) => {
         const aName = a.name.toLowerCase();
         const bName = b.name.toLowerCase();
         
-        // Highest priority: documents with "schedule", "soi", "portfolio" in name
-        const aIsSchedule = aName.includes("schedule") || aName.includes("soi") || aName.includes("portfolio");
-        const bIsSchedule = bName.includes("schedule") || bName.includes("soi") || bName.includes("portfolio");
-        if (aIsSchedule && !bIsSchedule) return -1;
-        if (!aIsSchedule && bIsSchedule) return 1;
+        // Deprioritize exhibit files
+        const aIsExhibit = aName.includes('exhibit') || aName.includes('ex-') || aName.match(/ex\d/);
+        const bIsExhibit = bName.includes('exhibit') || bName.includes('ex-') || bName.match(/ex\d/);
+        if (aIsExhibit && !bIsExhibit) return 1;
+        if (!aIsExhibit && bIsExhibit) return -1;
         
-        // Next priority: primary document
-        if (a.type === "primary" && b.type !== "primary") return -1;
-        if (a.type !== "primary" && b.type === "primary") return 1;
-        
-        // Deprioritize documents with underscores (usually graphics/exhibits)
-        const aHasUnderscore = aName.includes("_");
-        const bHasUnderscore = bName.includes("_");
-        if (!aHasUnderscore && bHasUnderscore) return -1;
-        if (aHasUnderscore && !bHasUnderscore) return 1;
+        // Prioritize main document (usually matches the filing date pattern or accession number)
+        const aIsMain = aName.includes(accessionNo.toLowerCase()) || aName.match(/\d{8}\.htm/);
+        const bIsMain = bName.includes(accessionNo.toLowerCase()) || bName.match(/\d{8}\.htm/);
+        if (aIsMain && !bIsMain) return -1;
+        if (!aIsMain && bIsMain) return 1;
         
         return 0;
       });
       
-      // Log first few documents for reference
-      console.log(`   Processing order: ${prioritizedDocs.slice(0, 5).map((d: any) => d.name).join(', ')}${prioritizedDocs.length > 5 ? '...' : ''}`);
-      console.log(`   Total HTM docs: ${htmDocs.length}`);
+      console.log(`   Processing order: ${prioritizedDocs.slice(0, 5).map((d: { name: string }) => d.name).join(', ')}...`);
       
-      // Try parsing each document until we find holdings (limit to 15 docs to avoid timeout)
-      const maxDocsToTry = Math.min(prioritizedDocs.length, 15);
-      
-      for (let docIdx = 0; docIdx < maxDocsToTry; docIdx++) {
+      // Try each document until we find holdings
+      const maxDocsToTry = Math.min(15, prioritizedDocs.length);
+      for (let docIdx = 0; docIdx < maxDocsToTry && holdings.length === 0; docIdx++) {
         const doc = prioritizedDocs[docIdx];
-        docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/${doc.name}`;
+        const docUrl = `https://www.sec.gov/Archives/edgar/data/${cik}/${accessionNo.replace(/-/g, "")}/${doc.name}`;
+        
         console.log(`\n📄 Trying document ${docIdx + 1}/${maxDocsToTry}: ${doc.name}`);
         console.log(`   URL: ${docUrl}`);
         
         try {
-          const html = await fetchSecFile(docUrl);
-          console.log(`   Size: ${(html.length / 1024).toFixed(0)} KB`);
+          const { text: html, totalSize } = await fetchSecFile(docUrl);
+          const docSizeKB = html.length / 1024;
+          console.log(`   Size: ${docSizeKB.toFixed(0)} KB`);
           
-          // For very large documents (>5MB), extract just the SOI section to avoid memory issues
           let textToParse = html;
+          
+          // For very large documents (like ARCC's 22MB filing), use RESUMABLE SEGMENTED PARSING
           if (html.length > 5_000_000) {
             console.log(`   📦 Large document (${(html.length / 1024 / 1024).toFixed(1)} MB), extracting SOI section...`);
             
-            // Find the boundaries of the Schedule of Investments section
             const lower = html.toLowerCase();
             
-            // Find ALL occurrences of "schedule of investments" - we want the main data section, not TOC
+            // Find all SOI occurrences to understand document structure
             const soiKeywords = [
               "consolidated schedule of investments",
               "schedule of investments",
             ];
             
-            // Collect all SOI occurrences
             const soiOccurrences: number[] = [];
-            for (const kw of soiKeywords) {
+            for (const keyword of soiKeywords) {
               let pos = 0;
-              while ((pos = lower.indexOf(kw, pos)) !== -1) {
+              while ((pos = lower.indexOf(keyword, pos)) !== -1) {
                 soiOccurrences.push(pos);
-                pos += kw.length;
+                pos += keyword.length;
               }
             }
-            
             soiOccurrences.sort((a, b) => a - b);
+            
             console.log(`   Found ${soiOccurrences.length} SOI keyword occurrences`);
             
             if (soiOccurrences.length === 0) {
-              warnings.push(`No Schedule of Investments found in large document ${doc.name}. Skipping.`);
               console.log(`   ⚠️ No SOI section found in large document, skipping`);
               continue;
             }
             
-            // For ARCC-style documents, the SOI header appears on EVERY page
-            // We need to find the FIRST real SOI section (after table of contents)
-            // and extract from there to the end markers
-            
+            // Find SOI boundaries
             const endMarkers = [
               "notes to consolidated financial statements",
               "notes to financial statements",
             ];
             
-            // Find the LAST occurrence of end markers (the actual notes section)
             let documentEnd = html.length;
             for (const marker of endMarkers) {
               let lastIdx = -1;
@@ -1622,18 +1156,14 @@ serve(async (req) => {
               if (lastIdx !== -1) {
                 documentEnd = lastIdx;
                 console.log(`   📍 Found end marker "${marker}" last occurrence at position ${lastIdx}`);
-                break; // Use the first end marker type found
+                break;
               }
             }
             
-            // Find where actual TABLE data starts (not just the header)
-            // Look for SOI occurrence that has a TABLE tag within 10KB after it
+            // Find best SOI start (with nearby table)
             let bestStart = soiOccurrences[0];
             for (const soiPos of soiOccurrences) {
-              // Skip if this is in the first 10% of document (likely TOC)
               if (soiPos < html.length * 0.05) continue;
-              
-              // Check if there's a table within 10KB of this SOI
               const nearbyHtml = lower.slice(soiPos, Math.min(soiPos + 10_000, html.length));
               if (nearbyHtml.includes('<table')) {
                 bestStart = soiPos;
@@ -1642,77 +1172,31 @@ serve(async (req) => {
               }
             }
             
-            // ============ CURRENT QUARTER ONLY EXTRACTION ============
-            // SEC filings often include both current quarter AND prior year-end for comparison
-            // We only want the CURRENT quarter, not the prior period
-            
-            // Look for prior period markers that indicate the start of comparison SOI
-            // Common patterns for prior period in Q3/10-Q filings
+            // Detect prior period markers
             const priorPeriodMarkers = [
-              'december 31, 2024',
-              'december 31,2024', 
-              'december&#160;31, 2024', // HTML encoded space
-              'december&nbsp;31, 2024',
-              'as of december 31, 2024',
-              'at december 31, 2024',
-              '12/31/2024',
-              '12/31/24',
-              // Patterns with schedule of investments + date together
-              'schedule of investments</b><br/>december 31',
-              'schedule of investments</b><br>december 31',
-              'schedule of investments (december 31',
-              'schedule of investments<br/>december 31',
-              // Generic prior markers
-              'december 31, 2023',
-              'december 31, 2022',
+              'december 31, 2024', 'december 31,2024', 
+              'december&#160;31, 2024', 'december&nbsp;31, 2024',
+              'as of december 31, 2024', 'at december 31, 2024',
+              '12/31/2024', '12/31/24',
+              'december 31, 2023', 'december 31, 2022',
             ];
             
-            // Find where prior period SOI starts (after our main SOI start)
             let priorPeriodStart = documentEnd;
-            const searchStartOffset = bestStart + 100_000; // Skip at least 100KB from start (the current quarter header area)
+            const searchStartOffset = bestStart + 100_000;
             
             for (const marker of priorPeriodMarkers) {
               const markerIdx = lower.indexOf(marker, searchStartOffset);
               if (markerIdx !== -1 && markerIdx < priorPeriodStart) {
-                // This marker could be the prior period SOI - verify it looks like an SOI section
-                // Check for table structure nearby (within 20KB after)
                 const nearbyAfter = lower.slice(markerIdx, Math.min(markerIdx + 20_000, html.length));
                 if (nearbyAfter.includes('<table') || nearbyAfter.includes('portfolio company') || nearbyAfter.includes('fair value')) {
                   priorPeriodStart = markerIdx;
                   console.log(`   📍 Found PRIOR PERIOD marker "${marker}" at position ${markerIdx}`);
-                  break; // Use the first valid one found
+                  break;
                 }
               }
             }
             
-            // If no prior period found by markers, look for a second "Schedule of Investments" header
-            if (priorPeriodStart === documentEnd) {
-              // Count SOI occurrences to find the second one (which would be the prior period)
-              let soiCount = 0;
-              let searchFrom = bestStart;
-              while (soiCount < 5) {
-                const soiIdx = lower.indexOf('schedule of investments', searchFrom);
-                if (soiIdx === -1) break;
-                soiCount++;
-                
-                // Skip the first 2 occurrences (could be title + current quarter header)
-                // The 3rd occurrence is likely the prior period
-                if (soiCount === 3 && soiIdx > bestStart + 500_000) {
-                  // Check if this has a December date nearby
-                  const nearbyText = lower.slice(soiIdx, Math.min(soiIdx + 5000, html.length));
-                  if (nearbyText.includes('december') || nearbyText.includes('12/31')) {
-                    priorPeriodStart = soiIdx;
-                    console.log(`   📍 Found 3rd SOI header at position ${soiIdx} (likely prior period)`);
-                    break;
-                  }
-                }
-                searchFrom = soiIdx + 30;
-              }
-            }
-            
-            // Find the LAST "Total Investments" BEFORE the prior period marker
-            // This is the actual end of the current quarter's SOI
-            // (The first "Total Investments" might be a subtotal within the SOI)
+            // Find last "Total Investments" before prior period
             let lastTotalInvestmentsIdx = -1;
             let searchPos = bestStart;
             while (true) {
@@ -1723,13 +1207,9 @@ serve(async (req) => {
             }
             
             let currentQuarterEnd = priorPeriodStart;
-            
             if (lastTotalInvestmentsIdx !== -1) {
-              // Include some buffer after "Total Investments" to capture the totals row
               currentQuarterEnd = Math.min(priorPeriodStart, lastTotalInvestmentsIdx + 10_000);
               console.log(`   📍 Found LAST "Total Investments" at ${lastTotalInvestmentsIdx}, setting end to ${currentQuarterEnd}`);
-            } else {
-              console.log(`   📍 No "Total Investments" found before prior period, using prior period start`);
             }
             
             // Final SOI boundaries
@@ -1744,24 +1224,21 @@ serve(async (req) => {
               console.log(`      ⚠️ Excluded prior period starting at position ${priorPeriodStart}`);
             }
             
-            console.log(`   📊 Full SOI section: ${(totalSoiSize / 1024 / 1024).toFixed(1)} MB`);
-            
-            // For very large SOI sections (like ARCC's $28.6B portfolio), use small-segment DOM parsing
-            // This gives accurate data while staying within CPU limits
-            // Supports resuming from where a previous run timed out
-            
-            if (totalSoiSize > 4_000_000) {
-              console.log(`   📦 Large SOI section (${(totalSoiSize / 1024 / 1024).toFixed(1)} MB), using small-segment DOM parsing...`);
+            // ============ RESUMABLE SEGMENTED PARSING ============
+            if (totalSoiSize > 2_000_000) {
+              console.log(`   📦 Using RESUMABLE segmented parsing for ${(totalSoiSize / 1024 / 1024).toFixed(1)} MB SOI section...`);
               
-              // Check if we're resuming an existing extraction or starting fresh
-              const { data: existingHoldings, error: checkError } = await supabaseClient
-                .from("holdings")
-                .select("company_name, investment_type, fair_value")
-                .eq("filing_id", filingId)
-                .limit(1000);
+              // Store total file size if not already stored
+              if (!filing.total_file_size) {
+                await supabaseClient
+                  .from("filings")
+                  .update({ total_file_size: totalSoiSize })
+                  .eq("id", filingId);
+              }
               
-              const existingCount = existingHoldings?.length || 0;
-              const isResume = existingCount > 50; // More than 50 suggests a partial extraction
+              // Check if we're resuming
+              const effectiveOffset = currentOffset > 0 ? currentOffset : soiStart;
+              const isResume = currentOffset > 0;
               
               if (!isResume) {
                 // Starting fresh - delete any existing holdings
@@ -1775,55 +1252,76 @@ serve(async (req) => {
                 }
                 console.log(`   📦 Starting fresh extraction`);
               } else {
-                console.log(`   📦 RESUMING extraction (${existingCount} holdings already exist)`);
-              }
-
-              // Establish a stable row_number counter (so ordering matches the filing)
-              let nextRowNumber = 1;
-              if (isResume) {
-                const { data: maxRowNumberRows } = await supabaseClient
-                  .from("holdings")
-                  .select("row_number")
-                  .eq("filing_id", filingId)
-                  .order("row_number", { ascending: false, nullsFirst: false })
-                  .limit(1);
-
-                const maxExistingRowNumber = maxRowNumberRows?.[0]?.row_number ?? 0;
-                nextRowNumber = maxExistingRowNumber + 1;
+                console.log(`   📦 RESUMING extraction from offset ${currentOffset}`);
               }
               
-              // Detect scale from the first part of the document
+              // Get existing holdings for deduplication
+              const { data: existingHoldings } = await supabaseClient
+                .from("holdings")
+                .select("company_name, investment_type, fair_value, row_number")
+                .eq("filing_id", filingId)
+                .order("row_number", { ascending: false })
+                .limit(1000);
+              
+              const seenHoldingKeys = new Set<string>();
+              let nextRowNumber = 1;
+              
+              if (existingHoldings && existingHoldings.length > 0) {
+                for (const h of existingHoldings) {
+                  seenHoldingKeys.add(`${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`);
+                }
+                nextRowNumber = (existingHoldings[0]?.row_number || 0) + 1;
+                console.log(`   📦 ${existingHoldings.length} existing holdings, next row: ${nextRowNumber}`);
+              }
+              
+              // Detect scale
               const segmentScaleResult = detectScale(html.slice(soiStart, Math.min(soiStart + 100_000, soiEnd)));
               console.log(`   📊 Scale detected: ${segmentScaleResult.detected}`);
               const scale = segmentScaleResult?.scale || 1;
               
-              // Build set of existing holding keys for deduplication
-              const seenHoldingKeys = new Set<string>();
-              if (isResume && existingHoldings) {
-                for (const h of existingHoldings) {
-                  const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
-                  seenHoldingKeys.add(key);
-                }
-              }
-              
-              // Use very small segments (150KB) to stay within CPU limits
-              const SEGMENT_SIZE = 150_000;
-              const OVERLAP_SIZE = 15_000;
-              
-              let currentPosition = soiStart;
-              let segmentCount = 0;
+              let currentPosition = effectiveOffset;
+              let carryIndustry: string | null = currentIndustry;
               let totalInserted = 0;
-              let runningTotalValue = 0;
-              let skippedDuplicates = 0;
+              let segmentCount = 0;
+              let cpuTimeUsed = 0;
               
-              // Track industry state across segments for proper grouping
-              let carryIndustry: string | null = null;
-              
+              // Process segments until CPU limit or completion
               while (currentPosition < soiEnd) {
+                // Check CPU time
+                cpuTimeUsed = performance.now() - startTime;
+                if (cpuTimeUsed > CPU_TIME_LIMIT_MS) {
+                  console.log(`   ⏱️ CPU time limit reached (${cpuTimeUsed.toFixed(1)}ms), saving state...`);
+                  
+                  // Save current state to database
+                  await supabaseClient
+                    .from("filings")
+                    .update({ 
+                      current_byte_offset: currentPosition,
+                      current_industry_state: carryIndustry,
+                      total_file_size: totalSoiSize,
+                    })
+                    .eq("id", filingId);
+                  
+                  const percentComplete = ((currentPosition - soiStart) / totalSoiSize * 100).toFixed(1);
+                  
+                  return new Response(
+                    JSON.stringify({
+                      status: "PARTIAL",
+                      filingId,
+                      next_offset: currentPosition,
+                      percentage_complete: parseFloat(percentComplete),
+                      total_file_size: totalSoiSize,
+                      holdings_inserted_this_run: totalInserted,
+                      current_industry: carryIndustry,
+                      message: `Processed ${percentComplete}% - will resume from offset ${currentPosition}`,
+                    }),
+                    { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+                  );
+                }
+                
                 segmentCount++;
                 const segmentEnd = Math.min(currentPosition + SEGMENT_SIZE, soiEnd);
                 
-                // Log every 20th segment
                 if (segmentCount % 20 === 1) {
                   console.log(`   📦 Segment ${segmentCount}, pos ${(currentPosition / 1024 / 1024).toFixed(1)}MB, inserted ${totalInserted}, industry=${carryIndustry || 'none'}`);
                 }
@@ -1831,7 +1329,7 @@ serve(async (req) => {
                 try {
                   const segment = html.slice(currentPosition, segmentEnd);
                   
-                  // Quick pre-check: skip segments without table content
+                  // Skip segments without table content
                   if (!segment.toLowerCase().includes('<tr')) {
                     const nextPosition = segmentEnd - OVERLAP_SIZE;
                     if (nextPosition <= currentPosition) break;
@@ -1839,10 +1337,9 @@ serve(async (req) => {
                     continue;
                   }
                   
-                  // Parse with DOM parser (but with small segment size), passing carry-forward industry
                   const segmentResult = parseHtmlScheduleOfInvestments(segment, false, carryIndustry);
                   const segmentHoldings = segmentResult.holdings;
-                  carryIndustry = segmentResult.lastIndustry; // Carry forward industry state to next segment
+                  carryIndustry = segmentResult.lastIndustry;
                   
                   if (segmentHoldings.length > 0) {
                     const newHoldings: Holding[] = [];
@@ -1852,8 +1349,6 @@ serve(async (req) => {
                       if (!seenHoldingKeys.has(key)) {
                         seenHoldingKeys.add(key);
                         newHoldings.push(h);
-                      } else {
-                        skippedDuplicates++;
                       }
                     }
                     
@@ -1871,7 +1366,6 @@ serve(async (req) => {
                         cost: h.cost != null ? Math.round((h.cost * scale) * 10) / 10 : null,
                         fair_value: h.fair_value != null ? Math.round((h.fair_value * scale) * 10) / 10 : null,
                         row_number: nextRowNumber + idx,
-                        // Track approximate HTML position for ordering
                         source_pos: currentPosition + idx,
                       }));
                       
@@ -1882,7 +1376,6 @@ serve(async (req) => {
                       if (!insertError) {
                         totalInserted += holdingsToInsert.length;
                         nextRowNumber += holdingsToInsert.length;
-                        runningTotalValue += holdingsToInsert.reduce((sum, h) => sum + (h.fair_value || 0), 0);
                       }
                     }
                   }
@@ -1895,8 +1388,8 @@ serve(async (req) => {
                 currentPosition = nextPosition;
               }
               
-              console.log(`   📊 This run: ${totalInserted} new holdings, $${runningTotalValue.toFixed(1)}M`);
-              console.log(`   📊 Skipped ${skippedDuplicates} duplicates`);
+              // Completed all segments
+              console.log(`   ✅ Completed all segments! Total inserted: ${totalInserted}`);
               
               // Get final count
               const { count: finalCount } = await supabaseClient
@@ -1911,27 +1404,26 @@ serve(async (req) => {
               
               const finalTotalValue = totalValueData?.reduce((sum, h) => sum + (h.fair_value || 0), 0) || 0;
               
-              // Mark as parsed if we have a reasonable number of holdings
-              if ((finalCount || 0) > 100) {
-                await supabaseClient
-                  .from("filings")
-                  .update({ 
-                    parsed_successfully: true,
-                    value_scale: segmentScaleResult?.detected || 'unknown'
-                  })
-                  .eq("id", filingId);
-              }
+              // Reset state and mark as complete
+              await supabaseClient
+                .from("filings")
+                .update({ 
+                  parsed_successfully: (finalCount || 0) > 100,
+                  value_scale: segmentScaleResult?.detected || 'unknown',
+                  current_byte_offset: 0,
+                  current_industry_state: null,
+                })
+                .eq("id", filingId);
               
               return new Response(
                 JSON.stringify({
+                  status: "COMPLETE",
                   filingId,
                   holdingsInserted: totalInserted,
                   totalHoldings: finalCount,
                   totalValue: finalTotalValue,
                   valueScale: segmentScaleResult?.detected || 'unknown',
-                  method: 'segmented-dom',
-                  resumed: isResume,
-                  complete: currentPosition >= soiEnd,
+                  percentage_complete: 100,
                 }),
                 { headers: { ...corsHeaders, "Content-Type": "application/json" } }
               );
@@ -1942,7 +1434,7 @@ serve(async (req) => {
             console.log(`   📦 Extracted SOI section: ${(textToParse.length / 1024 / 1024).toFixed(1)} MB`);
           }
           
-          // Standard processing path (for smaller SOI sections or non-SOI documents)
+          // Standard processing path (for smaller documents)
           if (textToParse && holdings.length === 0) {
             const useDebug = debugMode || (docIdx >= 2 && holdings.length === 0);
             const result = parseHtmlScheduleOfInvestments(textToParse, useDebug);
@@ -1958,7 +1450,7 @@ serve(async (req) => {
           }
         } catch (docError) {
           console.error(`   Error parsing ${doc.name}:`, docError);
-          continue; // Try next document
+          continue;
         }
       }
       
@@ -2019,7 +1511,9 @@ serve(async (req) => {
         .from("filings")
         .update({ 
           parsed_successfully: true,
-          value_scale: scaleResult.detected
+          value_scale: scaleResult.detected,
+          current_byte_offset: 0,
+          current_industry_state: null,
         })
         .eq("id", filingId);
 
@@ -2031,10 +1525,12 @@ serve(async (req) => {
 
       return new Response(
         JSON.stringify({
+          status: "COMPLETE",
           filingId,
           holdingsInserted: holdingsToInsert.length,
           valueScale: scaleResult.detected,
           scaleConfidence: scaleResult.confidence,
+          percentage_complete: 100,
           warnings: warnings.length > 0 ? warnings : undefined,
         }),
         {
@@ -2046,12 +1542,13 @@ serve(async (req) => {
       warnings.push("No holdings found in filing (snippet-based parsing only)");
       
       console.log(`No holdings found. Index URL: ${indexUrl}`);
-      console.log(`Doc URL: ${docUrl}`);
       
       return new Response(
         JSON.stringify({
+          status: "COMPLETE",
           filingId,
           holdingsInserted: 0,
+          percentage_complete: 100,
           warnings,
         }),
         {
@@ -2064,7 +1561,7 @@ serve(async (req) => {
     console.error("Error in extract_holdings_for_filing:", error);
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     return new Response(
-      JSON.stringify({ error: errorMessage }),
+      JSON.stringify({ status: "ERROR", error: errorMessage }),
       {
         status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
