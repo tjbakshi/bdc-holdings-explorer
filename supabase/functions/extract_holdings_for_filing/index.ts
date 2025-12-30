@@ -370,16 +370,38 @@ const SKIP_KEYWORDS = [
 
 // Industry section headers - these are section labels, not company names
 // We want to track these as current industry for subsequent rows
-const INDUSTRY_HEADERS = [
-  "software and services", "health care", "commercial and professional",
-  "financial services", "consumer services", "consumer distribution",
-  "sports, media", "investment funds", "capital goods",
-  "pharmaceuticals", "biotechnology", "insurance",
-  "real estate", "transportation", "utilities", "energy",
-  "materials", "telecommunications", "technology",
-  "media and entertainment", "food and beverage", "retail",
-  "diversified financials", "consumer durables", "automobiles",
-  "retailing", "food, beverage", "household", "personal products",
+// This list is expanded to cover more industry patterns seen in SEC filings
+const INDUSTRY_PATTERNS = [
+  // Technology & Software
+  /^technology/i, /^software/i, /^internet/i, /^it services/i,
+  /^technology hardware/i, /^semiconductors/i, /^electronic/i,
+  // Healthcare
+  /^health care/i, /^healthcare/i, /^pharmaceuticals/i, /^biotechnology/i,
+  /^life sciences/i, /^medical/i, /^biotech/i,
+  // Financial
+  /^financial/i, /^insurance/i, /^banking/i, /^capital markets/i,
+  /^diversified financials/i, /^real estate/i,
+  // Consumer
+  /^consumer/i, /^retail/i, /^food/i, /^beverage/i, /^household/i,
+  /^personal products/i, /^textiles/i, /^apparel/i, /^leisure/i,
+  // Industrial
+  /^industrial/i, /^manufacturing/i, /^capital goods/i, /^machinery/i,
+  /^aerospace/i, /^defense/i, /^construction/i, /^building/i,
+  // Services
+  /^commercial/i, /^professional services/i, /^business services/i,
+  /^support services/i, /^education/i, /^transportation/i,
+  // Utilities & Energy
+  /^utilities/i, /^energy/i, /^oil/i, /^gas utilities/i, /^electric/i,
+  /^power/i, /^renewable/i,
+  // Media & Communications
+  /^media/i, /^communications/i, /^telecommunication/i, /^entertainment/i,
+  /^broadcasting/i, /^advertising/i,
+  // Materials
+  /^materials/i, /^chemicals/i, /^metals/i, /^mining/i, /^paper/i,
+  // Other common SEC industry categories
+  /^automobiles/i, /^auto/i, /^hotels/i, /^restaurants/i, /^gaming/i,
+  /^investment funds/i, /^sports/i, /^distribution/i, /^logistics/i,
+  /^environmental/i, /^containers/i, /^packaging/i,
 ];
 
 // Investment type labels that indicate this is a type description, not a company
@@ -411,8 +433,25 @@ const COMPANY_SUFFIXES = [
 
 // Check if text is an industry section header
 function isIndustrySectionHeader(text: string): boolean {
-  const lower = text.toLowerCase().trim();
-  return INDUSTRY_HEADERS.some(h => lower === h || lower.startsWith(h + " "));
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length < 3) return false;
+  
+  // Industry headers don't have company entity suffixes
+  const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Co\.|Company|Enterprises|Partners)\b/i.test(trimmed);
+  if (hasCompanyEntity) return false;
+  
+  // Industry headers typically don't have $ amounts or percentages
+  const hasNumericValues = /\$[\d,]+|\d+\.\d+%|\d{1,3}(?:,\d{3})+/.test(trimmed);
+  if (hasNumericValues) return false;
+  
+  // Check if it matches known industry patterns
+  for (const pattern of INDUSTRY_PATTERNS) {
+    if (pattern.test(trimmed)) {
+      return true;
+    }
+  }
+  
+  return false;
 }
 
 // Check if text is an investment type label (not a company name)
@@ -853,11 +892,27 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     
     // If we found holdings in this table, log debug info and stop searching
     if (holdings.length > 0) {
-      // Count unique companies
+      // Count unique companies and industries
       const uniqueCompanies = new Set(holdings.map(h => h.company_name)).size;
+      const uniqueIndustries = new Set(holdings.filter(h => h.industry).map(h => h.industry));
+      
+      // Group companies by industry for logging
+      const industryGroups: Record<string, string[]> = {};
+      for (const h of holdings) {
+        const ind = h.industry || 'Unknown';
+        if (!industryGroups[ind]) industryGroups[ind] = [];
+        if (!industryGroups[ind].includes(h.company_name)) {
+          industryGroups[ind].push(h.company_name);
+        }
+      }
       
       console.log(`\n=== Parsing Results ===`);
       console.log(`✅ Accepted ${holdings.length} investment records from ${uniqueCompanies} unique companies`);
+      console.log(`📂 Industries found (${uniqueIndustries.size}): ${Array.from(uniqueIndustries).join(', ')}`);
+      console.log(`📊 Companies by industry:`);
+      for (const [ind, companies] of Object.entries(industryGroups)) {
+        console.log(`   ${ind}: ${companies.length} companies (${companies.slice(0, 3).join(', ')}${companies.length > 3 ? '...' : ''})`);
+      }
       console.log(`First 10 accepted:`, debugAccepted);
       console.log(`First 10 rejected:`, debugRejected);
       console.log(`========================\n`);
