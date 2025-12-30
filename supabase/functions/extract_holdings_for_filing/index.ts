@@ -2244,7 +2244,23 @@ serve(async (req) => {
                     if (nonEmptyTextCells.length === 1 || (hasBoldOrItalic && hasColspan)) {
                       const candidateIndustry = nonEmptyTextCells[0]?.trim() || textCells[0]?.trim() || '';
                       
-                      if (candidateIndustry.length >= 3 && candidateIndustry.length <= 100) {
+                      // FILTER OUT: HTML entities and empty/whitespace-only entries
+                      const isHtmlEntity = /^&#\d+;?$|^&[a-z]+;?$/i.test(candidateIndustry) ||
+                                           candidateIndustry.includes('&#') ||
+                                           /^[\s\u00A0—–-]+$/.test(candidateIndustry);
+                      
+                      // FILTER OUT: False positive industry names (SEC form fields, table headers)
+                      const falsePositivePatterns = [
+                        /^(date|filer|accelerated|small|emerging|shell|registrant|exchange|trading|file|securities)/i,
+                        /^(amortized|fair value|cost|shares|units|principal|percent|interest)/i,
+                        /^(transfers? (into|out|from|to))/i,
+                        /^(beginning|ending|balance|change|net|gross)/i,
+                        /^(large|non-|smaller|accelerated filer)/i,
+                        /^(unsecured|secured|senior|junior|subordinated)\s+(notes?|loans?|debt)/i,
+                      ];
+                      const isFalsePositive = falsePositivePatterns.some(p => p.test(candidateIndustry));
+                      
+                      if (!isHtmlEntity && !isFalsePositive && candidateIndustry.length >= 3 && candidateIndustry.length <= 100) {
                         const lowerCandidate = candidateIndustry.toLowerCase();
                         
                         // Check NOT a skip keyword, company, investment type, total, or header
