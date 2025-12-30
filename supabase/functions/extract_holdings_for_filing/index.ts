@@ -22,6 +22,95 @@ interface Holding {
   fair_value?: number | null;
 }
 
+interface ScaleDetectionResult {
+  scale: number; // Multiplier to convert to millions (e.g., 0.001 for thousands, 1 for millions)
+  detected: 'thousands' | 'millions' | 'unknown';
+  confidence: 'high' | 'medium' | 'low';
+}
+
+// Detect the scale of values in a filing (thousands vs millions)
+function detectScale(html: string): ScaleDetectionResult {
+  const lowerHtml = html.toLowerCase();
+  
+  // High-confidence patterns for thousands
+  const thousandPatterns = [
+    /\(in thousands\)/i,
+    /\(in\s+000s?\)/i,
+    /amounts?\s+in\s+thousands/i,
+    /\$\s*in\s+thousands/i,
+    /dollars?\s+in\s+thousands/i,
+    /000s?\s*omitted/i,
+    /expressed\s+in\s+thousands/i,
+    /stated\s+in\s+thousands/i,
+  ];
+  
+  // High-confidence patterns for millions  
+  const millionPatterns = [
+    /\(in millions\)/i,
+    /amounts?\s+in\s+millions/i,
+    /\$\s*in\s+millions/i,
+    /dollars?\s+in\s+millions/i,
+    /expressed\s+in\s+millions/i,
+    /stated\s+in\s+millions/i,
+  ];
+  
+  // Check for thousands indicator
+  for (const pattern of thousandPatterns) {
+    if (pattern.test(lowerHtml)) {
+      console.log(`📊 Scale detected: THOUSANDS (pattern: ${pattern})`);
+      return { scale: 0.001, detected: 'thousands', confidence: 'high' };
+    }
+  }
+  
+  // Check for millions indicator
+  for (const pattern of millionPatterns) {
+    if (pattern.test(lowerHtml)) {
+      console.log(`📊 Scale detected: MILLIONS (pattern: ${pattern})`);
+      return { scale: 1, detected: 'millions', confidence: 'high' };
+    }
+  }
+  
+  // Default assumption: most BDC filings report in thousands
+  console.log(`📊 Scale detected: THOUSANDS (default assumption)`);
+  return { scale: 0.001, detected: 'thousands', confidence: 'low' };
+}
+
+// Validate scale by checking if values are reasonable for BDC holdings
+function validateScale(holdings: Holding[], scale: ScaleDetectionResult): { valid: boolean; warning?: string } {
+  if (holdings.length === 0) return { valid: true };
+  
+  // Calculate average fair value after applying scale
+  const validValues = holdings
+    .filter(h => h.fair_value !== null)
+    .map(h => (h.fair_value as number) * scale.scale);
+  
+  if (validValues.length === 0) return { valid: true };
+  
+  const avgValue = validValues.reduce((sum, v) => sum + v, 0) / validValues.length;
+  const maxValue = Math.max(...validValues);
+  const minValue = Math.min(...validValues);
+  
+  console.log(`📊 Scale validation: avg=$${avgValue.toFixed(1)}M, min=$${minValue.toFixed(1)}M, max=$${maxValue.toFixed(1)}M`);
+  
+  // BDC holdings typically range from $0.1M to $500M per position
+  // Average should be between $1M and $100M
+  if (avgValue > 1000) {
+    return { 
+      valid: false, 
+      warning: `Average holding value ($${avgValue.toFixed(1)}M) too large - values may already be in thousands, not actual amounts`
+    };
+  }
+  
+  if (avgValue < 0.01) {
+    return {
+      valid: false,
+      warning: `Average holding value ($${(avgValue * 1000).toFixed(1)}K) too small - values may be in millions, not thousands`
+    };
+  }
+  
+  return { valid: true };
+}
+
 // Helper to fetch SEC files with retry
 async function fetchSecFile(url: string, retries = 2): Promise<string> {
   for (let i = 0; i <= retries; i++) {
@@ -60,6 +149,13 @@ function parseNumeric(value: string | null | undefined): number | null {
   if (isNaN(parsed)) return null;
   
   return isNegative ? -parsed : parsed;
+}
+
+// Convert a value to millions using the detected scale, round to 1 decimal
+function toMillions(value: number | null | undefined, scale: number): number | null {
+  if (value === null || value === undefined) return null;
+  const inMillions = value * scale;
+  return Math.round(inMillions * 10) / 10;
 }
 
 // Parse date from various formats
@@ -516,9 +612,12 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
 }
 
 // Parse HTML Schedule of Investments table from snippets
-function parseHtmlScheduleOfInvestments(html: string, debugMode = false): Holding[] {
+function parseHtmlScheduleOfInvestments(html: string, debugMode = false): { holdings: Holding[]; scaleResult: ScaleDetectionResult } {
   const maxRowsPerTable = 500;
   const maxHoldings = 1000;
+  
+  // Detect scale from the HTML (look for "in thousands" or "in millions")
+  const scaleResult = detectScale(html);
   
   try {
     // First try: Extract only relevant HTML snippets
@@ -533,7 +632,7 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): Holdin
       
       if (holdings.length > 0) {
         console.log(`Found ${holdings.length} holdings in snippet`);
-        return holdings;
+        return { holdings, scaleResult };
       }
     }
     
@@ -544,7 +643,7 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): Holdin
     console.error("Error parsing HTML:", error);
   }
   
-  return [];
+  return { holdings: [], scaleResult };
 }
 
 // Main serve function
@@ -595,6 +694,7 @@ serve(async (req) => {
     console.log(`Index URL: ${indexUrl}`);
     
     let holdings: Holding[] = [];
+    let scaleResult: ScaleDetectionResult = { scale: 0.001, detected: 'thousands', confidence: 'low' };
     const warnings: string[] = [];
     let docUrl = "";
     
@@ -695,7 +795,9 @@ serve(async (req) => {
           
           // If we haven't found holdings yet, enable debug mode on later documents
           const useDebug = debugMode || (docIdx >= 2 && holdings.length === 0);
-          holdings = parseHtmlScheduleOfInvestments(textToParse, useDebug);
+          const result = parseHtmlScheduleOfInvestments(textToParse, useDebug);
+          holdings = result.holdings;
+          scaleResult = result.scaleResult;
           
           console.log(`   Result: ${holdings.length} holdings found`);
           
@@ -717,12 +819,40 @@ serve(async (req) => {
       warnings.push(`Parsing error: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
     
-    // If we found holdings, insert them
+    // If we found holdings, apply scale conversion and insert them
     if (holdings.length > 0) {
+      // Validate scale detection
+      const scaleValidation = validateScale(holdings, scaleResult);
+      if (!scaleValidation.valid) {
+        console.warn(`⚠️ Scale validation warning: ${scaleValidation.warning}`);
+        warnings.push(scaleValidation.warning || "Scale validation failed");
+      }
+      
+      // Apply scale conversion - convert all values to millions
+      console.log(`📊 Applying scale conversion: ${scaleResult.detected} -> millions (multiplier: ${scaleResult.scale})`);
+      
       const holdingsToInsert = holdings.map((h) => ({
         filing_id: filingId,
-        ...h,
+        company_name: h.company_name,
+        investment_type: h.investment_type,
+        industry: h.industry,
+        description: h.description,
+        interest_rate: h.interest_rate,
+        reference_rate: h.reference_rate,
+        maturity_date: h.maturity_date,
+        par_amount: toMillions(h.par_amount, scaleResult.scale),
+        cost: toMillions(h.cost, scaleResult.scale),
+        fair_value: toMillions(h.fair_value, scaleResult.scale),
       }));
+      
+      // Log sample converted values
+      if (holdingsToInsert.length > 0) {
+        const sample = holdingsToInsert[0];
+        console.log(`📊 Sample conversion: ${holdings[0].company_name}`);
+        console.log(`   Fair Value: ${holdings[0].fair_value} -> $${sample.fair_value}M`);
+        console.log(`   Cost: ${holdings[0].cost} -> $${sample.cost}M`);
+        console.log(`   Par: ${holdings[0].par_amount} -> $${sample.par_amount}M`);
+      }
 
       const { error: insertError } = await supabaseClient
         .from("holdings")
@@ -732,22 +862,27 @@ serve(async (req) => {
         throw new Error(`Error inserting holdings: ${insertError.message}`);
       }
 
-      // Mark filing as parsed successfully
+      // Mark filing as parsed successfully and store the detected scale
       const { error: updateError } = await supabaseClient
         .from("filings")
-        .update({ parsed_successfully: true })
+        .update({ 
+          parsed_successfully: true,
+          value_scale: scaleResult.detected
+        })
         .eq("id", filingId);
 
       if (updateError) {
         console.error("Error updating filing status:", updateError);
       }
 
-      console.log(`Inserted ${holdingsToInsert.length} holdings for filing ${accessionNo}`);
+      console.log(`Inserted ${holdingsToInsert.length} holdings for filing ${accessionNo} (scale: ${scaleResult.detected})`);
 
       return new Response(
         JSON.stringify({
           filingId,
           holdingsInserted: holdingsToInsert.length,
+          valueScale: scaleResult.detected,
+          scaleConfidence: scaleResult.confidence,
           warnings: warnings.length > 0 ? warnings : undefined,
         }),
         {
