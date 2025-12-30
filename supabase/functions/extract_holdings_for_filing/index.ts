@@ -375,33 +375,39 @@ const INDUSTRY_PATTERNS = [
   // Technology & Software
   /^technology/i, /^software/i, /^internet/i, /^it services/i,
   /^technology hardware/i, /^semiconductors/i, /^electronic/i,
+  /^software and services/i, /^technology services/i,
   // Healthcare
   /^health care/i, /^healthcare/i, /^pharmaceuticals/i, /^biotechnology/i,
-  /^life sciences/i, /^medical/i, /^biotech/i,
+  /^life sciences/i, /^medical/i, /^biotech/i, /^health care equipment/i,
   // Financial
   /^financial/i, /^insurance/i, /^banking/i, /^capital markets/i,
-  /^diversified financials/i, /^real estate/i,
+  /^diversified financials/i, /^real estate/i, /^financial services/i,
   // Consumer
   /^consumer/i, /^retail/i, /^food/i, /^beverage/i, /^household/i,
   /^personal products/i, /^textiles/i, /^apparel/i, /^leisure/i,
+  /^consumer services/i, /^consumer discretionary/i, /^consumer staples/i,
+  /^consumer distribution/i, /^food, beverage/i, /^food and beverage/i,
   // Industrial
   /^industrial/i, /^manufacturing/i, /^capital goods/i, /^machinery/i,
   /^aerospace/i, /^defense/i, /^construction/i, /^building/i,
+  /^commercial and professional/i, /^commercial services/i,
   // Services
   /^commercial/i, /^professional services/i, /^business services/i,
   /^support services/i, /^education/i, /^transportation/i,
   // Utilities & Energy
-  /^utilities/i, /^energy/i, /^oil/i, /^gas utilities/i, /^electric/i,
-  /^power/i, /^renewable/i,
+  /^utilities/i, /^energy/i, /^oil/i, /^gas utilities/i, /^electric utilities/i,
+  /^power/i, /^renewable/i, /^electric/i, /^water utilities/i,
   // Media & Communications
   /^media/i, /^communications/i, /^telecommunication/i, /^entertainment/i,
-  /^broadcasting/i, /^advertising/i,
+  /^broadcasting/i, /^advertising/i, /^media and entertainment/i,
+  /^sports/i, /^sports,? media/i,
   // Materials
   /^materials/i, /^chemicals/i, /^metals/i, /^mining/i, /^paper/i,
   // Other common SEC industry categories
   /^automobiles/i, /^auto/i, /^hotels/i, /^restaurants/i, /^gaming/i,
-  /^investment funds/i, /^sports/i, /^distribution/i, /^logistics/i,
+  /^investment funds/i, /^distribution/i, /^logistics/i,
   /^environmental/i, /^containers/i, /^packaging/i,
+  /^retailing/i, /^household products/i,
 ];
 
 // Investment type labels that indicate this is a type description, not a company
@@ -448,6 +454,59 @@ function isIndustrySectionHeader(text: string): boolean {
   for (const pattern of INDUSTRY_PATTERNS) {
     if (pattern.test(trimmed)) {
       return true;
+    }
+  }
+  
+  return false;
+}
+
+// Check if a row looks like an industry section header based on structure
+// Industry headers typically have: fewer cells, no numerical values, potential colspan
+function isRowAnIndustrySectionHeader(cells: Element[], companyCellText: string, expectedCellCount: number): boolean {
+  if (!companyCellText || companyCellText.length < 3) return false;
+  
+  // First check if the text itself looks like an industry header
+  if (isIndustrySectionHeader(companyCellText)) return true;
+  
+  // Additional structural checks
+  // Check if this row has significantly fewer cells than typical data rows
+  if (cells.length < Math.floor(expectedCellCount * 0.5) && cells.length <= 3) {
+    // Row has fewer cells - check if first cell has colspan or spans the row
+    const firstCell = cells[0];
+    const colspan = parseInt(firstCell?.getAttribute("colspan") || "1", 10);
+    
+    // If first cell has large colspan, it's likely a section header
+    if (colspan >= 3) {
+      // Additional check: no company suffix and no numbers
+      const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited)\b/i.test(companyCellText);
+      const hasNumericValues = /\$[\d,]+|\d+\.\d+%/.test(companyCellText);
+      
+      if (!hasCompanyEntity && !hasNumericValues) {
+        return true;
+      }
+    }
+  }
+  
+  // Check if all cells except first are empty (common for section headers)
+  if (cells.length > 1) {
+    const otherCellsEmpty = cells.slice(1).every(cell => {
+      const text = cell.textContent?.trim() || "";
+      return text === "" || text === "-" || text === "—";
+    });
+    
+    if (otherCellsEmpty) {
+      // All other cells empty - check if first cell looks like industry
+      const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited)\b/i.test(companyCellText);
+      const hasNumericValues = /\$[\d,]+|\d+\.\d+%/.test(companyCellText);
+      
+      if (!hasCompanyEntity && !hasNumericValues && companyCellText.length < 100) {
+        // Check if it's not a common subtotal phrase
+        const lower = companyCellText.toLowerCase();
+        const isSubtotal = /total|subtotal|net assets|portfolio|balance/i.test(lower);
+        if (!isSubtotal) {
+          return true;
+        }
+      }
     }
   }
   
@@ -700,6 +759,9 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     // Cap the number of rows we process per table to prevent blowup
     const rowsToProcess = Math.min(rows.length, headerRowIndex + maxRowsPerTable + 1);
     
+    // Track expected cell count for structure-based industry header detection
+    let expectedCellCount = headerCells.length;
+    
     for (let i = headerRowIndex + 1; i < rowsToProcess; i++) {
       const row = rows[i] as Element;
       const cellNodes = Array.from(row.querySelectorAll("td"));
@@ -717,8 +779,8 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       const industryCell = colIndices.industry >= 0 ? getCellAtPosition(cells, colIndices.industry) : null;
       const industryCellText = industryCell?.textContent?.trim() || "";
       
-      // Check if this row is an industry section header
-      if (companyCellText && isIndustrySectionHeader(companyCellText)) {
+      // Check if this row is an industry section header (using enhanced detection)
+      if (companyCellText && isRowAnIndustrySectionHeader(cells, companyCellText, expectedCellCount)) {
         // This row is an industry section header - update current industry
         currentIndustry = companyCellText;
         currentCompany = null; // Reset company when entering new industry section
