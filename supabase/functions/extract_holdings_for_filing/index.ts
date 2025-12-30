@@ -2238,11 +2238,20 @@ serve(async (req) => {
                     // Skip headers, notes, and balance sheet items
                     if (/^(net|balance|notes|schedule|see accompanying|fair value|cost|principal|company|investment type)/i.test(firstCell)) continue;
                     
+                    // Skip date entries that got captured as company names
+                    if (/^(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d/i.test(firstCell)) continue;
+                    
+                    // Skip entries that are just category labels (no entity suffix, very generic)
+                    if (/^(subordinated notes|other liabilities|other assets|derivative|net change)/i.test(firstCell)) continue;
+                    
                     const isNonPortfolioItem = NON_PORTFOLIO_ITEMS.some(item => lowerFirstCell.includes(item));
                     if (isNonPortfolioItem) continue;
                     
                     const companyName = cleanCompanyName(firstCell);
                     if (!companyName || companyName.length < 5) continue;
+                    
+                    // Skip if looks like a date format (e.g., "April 29, 2025")
+                    if (/^\w+\s+\d{1,2},?\s+\d{4}$/.test(companyName)) continue;
                     
                     // FIX #2: MIDDLE-SWEEP METADATA EXTRACTION
                     const middleCells = textCells.slice(1);
