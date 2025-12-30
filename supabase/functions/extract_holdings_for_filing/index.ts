@@ -685,6 +685,12 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       const costCell = colIndices.cost >= 0 ? getCellAtPosition(cells, colIndices.cost) : null;
       const cost = parseNumeric(costCell?.textContent?.trim());
       
+      // Debug logging for first few rows
+      if (debugMode && i <= headerRowIndex + 20) {
+        const totalCellSpan = cells.reduce((sum, c) => sum + parseInt(c.getAttribute("colspan") || "1", 10), 0);
+        console.log(`Row ${i - headerRowIndex}: cells=${cells.length}, span=${totalCellSpan}, company="${companyCellText.substring(0, 30)}", FV=${fairValue}, cost=${cost}`);
+      }
+      
       // Skip rows without fair value (could be subtotals, headers, or empty lines)
       if (fairValue === null || fairValue === 0) {
         // Don't log as rejected - these are expected empty rows in multi-line format
