@@ -2323,6 +2323,15 @@ serve(async (req) => {
                     
                     if (fairValue === null || fairValue === 0) continue;
                     
+                    // SANITY CHECK: Fair values should be reasonable for BDC holdings
+                    // Values like -26912 or 5394181 are XBRL IDs, not real fair values
+                    // Real holdings typically range from $0.1M to $1000M per position
+                    const absFairValue = Math.abs(fairValue);
+                    if (absFairValue > 2000 || absFairValue < 0.01) {
+                      // Skip obviously incorrect values (likely XBRL numeric IDs)
+                      continue;
+                    }
+                    
                     // Validation - ensure it's not a skip keyword
                     const lowerName = companyName.toLowerCase();
                     const isSkipWord = SKIP_KEYWORDS.some(kw => lowerName.includes(kw));
