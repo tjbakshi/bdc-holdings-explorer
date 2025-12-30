@@ -20,7 +20,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Download } from "lucide-react";
+import * as XLSX from "xlsx";
 
 const BdcDetail = () => {
   const { bdcId } = useParams<{ bdcId: string }>();
@@ -136,6 +137,39 @@ const BdcDetail = () => {
     ? ((portfolioSummary.totalFairValue / portfolioSummary.totalCost) * 100).toFixed(2) + "%" 
     : "—";
 
+  const exportToExcel = () => {
+    if (!holdings || !bdc) return;
+    
+    const selectedFiling = filings?.find(f => f.id === selectedFilingId);
+    const periodEnd = selectedFiling ? formatDate(selectedFiling.period_end) : "Unknown";
+    
+    const exportData = holdings.map((h) => ({
+      "Portfolio Company": h.company_name,
+      "Investment Type": h.investment_type || "",
+      "Industry": h.industry || "",
+      "Description": h.description || "",
+      "Interest Rate": h.interest_rate || "",
+      "Reference Rate": h.reference_rate || "",
+      "Maturity Date": h.maturity_date || "",
+      "Par Amount ($M)": h.par_amount ?? h.cost ?? "",
+      "Cost ($M)": h.cost ?? "",
+      "Fair Value ($M)": h.fair_value ?? "",
+      "FMV % Par": h.fair_value && (h.par_amount ?? h.cost) 
+        ? ((h.fair_value / (h.par_amount ?? h.cost!)) * 100).toFixed(2) + "%" 
+        : "",
+      "FMV % Cost": h.fair_value && h.cost 
+        ? ((h.fair_value / h.cost) * 100).toFixed(2) + "%" 
+        : "",
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(exportData);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Holdings");
+    
+    const fileName = `${bdc.ticker || bdc.bdc_name}_Holdings_${periodEnd.replace(/\//g, "-")}.xlsx`;
+    XLSX.writeFile(workbook, fileName);
+  };
+
   if (bdcLoading) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
@@ -242,12 +276,18 @@ const BdcDetail = () => {
               </Card>
             ) : (
               <Card>
-                <CardHeader>
-                  <CardTitle>Portfolio Holdings</CardTitle>
-                  <CardDescription>
-                    Showing {holdings.length} holdings for the selected filing period
-                    <span className="ml-2 text-xs text-muted-foreground">(Values in millions USD)</span>
-                  </CardDescription>
+                <CardHeader className="flex flex-row items-center justify-between">
+                  <div>
+                    <CardTitle>Portfolio Holdings</CardTitle>
+                    <CardDescription>
+                      Showing {holdings.length} holdings for the selected filing period
+                      <span className="ml-2 text-xs text-muted-foreground">(Values in millions USD)</span>
+                    </CardDescription>
+                  </div>
+                  <Button onClick={exportToExcel} variant="outline" size="sm">
+                    <Download className="mr-2 h-4 w-4" />
+                    Export to Excel
+                  </Button>
                 </CardHeader>
                 <CardContent>
                   {/* Portfolio Summary */}
