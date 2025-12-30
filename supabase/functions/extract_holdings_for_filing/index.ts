@@ -1231,6 +1231,167 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): { hold
   return { holdings: allHoldings, scaleResult };
 }
 
+// ======================================================================
+// LIGHTWEIGHT REGEX-BASED PARSER FOR LARGE FILINGS
+// ======================================================================
+// This parser avoids DOM parsing entirely to minimize CPU usage.
+// It uses regex to extract table rows and parse holdings directly from HTML strings.
+
+function parseLargeFilingSegment(htmlSegment: string): Holding[] {
+  const holdings: Holding[] = [];
+  
+  // Find all table rows in this segment
+  const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let rowMatch;
+  
+  // Track current industry from section headers
+  let currentIndustry: string | null = null;
+  let currentCompany: string | null = null;
+  
+  while ((rowMatch = rowRegex.exec(htmlSegment)) !== null) {
+    const rowHtml = rowMatch[1];
+    
+    // Extract all cell contents - handle both td and th
+    const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
+    const cells: string[] = [];
+    let cellMatch;
+    
+    while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
+      // Clean HTML tags from cell content
+      const text = cellMatch[1]
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/\s+/g, ' ')
+        .trim();
+      cells.push(text);
+    }
+    
+    if (cells.length < 3) continue;
+    
+    const firstCell = cells[0];
+    
+    // Skip empty rows
+    if (!firstCell || firstCell.length < 2) continue;
+    
+    // Check if this is an industry section header (text in first cell, mostly empty after)
+    const nonEmptyCells = cells.filter(c => c && c.length > 1 && !/^[-—\s]*$/.test(c));
+    if (nonEmptyCells.length === 1 && firstCell.length > 5 && firstCell.length < 80) {
+      // Potential industry header
+      const isIndustryHeader = !/(LLC|Inc\.|Corp\.|L\.P\.|Ltd\.|Holdings|Company|Total|Subtotal)/i.test(firstCell);
+      if (isIndustryHeader) {
+        currentIndustry = firstCell;
+        continue;
+      }
+    }
+    
+    // Skip summary/total rows
+    if (/^(Total|Subtotal|Sub-total|Net\s|Balance|See accompanying|Notes to)/i.test(firstCell)) {
+      continue;
+    }
+    
+    // Try to find numeric values (fair value, cost) - typically in last few cells
+    const numericCells: { index: number; value: number; text: string }[] = [];
+    for (let i = cells.length - 1; i >= 0 && numericCells.length < 5; i--) {
+      const cellText = cells[i];
+      // Parse numeric: handle $, commas, parentheses for negatives
+      const cleaned = cellText.replace(/[$,\s]/g, '').trim();
+      if (cleaned && cleaned !== '-' && cleaned !== '—') {
+        const isNegative = cleaned.startsWith('(') && cleaned.endsWith(')');
+        const numStr = isNegative ? cleaned.slice(1, -1) : cleaned;
+        const parsed = parseFloat(numStr);
+        if (!isNaN(parsed) && parsed !== 0) {
+          numericCells.unshift({ index: i, value: isNegative ? -parsed : parsed, text: cellText });
+        }
+      }
+    }
+    
+    // Need at least one numeric value (fair value)
+    if (numericCells.length === 0) continue;
+    
+    // Determine company name - first cell or carry forward from previous row
+    let companyName = firstCell;
+    
+    // Check if first cell looks like a company name
+    const hasCompanyEntity = /(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Company|Partners|Group)\b/i.test(firstCell);
+    
+    if (hasCompanyEntity || firstCell.length > 10) {
+      // Clean footnotes
+      companyName = firstCell
+        .replace(/\(\d+(?:,\s*\d+)*\)\s*$/g, '')
+        .replace(/\s*[\*†‡§¶#]+\s*$/g, '')
+        .trim();
+      currentCompany = companyName;
+    } else if (currentCompany) {
+      // This might be a continuation row for the same company
+      companyName = currentCompany;
+    }
+    
+    // Skip if company name is too short or invalid
+    if (!companyName || companyName.length < 5) continue;
+    if (/^[\d\s$%.,()-]+$/.test(companyName)) continue; // Just numbers/symbols
+    
+    // Extract investment type from second cell if it looks like one
+    let investmentType: string | null = null;
+    if (cells.length > 1) {
+      const secondCell = cells[1];
+      if (/(first lien|second lien|senior|subordinated|mezzanine|equity|preferred|common|warrant|unitranche|loan|note|bond)/i.test(secondCell)) {
+        investmentType = secondCell.slice(0, 100);
+      }
+    }
+    
+    // Get fair value (last numeric), cost (second to last if exists)
+    const fairValue = numericCells[numericCells.length - 1]?.value || null;
+    const cost = numericCells.length > 1 ? numericCells[numericCells.length - 2]?.value : null;
+    const parAmount = numericCells.length > 2 ? numericCells[numericCells.length - 3]?.value : null;
+    
+    // Skip if fair value is null or zero
+    if (!fairValue || fairValue === 0) continue;
+    
+    // Try to find maturity date - look for date patterns in cells
+    let maturityDate: string | null = null;
+    for (const cell of cells) {
+      // MM/YYYY or MM/DD/YYYY patterns
+      const dateMatch = cell.match(/(\d{1,2}\/\d{1,2}\/\d{4}|\d{1,2}\/\d{4})/);
+      if (dateMatch) {
+        maturityDate = parseDate(dateMatch[1]);
+        break;
+      }
+    }
+    
+    // Try to find interest rate - look for rate patterns
+    let interestRate: string | null = null;
+    let referenceRate: string | null = null;
+    for (const cell of cells) {
+      if (/(SOFR|LIBOR|Prime)/i.test(cell)) {
+        interestRate = cell.slice(0, 100);
+        referenceRate = cell.match(/(SOFR|LIBOR|Prime)/i)?.[1]?.toUpperCase() || null;
+        break;
+      }
+      if (/\d+\.?\d*\s*%/.test(cell) && !interestRate) {
+        interestRate = cell.slice(0, 50);
+      }
+    }
+    
+    holdings.push({
+      company_name: companyName,
+      investment_type: investmentType,
+      industry: currentIndustry,
+      description: null,
+      interest_rate: interestRate,
+      reference_rate: referenceRate,
+      maturity_date: maturityDate,
+      par_amount: parAmount,
+      cost: cost,
+      fair_value: fairValue,
+    });
+  }
+  
+  return holdings;
+}
+
 // Main serve function
 serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -1427,20 +1588,32 @@ serve(async (req) => {
             console.log(`   📊 Full SOI section: ${(totalSoiSize / 1024 / 1024).toFixed(1)} MB`);
             
             // For very large SOI sections (like ARCC's $28.6B portfolio), use segment-based extraction
-            // This processes in segments and saves to DB incrementally to avoid memory issues
-            const SEGMENT_SIZE = 4_000_000; // 4MB per segment
-            const OVERLAP_SIZE = 200_000; // 200KB overlap to avoid cutting holdings
+            // Critical: Use smaller segments (1.5MB) and save to DB after EACH segment to avoid memory accumulation
+            const SEGMENT_SIZE = 1_500_000; // 1.5MB per segment - smaller to avoid memory issues
+            const OVERLAP_SIZE = 100_000; // 100KB overlap to avoid cutting holdings
             
-            if (totalSoiSize > 6_000_000) {
-              console.log(`   📦 Large SOI section detected, using segmented extraction...`);
-              console.log(`   📦 Will process in ${Math.ceil(totalSoiSize / SEGMENT_SIZE)} segments of ~4MB each`);
+            if (totalSoiSize > 4_000_000) {
+              const numSegments = Math.ceil(totalSoiSize / SEGMENT_SIZE);
+              console.log(`   📦 Large SOI section detected, using segmented DB-save approach...`);
+              console.log(`   📦 Will process ${numSegments} segments of ~1.5MB, saving to DB after each`);
               
-              // Process segments and collect holdings, then save at end
-              const allHoldings: Holding[] = [];
+              // First delete any existing holdings for this filing to avoid duplicates
+              const { error: deleteError } = await supabaseClient
+                .from("holdings")
+                .delete()
+                .eq("filing_id", filingId);
+              
+              if (deleteError) {
+                console.error(`   ⚠️ Error clearing existing holdings:`, deleteError);
+              }
+              
+              // Track holdings keys across segments for deduplication
+              const seenHoldingKeys = new Set<string>();
               let combinedScaleResult: ScaleDetectionResult | null = null;
               let currentPosition = soiStart;
               let segmentCount = 0;
-              let totalValue = 0;
+              let totalInserted = 0;
+              let runningTotalValue = 0;
               
               while (currentPosition < soiEnd) {
                 segmentCount++;
@@ -1448,25 +1621,65 @@ serve(async (req) => {
                 
                 const segmentMBStart = ((currentPosition - soiStart) / 1024 / 1024).toFixed(1);
                 const segmentMBEnd = ((segmentEnd - soiStart) / 1024 / 1024).toFixed(1);
-                console.log(`   📦 Segment ${segmentCount}: Processing MB ${segmentMBStart} to ${segmentMBEnd}...`);
-                
-                // Extract this segment from the HTML
-                const segment = html.slice(currentPosition, segmentEnd);
+                console.log(`   📦 Segment ${segmentCount}/${numSegments}: MB ${segmentMBStart}-${segmentMBEnd}`);
                 
                 try {
-                  // Parse holdings from this segment
-                  const segmentResult = parseHtmlScheduleOfInvestments(segment, false);
+                  // Extract and parse this segment using the LIGHTWEIGHT regex parser (no DOM)
+                  const segment = html.slice(currentPosition, segmentEnd);
                   
-                  if (!combinedScaleResult && segmentResult.scaleResult) {
-                    combinedScaleResult = segmentResult.scaleResult;
+                  // Detect scale on first segment only
+                  if (!combinedScaleResult) {
+                    combinedScaleResult = detectScale(segment);
+                    console.log(`   📊 Scale detected: ${combinedScaleResult.detected}`);
                   }
                   
-                  if (segmentResult.holdings.length > 0) {
-                    const segmentValue = segmentResult.holdings.reduce((sum, h) => sum + (h.fair_value || 0), 0);
-                    totalValue += segmentValue;
-                    allHoldings.push(...segmentResult.holdings);
-                    console.log(`   ✅ Segment ${segmentCount}: Found ${segmentResult.holdings.length} holdings (segment value: ${(segmentValue * 0.001).toFixed(1)}M)`);
-                    console.log(`   📊 Running total: ${allHoldings.length} holdings (~$${(totalValue * 0.001).toFixed(1)}M)`);
+                  // Use lightweight regex parser - much faster and lower memory
+                  const segmentHoldings = parseLargeFilingSegment(segment);
+                  
+                  if (segmentHoldings.length > 0) {
+                    // Deduplicate against previously seen holdings
+                    const scale = combinedScaleResult?.scale || 1; // ARCC reports in millions
+                    const newHoldings: Holding[] = [];
+                    
+                    for (const h of segmentHoldings) {
+                      const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}|${h.maturity_date || ''}`;
+                      if (!seenHoldingKeys.has(key)) {
+                        seenHoldingKeys.add(key);
+                        newHoldings.push(h);
+                      }
+                    }
+                    
+                    if (newHoldings.length > 0) {
+                      // Convert and save to DB immediately
+                      const holdingsToInsert = newHoldings.map((h) => ({
+                        filing_id: filingId,
+                        company_name: h.company_name,
+                        investment_type: h.investment_type,
+                        industry: h.industry,
+                        description: h.description,
+                        interest_rate: h.interest_rate,
+                        reference_rate: h.reference_rate,
+                        maturity_date: h.maturity_date,
+                        par_amount: toMillions(h.par_amount, scale),
+                        cost: toMillions(h.cost, scale),
+                        fair_value: toMillions(h.fair_value, scale),
+                      }));
+                      
+                      const { error: insertError } = await supabaseClient
+                        .from("holdings")
+                        .insert(holdingsToInsert);
+                      
+                      if (insertError) {
+                        console.error(`   ⚠️ Insert error in segment ${segmentCount}:`, insertError.message);
+                      } else {
+                        totalInserted += holdingsToInsert.length;
+                        const segmentValue = holdingsToInsert.reduce((sum, h) => sum + (h.fair_value || 0), 0);
+                        runningTotalValue += segmentValue;
+                        console.log(`   ✅ Saved ${holdingsToInsert.length} new holdings ($${segmentValue.toFixed(1)}M) | Total: ${totalInserted} ($${runningTotalValue.toFixed(1)}M)`);
+                      }
+                    } else {
+                      console.log(`   ⚪ Segment ${segmentCount}: All ${segmentHoldings.length} holdings were duplicates`);
+                    }
                   } else {
                     console.log(`   ⚪ Segment ${segmentCount}: No holdings found`);
                   }
@@ -1474,35 +1687,58 @@ serve(async (req) => {
                   console.error(`   ⚠️ Error processing segment ${segmentCount}:`, segmentError);
                 }
                 
-                // Move to next segment with overlap
-                currentPosition = segmentEnd - OVERLAP_SIZE;
+                // Move to next segment with overlap - but ensure we always advance
+                const nextPosition = segmentEnd - OVERLAP_SIZE;
+                if (nextPosition <= currentPosition) {
+                  // We've reached the end, break the loop
+                  break;
+                }
+                currentPosition = nextPosition;
                 
-                // Small pause between segments to prevent overwhelming
-                await new Promise(resolve => setTimeout(resolve, 50));
+                // Brief pause to allow garbage collection
+                await new Promise(resolve => setTimeout(resolve, 10));
               }
               
-              console.log(`   📦 Segment processing complete. Raw count: ${allHoldings.length} holdings`);
-              
-              // Deduplicate holdings from overlapping segments
-              // Use composite key: company_name + investment_type + fair_value + maturity_date
-              const holdingKeys = new Set<string>();
-              holdings = allHoldings.filter(h => {
-                const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}|${h.maturity_date || ''}`;
-                if (holdingKeys.has(key)) return false;
-                holdingKeys.add(key);
-                return true;
-              });
+              console.log(`   📦 Segmented extraction complete!`);
+              console.log(`   📊 Total: ${totalInserted} holdings, $${runningTotalValue.toFixed(1)}M`);
               
               if (combinedScaleResult) scaleResult = combinedScaleResult;
               
-              const estimatedTotal = holdings.reduce((sum, h) => sum + (h.fair_value || 0), 0) * scaleResult.scale;
-              console.log(`   📦 After deduplication: ${holdings.length} unique holdings`);
-              console.log(`   📊 Estimated total value: $${estimatedTotal.toFixed(1)}M`);
-              
-              if (holdings.length > 0) {
-                console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name} (segmented)`);
-                break;
+              // For segmented extraction, we've already saved to DB, so mark filing as parsed and return
+              if (totalInserted > 0) {
+                const { error: updateError } = await supabaseClient
+                  .from("filings")
+                  .update({ 
+                    parsed_successfully: true,
+                    value_scale: scaleResult?.detected || 'unknown'
+                  })
+                  .eq("id", filingId);
+                
+                if (updateError) {
+                  console.error("Error updating filing status:", updateError);
+                }
+                
+                console.log(`✅ Segmented extraction: Inserted ${totalInserted} holdings for filing ${accessionNo}`);
+                
+                return new Response(
+                  JSON.stringify({
+                    filingId,
+                    holdingsInserted: totalInserted,
+                    totalValue: runningTotalValue,
+                    valueScale: scaleResult?.detected || 'unknown',
+                    scaleConfidence: scaleResult?.confidence || 'low',
+                    method: 'segmented',
+                    segments: segmentCount,
+                    warnings: warnings.length > 0 ? warnings : undefined,
+                  }),
+                  {
+                    headers: { ...corsHeaders, "Content-Type": "application/json" },
+                  }
+                );
               }
+              
+              // If no holdings found in segmented mode, continue to try other docs
+              console.log(`   ⚠️ Segmented extraction found no holdings, trying other documents...`);
             } else {
               // Standard processing for smaller sections
               textToParse = html.slice(soiStart, soiEnd);
