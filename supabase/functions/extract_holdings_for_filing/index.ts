@@ -1698,9 +1698,15 @@ serve(async (req) => {
         const nameA = a.name?.toLowerCase() || "";
         const nameB = b.name?.toLowerCase() || "";
         
-        // Highest priority: files that look like the main filing document (10-K, 10-Q)
-        const isMainDocA = /\d+-q\.htm|10-k\.htm|^[a-z]+\d+\.htm$|primary_doc/i.test(nameA);
-        const isMainDocB = /\d+-q\.htm|10-k\.htm|^[a-z]+\d+\.htm$|primary_doc/i.test(nameB);
+        // DEPRIORITIZE R*.htm files (XBRL viewer files, not actual data)
+        const isXbrlViewerA = /^r\d+\.htm$/i.test(nameA);
+        const isXbrlViewerB = /^r\d+\.htm$/i.test(nameB);
+        if (!isXbrlViewerA && isXbrlViewerB) return -1;
+        if (isXbrlViewerA && !isXbrlViewerB) return 1;
+        
+        // Highest priority: main filing document (ticker-date.htm pattern)
+        const isMainDocA = /^[a-z]{3,5}-\d{8}\.htm$/i.test(nameA);
+        const isMainDocB = /^[a-z]{3,5}-\d{8}\.htm$/i.test(nameB);
         if (isMainDocA && !isMainDocB) return -1;
         if (!isMainDocA && isMainDocB) return 1;
         
@@ -1709,18 +1715,6 @@ serve(async (req) => {
         const sizeB = b.size || 0;
         if (sizeA > 1000000 && sizeB < 1000000) return -1;
         if (sizeA < 1000000 && sizeB > 1000000) return 1;
-        
-        // Third priority: files with "schedule" in name
-        const hasScheduleA = nameA.includes("schedule") || nameA.includes("soi");
-        const hasScheduleB = nameB.includes("schedule") || nameB.includes("soi");
-        if (hasScheduleA && !hasScheduleB) return -1;
-        if (!hasScheduleA && hasScheduleB) return 1;
-        
-        // Fourth priority: files with "invest" in name
-        const hasInvestA = nameA.includes("invest");
-        const hasInvestB = nameB.includes("invest");
-        if (hasInvestA && !hasInvestB) return -1;
-        if (!hasInvestA && hasInvestB) return 1;
         
         // Deprioritize exhibit files
         const isExhibitA = nameA.includes("ex") || nameA.includes("exhibit");
@@ -1745,8 +1739,11 @@ serve(async (req) => {
         console.log(`   URL: ${docUrl}`);
         
         try {
-          // Check file size first to avoid loading huge files into memory
-          const fileSize = await getSecFileSize(docUrl);
+          // Check file size - use size from index.json first, fallback to HEAD request
+          let fileSize = doc.size || null;
+          if (!fileSize) {
+            fileSize = await getSecFileSize(docUrl);
+          }
           console.log(`   Size: ${fileSize ? `${(fileSize / 1024).toFixed(0)} KB` : 'unknown'}`);
           
           // For VERY large files (>2MB), use the chunked streaming approach
@@ -1763,8 +1760,8 @@ serve(async (req) => {
               console.error(`   ⚠️ Error clearing existing holdings:`, deleteError);
             }
             
-            // Fetch first 100KB to detect scale and find SOI section boundaries
-            const headerChunk = await fetchSecFileChunked(docUrl, 0, 100_000);
+            // Fetch first 500KB to detect scale and find SOI section boundaries (larger chunk)
+            const headerChunk = await fetchSecFileChunked(docUrl, 0, 500_000);
             const scaleResult = detectScale(headerChunk);
             console.log(`   📊 Scale detected: ${scaleResult.detected}`);
             const scale = scaleResult.scale;
@@ -1772,17 +1769,22 @@ serve(async (req) => {
             // Find where SOI section likely starts
             const lowerHeader = headerChunk.toLowerCase();
             let soiStartGuess = lowerHeader.indexOf('schedule of investments');
-            if (soiStartGuess === -1) soiStartGuess = 0;
+            if (soiStartGuess === -1) {
+              console.log(`   ⚠️ SOI not found in first 500KB, starting from beginning`);
+              soiStartGuess = 0;
+            } else {
+              console.log(`   📍 SOI found at position ${soiStartGuess} in header chunk`);
+            }
             
-            // Process file in 150KB chunks, accumulating holdings
-            const CHUNK_SIZE = 150_000;
-            const OVERLAP = 10_000;
+            // Process file in 200KB chunks, accumulating holdings
+            const CHUNK_SIZE = 200_000;
+            const OVERLAP = 5_000;
             const allHoldings: Holding[] = [];
             const seenKeys = new Set<string>();
             let activeIndustry: string | null = null;
+            let rowsProcessed = 0;
             
-            // Regex patterns for parsing
-            const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+            // Regex patterns for parsing - create new one each chunk to reset lastIndex
             const tagRemoveRegex = /<[^>]+>/g;
             const nbspRegex = /&nbsp;/gi;
             
@@ -1793,8 +1795,8 @@ serve(async (req) => {
               chunkCount++;
               const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, fileSize);
               
-              if (chunkCount % 10 === 1) {
-                console.log(`   📦 Chunk ${chunkCount}: ${(chunkStart / 1024).toFixed(0)}KB - ${(chunkEnd / 1024).toFixed(0)}KB (${allHoldings.length} holdings so far)`);
+              if (chunkCount % 5 === 1 || chunkCount <= 3) {
+                console.log(`   📦 Chunk ${chunkCount}: ${(chunkStart / 1024).toFixed(0)}KB - ${(chunkEnd / 1024).toFixed(0)}KB, rows=${rowsProcessed}, holdings=${allHoldings.length}`);
               }
               
               try {
@@ -1803,16 +1805,21 @@ serve(async (req) => {
                 
                 // Stop if we hit the notes section or prior period
                 if (chunkLower.includes('notes to consolidated financial statements') ||
-                    chunkLower.includes('notes to financial statements') ||
-                    chunkLower.includes('december 31, 2024') ||
-                    chunkLower.includes('december 31, 2023')) {
-                  console.log(`   📍 Found end marker in chunk ${chunkCount}, stopping`);
+                    chunkLower.includes('notes to financial statements')) {
+                  console.log(`   📍 Found notes section in chunk ${chunkCount}, stopping`);
+                  break;
+                }
+                // Check for prior period date (December of previous year)
+                if (chunkCount > 5 && (chunkLower.includes('december 31, 2024') || chunkLower.includes('december 31, 2023'))) {
+                  console.log(`   📍 Found prior period date in chunk ${chunkCount}, stopping`);
                   break;
                 }
                 
-                // Parse rows from this chunk
+                // Parse rows from this chunk - create new regex each time to reset lastIndex
+                const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
                 let rowMatch;
                 while ((rowMatch = rowRegex.exec(chunkHtml)) !== null) {
+                  rowsProcessed++;
                   const rowHtml = rowMatch[1];
                   
                   // Extract cells
@@ -1826,6 +1833,11 @@ serve(async (req) => {
                       .replace(/\s+/g, ' ')
                       .trim();
                     cells.push(cellText);
+                  }
+                  
+                  // Log first few rows for debugging
+                  if (chunkCount === 1 && rowsProcessed <= 5) {
+                    console.log(`   Row ${rowsProcessed}: ${cells.length} cells, first="${cells[0]?.substring(0, 40)}"`);
                   }
                   
                   if (cells.length < 3) continue;
@@ -1987,7 +1999,7 @@ serve(async (req) => {
           const html = await fetchSecFile(docUrl);
           
           // Scale detection
-          const scaleResult = detectScale(html);
+          let scaleResult = detectScale(html);
 
           let textToParse = html;
           // For moderately large documents (>2MB), extract just the SOI section
@@ -2014,96 +2026,8 @@ serve(async (req) => {
               console.log(`   📦 Extracted SOI: ${(textToParse.length / 1024).toFixed(0)} KB`);
             }
           }
-              
-              // Sort all holdings by industry and company name before inserting
-              const sortedHoldings = sortHoldingsByIndustryAndCompany(allSegmentHoldings);
-              console.log(`   📊 Sorted ${sortedHoldings.length} holdings by industry and company name`);
-              
-              // Insert sorted holdings in batches
-              const BATCH_SIZE = 100;
-              let totalInserted = 0;
-              let runningTotalValue = 0;
-              
-              for (let i = 0; i < sortedHoldings.length; i += BATCH_SIZE) {
-                const batch = sortedHoldings.slice(i, i + BATCH_SIZE);
-                const holdingsToInsert = batch.map((h, idx) => ({
-                  filing_id: filingId,
-                  company_name: h.company_name,
-                  investment_type: h.investment_type,
-                  industry: h.industry,
-                  description: h.description,
-                  interest_rate: h.interest_rate,
-                  reference_rate: h.reference_rate,
-                  maturity_date: h.maturity_date,
-                  par_amount: h.par_amount != null ? Math.round((h.par_amount * scale) * 10) / 10 : null,
-                  cost: h.cost != null ? Math.round((h.cost * scale) * 10) / 10 : null,
-                  fair_value: h.fair_value != null ? Math.round((h.fair_value * scale) * 10) / 10 : null,
-                  row_number: nextRowNumber + i + idx,
-                  source_pos: i + idx, // Use sorted order as source_pos
-                }));
-                
-                const { error: insertError } = await supabaseClient
-                  .from("holdings")
-                  .insert(holdingsToInsert);
-                
-                if (!insertError) {
-                  totalInserted += holdingsToInsert.length;
-                  runningTotalValue += holdingsToInsert.reduce((sum, h) => sum + (h.fair_value || 0), 0);
-                }
-              }
-              
-              console.log(`   📊 This run: ${totalInserted} new holdings, $${runningTotalValue.toFixed(1)}M`);
-              console.log(`   📊 Skipped ${skippedDuplicates} duplicates`);
-              
-              // Get final count
-              const { count: finalCount } = await supabaseClient
-                .from("holdings")
-                .select("*", { count: "exact", head: true })
-                .eq("filing_id", filingId);
-              
-              const { data: totalValueData } = await supabaseClient
-                .from("holdings")
-                .select("fair_value")
-                .eq("filing_id", filingId);
-              
-              const finalTotalValue = totalValueData?.reduce((sum, h) => sum + (h.fair_value || 0), 0) || 0;
-              
-              // Mark as parsed if we have a reasonable number of holdings
-              if ((finalCount || 0) > 100) {
-                await supabaseClient
-                  .from("filings")
-                  .update({ 
-                    parsed_successfully: true,
-                    value_scale: segmentScaleResult?.detected || 'unknown'
-                  })
-                  .eq("id", filingId);
-              }
-              
-              const registryStats = industryRegistry.getStats();
-              
-              return new Response(
-                JSON.stringify({
-                  filingId,
-                  holdingsInserted: totalInserted,
-                  totalHoldings: finalCount,
-                  totalValue: finalTotalValue,
-                  valueScale: segmentScaleResult?.detected || 'unknown',
-                  method: 'regex-lightweight-parser',
-                  resumed: isResume,
-                  complete: true,
-                  industriesFound: registryStats.industries,
-                  sortedByCompanyName: true,
-                }),
-                { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-              );
-            }
-            
-            // For smaller SOI sections, use standard DOM parsing
-            textToParse = html.slice(soiStart, soiEnd);
-            console.log(`   📦 Extracted SOI section: ${(textToParse.length / 1024 / 1024).toFixed(1)} MB`);
-          }
           
-          // Standard processing path (for smaller SOI sections or non-SOI documents)
+          // Standard processing path (for smaller documents)
           if (textToParse && holdings.length === 0) {
             const useDebug = debugMode || (docIdx >= 2 && holdings.length === 0);
             const result = parseHtmlScheduleOfInvestments(textToParse, useDebug, industryRegistry);
