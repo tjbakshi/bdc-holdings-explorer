@@ -2128,6 +2128,17 @@ serve(async (req) => {
               'class g redeemable', 'class h redeemable', 'class i redeemable',
               'class b preferred', 'class a preferred',
               'class b limited liability',
+              // Investment type category labels (not company names)
+              'first lien senior secured loans', 'second lien senior secured loans',
+              'senior subordinated loans', 'subordinated certificates',
+              'subordinated certificates and', 'preferred equity', 'other equity',
+              'equity/other', 'equity interests', 'common equity',
+              // Funding facilities (summary lines)
+              'revolving funding facility', 'bnp funding facility', 'smbc funding facility',
+              'funding facility', 'credit facility',
+              // Other summary items  
+              'shares outstanding', 'derivative instrument', 'members\' capital',
+              'clo secured loans', 'senior secured loans (principal',
             ];
             
             // Regex patterns for parsing - create new one each chunk to reset lastIndex
