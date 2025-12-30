@@ -374,7 +374,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       maturity: findHeader(["maturity", "expiration", "due"]),
       par: findHeader(["par", "principal", "face"]),
       cost: findHeader(["cost", "amortized"]),
-      fairValue: findHeader(["fair value", "fair", "market"]),
+      fairValue: findHeader(["fair value", "fairvalue", "fair", "market"]),
     };
     
     if (debugMode) {
