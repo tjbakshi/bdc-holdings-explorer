@@ -163,14 +163,40 @@ function parseDate(value: string | null | undefined): string | null {
   if (!value) return null;
   
   const cleaned = value.trim();
-  if (!cleaned || cleaned === "-" || cleaned === "—") return null;
+  if (!cleaned || cleaned === "-" || cleaned === "—" || cleaned.toLowerCase() === "n/a") return null;
   
-  // Try parsing common date formats
+  // Try MM/DD/YYYY format (common in SEC filings)
+  const mmddyyyyMatch = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (mmddyyyyMatch) {
+    const [, month, day, year] = mmddyyyyMatch;
+    const date = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+    if (!isNaN(date.getTime())) {
+      return date.toISOString().split("T")[0];
+    }
+  }
+  
+  // Try Month DD, YYYY format (e.g., "December 31, 2027")
+  const monthDayYearMatch = cleaned.match(/^([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})$/);
+  if (monthDayYearMatch) {
+    const date = new Date(cleaned);
+    if (!isNaN(date.getTime())) {
+      return date.toISOString().split("T")[0];
+    }
+  }
+  
+  // Try YYYY-MM-DD format (ISO)
+  const isoMatch = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    return cleaned;
+  }
+  
+  // Try standard Date parsing as fallback
   const date = new Date(cleaned);
   if (!isNaN(date.getTime())) {
     return date.toISOString().split("T")[0];
   }
   
+  console.log(`⚠️ Could not parse date: "${cleaned}"`);
   return null;
 }
 
