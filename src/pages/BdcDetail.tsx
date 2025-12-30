@@ -20,8 +20,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { ArrowLeft, Download, Search, RotateCcw, Trash2, AlertTriangle } from "lucide-react";
+import { ArrowLeft, Download, Search, RotateCcw, Trash2, AlertTriangle, Loader2 } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -41,6 +42,7 @@ const BdcDetail = () => {
   const [selectedFilingId, setSelectedFilingId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [isResetting, setIsResetting] = useState<string | null>(null);
+  const [resetProgress, setResetProgress] = useState<'idle' | 'resetting' | 'extracting' | 'done'>('idle');
   const [isClearing, setIsClearing] = useState(false);
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -231,6 +233,7 @@ const BdcDetail = () => {
 
   const handleResetFiling = async (filingId: string) => {
     setIsResetting(filingId);
+    setResetProgress('resetting');
     try {
       // Step 1: Reset the filing (delete holdings and reset status)
       const { data, error } = await supabase.functions.invoke("manage-data", {
@@ -246,8 +249,9 @@ const BdcDetail = () => {
       });
 
       // Step 2: Re-extract holdings for the filing
+      setResetProgress('extracting');
       const { data: extractData, error: extractError } = await supabase.functions.invoke("extract_holdings_for_filing", {
-        body: { filing_id: filingId },
+        body: { filingId },
       });
 
       if (extractError) {
@@ -257,6 +261,7 @@ const BdcDetail = () => {
           description: "Reset complete. Extraction may still be processing in the background.",
         });
       } else {
+        setResetProgress('done');
         toast({
           title: "Filing Re-Parsed",
           description: extractData?.message || "Holdings have been re-extracted successfully.",
@@ -275,6 +280,7 @@ const BdcDetail = () => {
       });
     } finally {
       setIsResetting(null);
+      setResetProgress('idle');
     }
   };
 
@@ -401,17 +407,16 @@ const BdcDetail = () => {
                   </SelectContent>
                 </Select>
                 
-                {selectedFilingId && (
+                {selectedFilingId && !isResetting && (
                   <AlertDialog>
                     <AlertDialogTrigger asChild>
                       <Button 
                         variant="outline" 
                         size="sm" 
                         className="text-destructive border-destructive hover:bg-destructive hover:text-destructive-foreground"
-                        disabled={isResetting === selectedFilingId}
                       >
                         <RotateCcw className="mr-1 h-4 w-4" />
-                        {isResetting === selectedFilingId ? "Resetting..." : "Reset Filing"}
+                        Reset & Re-Parse
                       </Button>
                     </AlertDialogTrigger>
                     <AlertDialogContent>
@@ -421,8 +426,8 @@ const BdcDetail = () => {
                           Reset Filing Data
                         </AlertDialogTitle>
                         <AlertDialogDescription>
-                          This will permanently delete all holdings for this filing and reset its parsing status. 
-                          You will need to re-parse the filing to recover the data.
+                          This will permanently delete all holdings for this filing, reset its parsing status, 
+                          and automatically re-extract the holdings from the SEC filing.
                           <br /><br />
                           <strong>This action cannot be undone.</strong>
                         </AlertDialogDescription>
@@ -433,11 +438,33 @@ const BdcDetail = () => {
                           onClick={() => handleResetFiling(selectedFilingId)}
                           className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
                         >
-                          Reset Filing
+                          Reset & Re-Parse
                         </AlertDialogAction>
                       </AlertDialogFooter>
                     </AlertDialogContent>
                   </AlertDialog>
+                )}
+                
+                {/* Progress indicator during reset/extraction */}
+                {isResetting === selectedFilingId && (
+                  <div className="flex items-center gap-3 px-3 py-2 bg-muted rounded-md">
+                    <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                    <div className="flex flex-col gap-1 min-w-[200px]">
+                      <span className="text-sm font-medium">
+                        {resetProgress === 'resetting' && "Resetting filing..."}
+                        {resetProgress === 'extracting' && "Extracting holdings..."}
+                        {resetProgress === 'done' && "Complete!"}
+                      </span>
+                      <Progress 
+                        value={
+                          resetProgress === 'resetting' ? 33 : 
+                          resetProgress === 'extracting' ? 66 : 
+                          resetProgress === 'done' ? 100 : 0
+                        } 
+                        className="h-2"
+                      />
+                    </div>
+                  </div>
                 )}
               </div>
             </div>
