@@ -64,18 +64,32 @@ const BdcDetail = () => {
     enabled: !!bdcId,
   });
 
-  // Fetch holdings for selected filing
+  // Fetch holdings for selected filing - sorted by industry then alphabetically by company
   const { data: holdings, isLoading: holdingsLoading } = useQuery({
     queryKey: ["holdings", selectedFilingId],
     queryFn: async () => {
       const { data, error } = await supabase
         .from("holdings")
         .select("*")
-        .eq("filing_id", selectedFilingId)
-        .order("source_pos", { ascending: true, nullsFirst: false })
-        .order("row_number", { ascending: true, nullsFirst: false });
+        .eq("filing_id", selectedFilingId);
       
       if (error) throw error;
+      
+      // Sort client-side: by industry (alphabetically), then by company name within each industry
+      // This ensures consistent visual ordering regardless of HTML source position
+      if (data) {
+        data.sort((a, b) => {
+          // First sort by industry (nulls/unknown last)
+          const industryA = a.industry || 'zzz_Unknown';
+          const industryB = b.industry || 'zzz_Unknown';
+          const industryCompare = industryA.localeCompare(industryB);
+          if (industryCompare !== 0) return industryCompare;
+          
+          // Within same industry, sort alphabetically by company name
+          return a.company_name.localeCompare(b.company_name);
+        });
+      }
+      
       return data;
     },
     enabled: !!selectedFilingId,
