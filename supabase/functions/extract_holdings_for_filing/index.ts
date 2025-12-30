@@ -1419,77 +1419,99 @@ serve(async (req) => {
               }
             }
             
-            // Calculate section span
-            const sectionSpan = documentEnd - bestStart;
+            // Calculate section span - the FULL SOI section without any cap
+            const soiStart = Math.max(0, bestStart - 10_000);
+            const soiEnd = Math.min(html.length, documentEnd + 50_000);
+            const totalSoiSize = soiEnd - soiStart;
             
-            // Extract with some buffer, but cap at 8MB to avoid memory issues
-            const maxSoiSize = 8_000_000;
-            const start = Math.max(0, bestStart - 10_000);
-            let end = Math.min(html.length, documentEnd + 50_000);
+            console.log(`   📊 Full SOI section: ${(totalSoiSize / 1024 / 1024).toFixed(1)} MB`);
             
-            // If section is too large, only take the first portion
-            if (end - start > maxSoiSize) {
-              console.log(`   ⚠️ SOI section too large (${((end - start)/1024/1024).toFixed(1)}MB), capping at ${(maxSoiSize/1024/1024).toFixed(1)}MB`);
-              end = start + maxSoiSize;
+            // For very large SOI sections (like ARCC's $28.6B portfolio), use segment-based extraction
+            // This processes in segments and saves to DB incrementally to avoid memory issues
+            const SEGMENT_SIZE = 4_000_000; // 4MB per segment
+            const OVERLAP_SIZE = 200_000; // 200KB overlap to avoid cutting holdings
+            
+            if (totalSoiSize > 6_000_000) {
+              console.log(`   📦 Large SOI section detected, using segmented extraction...`);
+              console.log(`   📦 Will process in ${Math.ceil(totalSoiSize / SEGMENT_SIZE)} segments of ~4MB each`);
+              
+              // Process segments and collect holdings, then save at end
+              const allHoldings: Holding[] = [];
+              let combinedScaleResult: ScaleDetectionResult | null = null;
+              let currentPosition = soiStart;
+              let segmentCount = 0;
+              let totalValue = 0;
+              
+              while (currentPosition < soiEnd) {
+                segmentCount++;
+                const segmentEnd = Math.min(currentPosition + SEGMENT_SIZE, soiEnd);
+                
+                const segmentMBStart = ((currentPosition - soiStart) / 1024 / 1024).toFixed(1);
+                const segmentMBEnd = ((segmentEnd - soiStart) / 1024 / 1024).toFixed(1);
+                console.log(`   📦 Segment ${segmentCount}: Processing MB ${segmentMBStart} to ${segmentMBEnd}...`);
+                
+                // Extract this segment from the HTML
+                const segment = html.slice(currentPosition, segmentEnd);
+                
+                try {
+                  // Parse holdings from this segment
+                  const segmentResult = parseHtmlScheduleOfInvestments(segment, false);
+                  
+                  if (!combinedScaleResult && segmentResult.scaleResult) {
+                    combinedScaleResult = segmentResult.scaleResult;
+                  }
+                  
+                  if (segmentResult.holdings.length > 0) {
+                    const segmentValue = segmentResult.holdings.reduce((sum, h) => sum + (h.fair_value || 0), 0);
+                    totalValue += segmentValue;
+                    allHoldings.push(...segmentResult.holdings);
+                    console.log(`   ✅ Segment ${segmentCount}: Found ${segmentResult.holdings.length} holdings (segment value: ${(segmentValue * 0.001).toFixed(1)}M)`);
+                    console.log(`   📊 Running total: ${allHoldings.length} holdings (~$${(totalValue * 0.001).toFixed(1)}M)`);
+                  } else {
+                    console.log(`   ⚪ Segment ${segmentCount}: No holdings found`);
+                  }
+                } catch (segmentError) {
+                  console.error(`   ⚠️ Error processing segment ${segmentCount}:`, segmentError);
+                }
+                
+                // Move to next segment with overlap
+                currentPosition = segmentEnd - OVERLAP_SIZE;
+                
+                // Small pause between segments to prevent overwhelming
+                await new Promise(resolve => setTimeout(resolve, 50));
+              }
+              
+              console.log(`   📦 Segment processing complete. Raw count: ${allHoldings.length} holdings`);
+              
+              // Deduplicate holdings from overlapping segments
+              // Use composite key: company_name + investment_type + fair_value + maturity_date
+              const holdingKeys = new Set<string>();
+              holdings = allHoldings.filter(h => {
+                const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}|${h.maturity_date || ''}`;
+                if (holdingKeys.has(key)) return false;
+                holdingKeys.add(key);
+                return true;
+              });
+              
+              if (combinedScaleResult) scaleResult = combinedScaleResult;
+              
+              const estimatedTotal = holdings.reduce((sum, h) => sum + (h.fair_value || 0), 0) * scaleResult.scale;
+              console.log(`   📦 After deduplication: ${holdings.length} unique holdings`);
+              console.log(`   📊 Estimated total value: $${estimatedTotal.toFixed(1)}M`);
+              
+              if (holdings.length > 0) {
+                console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name} (segmented)`);
+                break;
+              }
+            } else {
+              // Standard processing for smaller sections
+              textToParse = html.slice(soiStart, soiEnd);
+              console.log(`   📦 Extracted SOI section: ${(textToParse.length / 1024 / 1024).toFixed(1)} MB`);
             }
-            
-            textToParse = html.slice(start, end);
-            
-            console.log(`   📦 Extracted SOI section: ${(textToParse.length / 1024 / 1024).toFixed(1)} MB (${start} to ${end}, section length: ${sectionSpan})`);
           }
           
-          // For very large sections, use streaming-style chunked processing
-          if (textToParse.length > 6_000_000) {
-            console.log(`   📦 Large SOI section (${(textToParse.length / 1024 / 1024).toFixed(1)} MB), using streaming chunks...`);
-            
-            // Process in 2MB chunks to minimize memory usage
-            const chunkSize = 2_000_000;
-            const overlap = 100_000; // 100KB overlap to avoid cutting holdings
-            const numChunks = Math.ceil(textToParse.length / chunkSize);
-            
-            console.log(`   📦 Will process ${numChunks} chunks of ~2MB each`);
-            
-            // Process each chunk immediately (streaming style)
-            const allHoldings: Holding[] = [];
-            let combinedScaleResult: ScaleDetectionResult | null = null;
-            
-            for (let i = 0; i < numChunks; i++) {
-              const start = i * chunkSize;
-              const end = Math.min(start + chunkSize + overlap, textToParse.length);
-              const chunk = textToParse.slice(start, end);
-              console.log(`   📦 Chunk ${i + 1}/${numChunks}: ${(start/1024/1024).toFixed(1)}MB - ${(end/1024/1024).toFixed(1)}MB`);
-              
-              try {
-                const chunkResult = parseHtmlScheduleOfInvestments(chunk, false);
-                console.log(`   📦 Chunk ${i + 1}: Found ${chunkResult.holdings.length} holdings`);
-                
-                if (!combinedScaleResult && chunkResult.scaleResult) {
-                  combinedScaleResult = chunkResult.scaleResult;
-                }
-                allHoldings.push(...chunkResult.holdings);
-              } catch (chunkError) {
-                console.error(`   📦 Error processing chunk ${i + 1}:`, chunkError);
-              }
-            }
-            
-            // Deduplicate holdings by company_name + investment_type + fair_value
-            const holdingKeys = new Set<string>();
-            holdings = allHoldings.filter(h => {
-              const key = `${h.company_name}|${h.investment_type}|${h.fair_value}`;
-              if (holdingKeys.has(key)) return false;
-              holdingKeys.add(key);
-              return true;
-            });
-            
-            if (combinedScaleResult) scaleResult = combinedScaleResult;
-            console.log(`   📦 Combined: ${holdings.length} unique holdings from ${allHoldings.length} total`);
-            
-            if (holdings.length > 0) {
-              console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name} (chunked)`);
-              break;
-            }
-          } else {
-            // Standard processing for smaller sections
+          // Standard processing path (for smaller SOI sections or non-SOI documents)
+          if (textToParse && holdings.length === 0) {
             const useDebug = debugMode || (docIdx >= 2 && holdings.length === 0);
             const result = parseHtmlScheduleOfInvestments(textToParse, useDebug);
             holdings = result.holdings;
