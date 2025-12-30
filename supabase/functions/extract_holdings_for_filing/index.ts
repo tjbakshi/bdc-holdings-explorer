@@ -370,7 +370,8 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       investmentType: findHeader(["investment", "type", "instrument", "class"]),
       industry: findHeader(["industry", "sector", "business"]),
       description: findHeader(["description", "notes"]),
-      interestRate: findHeader(["interest", "rate", "coupon", "spread"]),
+      interestRate: findHeader(["interest", "rate", "coupon"]),
+      spread: findHeader(["spread"]),
       maturity: findHeader(["maturity", "expiration", "due"]),
       par: findHeader(["par", "principal", "face"]),
       cost: findHeader(["cost", "amortized"]),
@@ -454,6 +455,12 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       
       const { rate, reference } = extractInterestRate(interestRateText);
       
+      // Get spread column value for reference_rate (overrides extracted reference if present)
+      const spreadCell = colIndices.spread >= 0 ? getCellAtPosition(colIndices.spread) : null;
+      const spreadText = spreadCell?.textContent?.trim() || "";
+      // Use spread column if available, otherwise fall back to extracted reference from interest rate
+      const referenceRate = spreadText || reference;
+      
       const investmentTypeCell = colIndices.investmentType >= 0 ? getCellAtPosition(colIndices.investmentType) : null;
       const industryCell = colIndices.industry >= 0 ? getCellAtPosition(colIndices.industry) : null;
       const descriptionCell = colIndices.description >= 0 ? getCellAtPosition(colIndices.description) : null;
@@ -466,7 +473,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
         industry: industryCell?.textContent?.trim() || null,
         description: descriptionCell?.textContent?.trim() || null,
         interest_rate: rate,
-        reference_rate: reference,
+        reference_rate: referenceRate || null,
         maturity_date: parseDate(maturityCell?.textContent?.trim()),
         par_amount: parseNumeric(parCell?.textContent?.trim()),
         cost,
