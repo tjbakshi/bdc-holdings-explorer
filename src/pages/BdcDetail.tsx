@@ -333,7 +333,7 @@ const BdcDetail = () => {
                               <TableCell>{holding.reference_rate || "—"}</TableCell>
                               <TableCell>{formatDate(holding.maturity_date)}</TableCell>
                               <TableCell className="text-right font-mono">
-                                {formatCurrencyMillions(holding.par_amount)}
+                                {formatCurrencyMillions(holding.par_amount ?? holding.cost)}
                               </TableCell>
                               <TableCell className="text-right font-mono">
                                 {formatCurrencyMillions(holding.cost)}
@@ -342,7 +342,7 @@ const BdcDetail = () => {
                                 {formatCurrencyMillions(holding.fair_value)}
                               </TableCell>
                               <TableCell className="text-right font-medium">
-                                {calculateFmvPar(holding.fair_value, holding.par_amount)}
+                                {calculateFmvPar(holding.fair_value, holding.par_amount ?? holding.cost)}
                               </TableCell>
                               <TableCell className="text-right font-medium">
                                 {calculateFmvCost(holding.fair_value, holding.cost)}
