@@ -2271,6 +2271,9 @@ serve(async (req) => {
                         /^(current|non-current|long-term|short-term)/i,
                         /^(new|existing|unfunded|funded|commitment)/i,
                         /^(investment|portfolio)\s+(commitments?|activity|summary)/i,
+                        /^(ratio|supplemental|data:|information:|schedule:)/i,
+                        /^(per share|weighted average|number of|shares)/i,
+                        /:$/,  // Any text ending with colon is likely a label, not an industry
                       ];
                       const isFalsePositive = falsePositivePatterns.some(p => p.test(candidateIndustry));
                       
@@ -2393,10 +2396,16 @@ serve(async (req) => {
                     const middleText = textCells.slice(1).join(' ');
                     
                     // Extract Interest Rate - AGGRESSIVE REGEX on RAW HTML
+                    // Skip "100%" which is typically ownership percentage, not interest rate
+                    // Real interest rates are typically in 3-25% range with decimal precision
                     let interestRate: string | null = null;
-                    const rateMatchRaw = middleCellsRawHtml.match(/(\d{1,2}\.?\d{0,3})\s*%/);
+                    const rateMatchRaw = middleCellsRawHtml.match(/(\d{1,2}\.\d{1,3})\s*%/);
                     if (rateMatchRaw) {
-                      interestRate = `${rateMatchRaw[1]}%`;
+                      const rateNum = parseFloat(rateMatchRaw[1]);
+                      // Interest rates are typically 3-25%, skip ownership percentages (100%, 50%, etc.)
+                      if (rateNum >= 3 && rateNum <= 25) {
+                        interestRate = `${rateMatchRaw[1]}%`;
+                      }
                     }
                     
                     // Extract Reference Rate - AGGRESSIVE REGEX on RAW HTML
