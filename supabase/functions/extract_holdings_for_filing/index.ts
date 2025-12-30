@@ -528,57 +528,77 @@ function isIndustrySectionHeader(text: string): boolean {
   return false;
 }
 
-// Check if a row looks like an industry section header based on structure
-// Industry headers typically have: fewer cells, no numerical values, potential colspan
-function isRowAnIndustrySectionHeader(cells: Element[], companyCellText: string, expectedCellCount: number): boolean {
-  if (!companyCellText || companyCellText.length < 3) return false;
+// UNIVERSAL industry header detection based on ROW STRUCTURE
+// Key insight: Industry headers have text in first cell and NOTHING else in the row
+// This works for any BDC regardless of industry naming conventions
+function isUniversalIndustryHeader(cells: Element[], firstCellText: string): boolean {
+  // Must have at least 2 cells to compare
+  if (cells.length < 2) return false;
   
-  // First check if the text itself looks like an industry header
+  // Must have text in first cell
+  if (!firstCellText || firstCellText.length === 0) return false;
+  
+  // First cell text should be reasonable length (not too long like a description)
+  if (firstCellText.length > 100) return false;
+  
+  // Check if ALL other cells are empty or contain only whitespace/non-breaking spaces
+  const otherCellsEmpty = cells.slice(1).every(cell => {
+    const content = cell.textContent?.trim() || '';
+    // Empty or just contains whitespace/non-breaking spaces
+    return content === '' || 
+           content === '\u00A0' || 
+           content === '-' ||
+           content === '—' ||
+           /^[\s\u00A0—-]*$/.test(content);
+  });
+  
+  // If other cells have content, it's not an industry header
+  if (!otherCellsEmpty) return false;
+  
+  // Exclude known non-industry patterns
+  const excludePatterns = [
+    /^Total/i,
+    /^Subtotal/i,
+    /^Sub-total/i,
+    /^Net\b/i,
+    /^See accompanying/i,
+    /^The accompanying/i,
+    /^Notes?\s*(to|$)/i,
+    /^\(/,  // Starts with parenthesis (likely a note)
+    /^\d+$/,  // Just a number
+    /^Page \d+/i,  // Page numbers
+    /^Portfolio/i,
+    /^Balance/i,
+    /^Investments\s+at/i,
+    /^\$[\d,]+/,  // Starts with dollar amount
+    /^\d+\.?\d*\s*%/,  // Starts with percentage
+    /^(First|Second|Third|Senior|Junior|Subordinated|Mezzanine|Equity|Preferred|Common)/i, // Investment types
+    /^(As of|For the|During)/i,  // Date/period phrases
+    /^Schedule of Investments/i,  // Table title
+    /^Consolidated/i,  // Table title
+  ];
+  
+  const shouldExclude = excludePatterns.some(pattern => pattern.test(firstCellText));
+  if (shouldExclude) return false;
+  
+  // Exclude if it has a company entity suffix (it's a company, not an industry)
+  const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Co\.|Company|Enterprises|Partners|Group)\b/i.test(firstCellText);
+  if (hasCompanyEntity) return false;
+  
+  // Passed all checks - this is likely an industry header
+  return true;
+}
+
+// Legacy function for backward compatibility - now calls universal detection
+function isRowAnIndustrySectionHeader(cells: Element[], companyCellText: string, expectedCellCount: number): boolean {
+  // First try exact match (highest confidence)
+  if (isExactIndustryCategory(companyCellText)) return true;
+  
+  // Then try legacy text-based detection
   if (isIndustrySectionHeader(companyCellText)) return true;
   
-  // Additional structural checks
-  // Check if this row has significantly fewer cells than typical data rows
-  if (cells.length < Math.floor(expectedCellCount * 0.5) && cells.length <= 3) {
-    // Row has fewer cells - check if first cell has colspan or spans the row
-    const firstCell = cells[0];
-    const colspan = parseInt(firstCell?.getAttribute("colspan") || "1", 10);
-    
-    // If first cell has large colspan, it's likely a section header
-    if (colspan >= 3) {
-      // Additional check: no company suffix and no numbers
-      const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited)\b/i.test(companyCellText);
-      const hasNumericValues = /\$[\d,]+|\d+\.\d+%/.test(companyCellText);
-      
-      if (!hasCompanyEntity && !hasNumericValues) {
-        return true;
-      }
-    }
-  }
-  
-  // Check if all cells except first are empty (common for section headers)
-  if (cells.length > 1) {
-    const otherCellsEmpty = cells.slice(1).every(cell => {
-      const text = cell.textContent?.trim() || "";
-      return text === "" || text === "-" || text === "—";
-    });
-    
-    if (otherCellsEmpty) {
-      // All other cells empty - check if first cell looks like industry
-      const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited)\b/i.test(companyCellText);
-      const hasNumericValues = /\$[\d,]+|\d+\.\d+%/.test(companyCellText);
-      
-      if (!hasCompanyEntity && !hasNumericValues && companyCellText.length < 100) {
-        // Check if it's not a common subtotal phrase
-        const lower = companyCellText.toLowerCase();
-        const isSubtotal = /total|subtotal|net assets|portfolio|balance/i.test(lower);
-        if (!isSubtotal) {
-          return true;
-        }
-      }
-    }
-  }
-  
-  return false;
+  // Finally use universal structure-based detection
+  return isUniversalIndustryHeader(cells, companyCellText);
 }
 
 // Check if text is an investment type label (not a company name)
@@ -847,30 +867,34 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       // Get the first cell text (could be in first td or th)
       const firstCellText = cells[0]?.textContent?.trim() || "";
       
-      // Debug logging for first few rows
+      // Debug logging for first few rows - show universal detection results
       if (debugRowsLogged < maxDebugRows && firstCellText) {
-        const cellTexts = cells.slice(0, 3).map(c => (c.textContent?.trim() || "").substring(0, 40));
+        const nonEmptyCells = cells.filter(c => {
+          const txt = c.textContent?.trim() || '';
+          return txt !== '' && txt !== '\u00A0' && txt !== '-' && txt !== '—';
+        }).length;
+        const isUniversal = isUniversalIndustryHeader(cells, firstCellText);
         const isExactMatch = isExactIndustryCategory(firstCellText);
-        console.log(`Row ${i - headerRowIndex}: cells=${cells.length}, exact_industry=${isExactMatch}, first="${firstCellText.substring(0, 50)}"`);
+        console.log(`Row ${i - headerRowIndex}: total_cells=${cells.length}, non_empty=${nonEmptyCells}, universal_industry=${isUniversal}, exact_match=${isExactMatch}, first="${firstCellText.substring(0, 60)}"`);
         debugRowsLogged++;
       }
       
       // Check if this is an industry section header FIRST (before company parsing)
-      // Industry headers often have: only one cell, or first cell with colspan, or matching industry names
+      // PRIMARY METHOD: Universal detection based on row structure (text only in first cell)
       if (firstCellText && firstCellText.length >= 3) {
-        // Check if it's an exact ARCC industry category
+        // Try universal structure-based detection FIRST (most reliable)
+        if (isUniversalIndustryHeader(cells, firstCellText)) {
+          currentIndustry = normalizeIndustryName(firstCellText);
+          currentCompany = null;
+          console.log(`📂 Industry section (universal): ${currentIndustry}`);
+          continue;
+        }
+        
+        // Fallback: Check if it's an exact known industry category
         if (isExactIndustryCategory(firstCellText)) {
           currentIndustry = normalizeIndustryName(firstCellText);
           currentCompany = null;
           console.log(`📂 Industry section (exact match): ${currentIndustry}`);
-          continue;
-        }
-        
-        // Check using structural analysis
-        if (isRowAnIndustrySectionHeader(cells, firstCellText, expectedCellCount)) {
-          currentIndustry = normalizeIndustryName(firstCellText);
-          currentCompany = null;
-          console.log(`📂 Industry section (structural): ${currentIndustry}`);
           continue;
         }
       }
