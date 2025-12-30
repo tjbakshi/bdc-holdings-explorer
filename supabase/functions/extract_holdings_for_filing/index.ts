@@ -165,6 +165,20 @@ function parseDate(value: string | null | undefined): string | null {
   const cleaned = value.trim();
   if (!cleaned || cleaned === "-" || cleaned === "—" || cleaned.toLowerCase() === "n/a") return null;
   
+  // Try MM/YYYY format (common in SEC filings for maturity dates) - use last day of month
+  const mmyyyyMatch = cleaned.match(/^(\d{1,2})\/(\d{4})$/);
+  if (mmyyyyMatch) {
+    const [, month, year] = mmyyyyMatch;
+    const monthNum = parseInt(month);
+    const yearNum = parseInt(year);
+    // Use last day of the month
+    const lastDay = new Date(yearNum, monthNum, 0).getDate();
+    const date = new Date(yearNum, monthNum - 1, lastDay);
+    if (!isNaN(date.getTime())) {
+      return date.toISOString().split("T")[0];
+    }
+  }
+  
   // Try MM/DD/YYYY format (common in SEC filings)
   const mmddyyyyMatch = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (mmddyyyyMatch) {
