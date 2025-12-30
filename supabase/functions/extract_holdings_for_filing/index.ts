@@ -1778,7 +1778,7 @@ serve(async (req) => {
                     }
                     
                     if (newHoldings.length > 0) {
-                      const holdingsToInsert = newHoldings.map((h) => ({
+                      const holdingsToInsert = newHoldings.map((h, idx) => ({
                         filing_id: filingId,
                         company_name: h.company_name,
                         investment_type: h.investment_type,
@@ -1790,6 +1790,7 @@ serve(async (req) => {
                         par_amount: h.par_amount != null ? Math.round((h.par_amount * scale) * 10) / 10 : null,
                         cost: h.cost != null ? Math.round((h.cost * scale) * 10) / 10 : null,
                         fair_value: h.fair_value != null ? Math.round((h.fair_value * scale) * 10) / 10 : null,
+                        row_number: totalInserted + idx + 1,
                       }));
                       
                       const { error: insertError } = await supabaseClient
@@ -1898,7 +1899,7 @@ serve(async (req) => {
       // Apply scale conversion - convert all values to millions
       console.log(`📊 Applying scale conversion: ${scaleResult.detected} -> millions (multiplier: ${scaleResult.scale})`);
       
-      const holdingsToInsert = holdings.map((h) => ({
+      const holdingsToInsert = holdings.map((h, idx) => ({
         filing_id: filingId,
         company_name: h.company_name,
         investment_type: h.investment_type,
@@ -1910,6 +1911,7 @@ serve(async (req) => {
         par_amount: toMillions(h.par_amount, scaleResult.scale),
         cost: toMillions(h.cost, scaleResult.scale),
         fair_value: toMillions(h.fair_value, scaleResult.scale),
+        row_number: idx + 1,
       }));
       
       // Log sample converted values
