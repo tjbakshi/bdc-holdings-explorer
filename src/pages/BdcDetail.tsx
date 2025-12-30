@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
@@ -20,12 +20,14 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { ArrowLeft, Download } from "lucide-react";
+import { ArrowLeft, Download, Search } from "lucide-react";
+import { Input } from "@/components/ui/input";
 import * as XLSX from "xlsx";
 
 const BdcDetail = () => {
   const { bdcId } = useParams<{ bdcId: string }>();
   const [selectedFilingId, setSelectedFilingId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
 
   // Fetch BDC info
   const { data: bdc, isLoading: bdcLoading } = useQuery({
@@ -136,6 +138,18 @@ const BdcDetail = () => {
   const summaryFmvCost = portfolioSummary && portfolioSummary.totalCost > 0 
     ? ((portfolioSummary.totalFairValue / portfolioSummary.totalCost) * 100).toFixed(2) + "%" 
     : "—";
+
+  // Filter holdings based on search query
+  const filteredHoldings = useMemo(() => {
+    if (!holdings || !searchQuery.trim()) return holdings;
+    const query = searchQuery.toLowerCase();
+    return holdings.filter(h => 
+      h.company_name.toLowerCase().includes(query) ||
+      (h.industry?.toLowerCase().includes(query)) ||
+      (h.investment_type?.toLowerCase().includes(query)) ||
+      (h.description?.toLowerCase().includes(query))
+    );
+  }, [holdings, searchQuery]);
 
   const exportToExcel = () => {
     if (!holdings || !bdc) return;
@@ -276,18 +290,29 @@ const BdcDetail = () => {
               </Card>
             ) : (
               <Card>
-                <CardHeader className="flex flex-row items-center justify-between">
-                  <div>
-                    <CardTitle>Portfolio Holdings</CardTitle>
-                    <CardDescription>
-                      Showing {holdings.length} holdings for the selected filing period
-                      <span className="ml-2 text-xs text-muted-foreground">(Values in millions USD)</span>
-                    </CardDescription>
+                <CardHeader className="flex flex-col gap-4">
+                  <div className="flex flex-row items-center justify-between">
+                    <div>
+                      <CardTitle>Portfolio Holdings</CardTitle>
+                      <CardDescription>
+                        Showing {filteredHoldings?.length || 0} of {holdings.length} holdings for the selected filing period
+                        <span className="ml-2 text-xs text-muted-foreground">(Values in millions USD)</span>
+                      </CardDescription>
+                    </div>
+                    <Button onClick={exportToExcel} variant="outline" size="sm">
+                      <Download className="mr-2 h-4 w-4" />
+                      Export to Excel
+                    </Button>
                   </div>
-                  <Button onClick={exportToExcel} variant="outline" size="sm">
-                    <Download className="mr-2 h-4 w-4" />
-                    Export to Excel
-                  </Button>
+                  <div className="relative max-w-sm">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                    <Input
+                      placeholder="Search by company, industry, type..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="pl-9"
+                    />
+                  </div>
                 </CardHeader>
                 <CardContent>
                   {/* Portfolio Summary */}
@@ -354,7 +379,7 @@ const BdcDetail = () => {
                           </TableRow>
                         </TableHeader>
                         <TableBody>
-                          {holdings.map((holding) => (
+                          {filteredHoldings?.map((holding) => (
                             <TableRow key={holding.id}>
                               <TableCell className="font-medium">
                                 <Link 
