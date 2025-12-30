@@ -121,9 +121,9 @@ const BdcDetail = () => {
     return new Date(dateStr).toLocaleDateString();
   };
 
-  // Calculate portfolio summary totals
+  // Calculate portfolio summary totals (use cost as fallback for par if blank)
   const portfolioSummary = holdings ? {
-    totalPar: holdings.reduce((sum, h) => sum + (h.par_amount || 0), 0),
+    totalPar: holdings.reduce((sum, h) => sum + (h.par_amount ?? h.cost ?? 0), 0),
     totalCost: holdings.reduce((sum, h) => sum + (h.cost || 0), 0),
     totalFairValue: holdings.reduce((sum, h) => sum + (h.fair_value || 0), 0),
   } : null;
