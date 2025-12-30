@@ -134,6 +134,23 @@ async function fetchSecFile(url: string, retries = 2): Promise<string> {
   throw new Error("Failed to fetch after retries");
 }
 
+// Clean footnote references from company names
+function cleanCompanyName(name: string | null | undefined): string {
+  if (!name) return "";
+  
+  let cleaned = name
+    // Remove parentheses with numbers at the end: (13) or (13, 14) or (1)(2)(3)
+    .replace(/(\s*\(\d+(?:,\s*\d+)*\))+\s*$/g, '')
+    // Remove superscript HTML tags if present
+    .replace(/<sup>.*?<\/sup>/g, '')
+    // Remove other footnote indicators like *, †, ‡, §, ¶, #
+    .replace(/\s*[\*†‡§¶#]+\s*$/g, '')
+    // Trim any trailing whitespace
+    .trim();
+  
+  return cleaned;
+}
+
 // Parse numeric value from string (handles $, commas, parentheses for negatives)
 function parseNumeric(value: string | null | undefined): number | null {
   if (!value) return null;
@@ -628,21 +645,24 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       
       if (companyCellText && companyCellText.length >= 5) {
         // Non-empty company cell - this is a new company
+        // Clean footnotes from the company name
+        const cleanedCompanyName = cleanCompanyName(companyCellText);
+        
         // Check if it has a company suffix before accepting as new company
-        if (hasCompanySuffix(companyCellText)) {
-          currentCompany = companyCellText;
+        if (hasCompanySuffix(cleanedCompanyName)) {
+          currentCompany = cleanedCompanyName;
           // Industry can come from: the industry/business column OR the current section header
           effectiveIndustry = industryCellText || currentIndustry;
           currentIndustry = effectiveIndustry || currentIndustry;
         } else {
           // Might be an investment type label or subtotal - skip as company
           if (debugRejected.length < 10) {
-            debugRejected.push({ name: companyCellText.substring(0, 50), reason: "No company suffix (continuation row handling)" });
+            debugRejected.push({ name: cleanedCompanyName.substring(0, 50), reason: "No company suffix (continuation row handling)" });
           }
           // Don't update currentCompany, treat as potential investment line for current company
           effectiveIndustry = currentIndustry;
         }
-        effectiveCompanyName = currentCompany || companyCellText;
+        effectiveCompanyName = currentCompany || cleanedCompanyName;
       } else if (currentCompany) {
         // Empty or short company cell - this is a continuation row for the current company
         effectiveCompanyName = currentCompany;
