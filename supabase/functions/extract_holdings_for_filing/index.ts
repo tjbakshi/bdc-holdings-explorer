@@ -1422,32 +1422,85 @@ serve(async (req) => {
             // Calculate section span
             const sectionSpan = documentEnd - bestStart;
             
-            // Extract with some buffer
+            // Extract with some buffer, but cap at 8MB to avoid memory issues
+            const maxSoiSize = 8_000_000;
             const start = Math.max(0, bestStart - 10_000);
-            const end = Math.min(html.length, documentEnd + 50_000);
+            let end = Math.min(html.length, documentEnd + 50_000);
+            
+            // If section is too large, only take the first portion
+            if (end - start > maxSoiSize) {
+              console.log(`   ⚠️ SOI section too large (${((end - start)/1024/1024).toFixed(1)}MB), capping at ${(maxSoiSize/1024/1024).toFixed(1)}MB`);
+              end = start + maxSoiSize;
+            }
+            
             textToParse = html.slice(start, end);
             
             console.log(`   📦 Extracted SOI section: ${(textToParse.length / 1024 / 1024).toFixed(1)} MB (${start} to ${end}, section length: ${sectionSpan})`);
           }
           
-          // Hard limit: Skip if section is still too large (shouldn't happen for just SOI)
-          if (textToParse.length > 10_000_000) {
-            warnings.push(`SOI section from ${doc.name} still too large (${(textToParse.length / 1024 / 1024).toFixed(1)} MB > 10MB). Skipping.`);
-            console.log(`   ⚠️ SOI section exceeds 10MB limit, skipping`);
-            continue;
-          }
-          
-          // If we haven't found holdings yet, enable debug mode on later documents
-          const useDebug = debugMode || (docIdx >= 2 && holdings.length === 0);
-          const result = parseHtmlScheduleOfInvestments(textToParse, useDebug);
-          holdings = result.holdings;
-          scaleResult = result.scaleResult;
-          
-          console.log(`   Result: ${holdings.length} holdings found`);
-          
-          if (holdings.length > 0) {
-            console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name}`);
-            break; // Stop trying more documents
+          // For very large sections, use streaming-style chunked processing
+          if (textToParse.length > 6_000_000) {
+            console.log(`   📦 Large SOI section (${(textToParse.length / 1024 / 1024).toFixed(1)} MB), using streaming chunks...`);
+            
+            // Process in 2MB chunks to minimize memory usage
+            const chunkSize = 2_000_000;
+            const overlap = 100_000; // 100KB overlap to avoid cutting holdings
+            const numChunks = Math.ceil(textToParse.length / chunkSize);
+            
+            console.log(`   📦 Will process ${numChunks} chunks of ~2MB each`);
+            
+            // Process each chunk immediately (streaming style)
+            const allHoldings: Holding[] = [];
+            let combinedScaleResult: ScaleDetectionResult | null = null;
+            
+            for (let i = 0; i < numChunks; i++) {
+              const start = i * chunkSize;
+              const end = Math.min(start + chunkSize + overlap, textToParse.length);
+              const chunk = textToParse.slice(start, end);
+              console.log(`   📦 Chunk ${i + 1}/${numChunks}: ${(start/1024/1024).toFixed(1)}MB - ${(end/1024/1024).toFixed(1)}MB`);
+              
+              try {
+                const chunkResult = parseHtmlScheduleOfInvestments(chunk, false);
+                console.log(`   📦 Chunk ${i + 1}: Found ${chunkResult.holdings.length} holdings`);
+                
+                if (!combinedScaleResult && chunkResult.scaleResult) {
+                  combinedScaleResult = chunkResult.scaleResult;
+                }
+                allHoldings.push(...chunkResult.holdings);
+              } catch (chunkError) {
+                console.error(`   📦 Error processing chunk ${i + 1}:`, chunkError);
+              }
+            }
+            
+            // Deduplicate holdings by company_name + investment_type + fair_value
+            const holdingKeys = new Set<string>();
+            holdings = allHoldings.filter(h => {
+              const key = `${h.company_name}|${h.investment_type}|${h.fair_value}`;
+              if (holdingKeys.has(key)) return false;
+              holdingKeys.add(key);
+              return true;
+            });
+            
+            if (combinedScaleResult) scaleResult = combinedScaleResult;
+            console.log(`   📦 Combined: ${holdings.length} unique holdings from ${allHoldings.length} total`);
+            
+            if (holdings.length > 0) {
+              console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name} (chunked)`);
+              break;
+            }
+          } else {
+            // Standard processing for smaller sections
+            const useDebug = debugMode || (docIdx >= 2 && holdings.length === 0);
+            const result = parseHtmlScheduleOfInvestments(textToParse, useDebug);
+            holdings = result.holdings;
+            scaleResult = result.scaleResult;
+            
+            console.log(`   Result: ${holdings.length} holdings found`);
+            
+            if (holdings.length > 0) {
+              console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name}`);
+              break;
+            }
           }
         } catch (docError) {
           console.error(`   Error parsing ${doc.name}:`, docError);
