@@ -716,10 +716,14 @@ function isRealHolding(companyName: string, fairValue: number | null, cost: numb
 }
 
 // Parse tables looking for Schedule of Investments with multi-line investment support
-function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number, debugMode = false): Holding[] {
+// Optional initialIndustry parameter allows carrying industry state from previous segments
+function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number, debugMode = false, initialIndustry: string | null = null): { holdings: Holding[]; lastIndustry: string | null } {
   const holdings: Holding[] = [];
   const debugAccepted: string[] = [];
   const debugRejected: { name: string; reason: string }[] = [];
+  
+  // Track industry state across ALL tables in this segment
+  let persistentIndustry: string | null = initialIndustry;
   
   let tableIndex = 0;
   for (const table of tables) {
@@ -817,7 +821,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     
     // State for tracking current company across multi-line investments
     let currentCompany: string | null = null;
-    let currentIndustry: string | null = null;
+    let currentIndustry: string | null = persistentIndustry;
     
     // Helper to get cell at a given column position (accounting for colspan)
     // Also supports fallback to cell index if position-based lookup fails
@@ -920,6 +924,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
         // Try universal structure-based detection FIRST (most reliable)
         if (isUniversalIndustryHeader(cells, firstCellText)) {
           currentIndustry = normalizeIndustryName(firstCellText);
+          persistentIndustry = currentIndustry; // Persist across tables/segments
           currentCompany = null;
           console.log(`📂 Industry section (universal): ${currentIndustry}`);
           continue;
@@ -928,6 +933,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
         // Fallback: Check if it's an exact known industry category
         if (isExactIndustryCategory(firstCellText)) {
           currentIndustry = normalizeIndustryName(firstCellText);
+          persistentIndustry = currentIndustry; // Persist across tables/segments
           currentCompany = null;
           console.log(`📂 Industry section (exact match): ${currentIndustry}`);
           continue;
@@ -1149,7 +1155,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       console.log(`First 10 accepted:`, debugAccepted);
       console.log(`First 10 rejected:`, debugRejected);
       console.log(`========================\n`);
-      return holdings;
+      return { holdings, lastIndustry: persistentIndustry };
     }
   }
   
@@ -1160,11 +1166,12 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     console.log(`============================================\n`);
   }
   
-  return holdings;
+  return { holdings, lastIndustry: persistentIndustry };
 }
 
 // Parse HTML Schedule of Investments table from snippets
-function parseHtmlScheduleOfInvestments(html: string, debugMode = false): { holdings: Holding[]; scaleResult: ScaleDetectionResult } {
+// Optional initialIndustry parameter allows carrying industry state from previous calls
+function parseHtmlScheduleOfInvestments(html: string, debugMode = false, initialIndustry: string | null = null): { holdings: Holding[]; scaleResult: ScaleDetectionResult; lastIndustry: string | null } {
   // ARCC and other large BDCs can have 500+ companies with 2-5 investment lines each
   // Need to process at least 3000 rows to capture the full Schedule of Investments
   const maxRowsPerTable = 3000;
@@ -1175,6 +1182,9 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): { hold
   
   // Accumulate holdings from ALL snippets instead of returning on first match
   const allHoldings: Holding[] = [];
+  
+  // Track industry state across snippets
+  let carryIndustry: string | null = initialIndustry;
   
   try {
     // Extract only relevant HTML snippets
@@ -1194,7 +1204,9 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): { hold
       }
       
       const tables = Array.from(doc.querySelectorAll("table")) as Element[];
-      const snippetHoldings = parseTables(tables, maxRowsPerTable, remainingCapacity, debugMode);
+      const parseResult = parseTables(tables, maxRowsPerTable, remainingCapacity, debugMode, carryIndustry);
+      const snippetHoldings = parseResult.holdings;
+      carryIndustry = parseResult.lastIndustry; // Carry forward industry state
       
       if (snippetHoldings.length > 0) {
         console.log(`Snippet ${i + 1}/${snippets.length}: Found ${snippetHoldings.length} holdings`);
@@ -1220,7 +1232,7 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): { hold
         console.log(`Deduplicated: ${allHoldings.length} -> ${deduplicatedHoldings.length} holdings`);
       }
       console.log(`Total unique holdings from all snippets: ${deduplicatedHoldings.length}`);
-      return { holdings: deduplicatedHoldings, scaleResult };
+      return { holdings: deduplicatedHoldings, scaleResult, lastIndustry: carryIndustry };
     } else {
       console.log("No holdings found in any snippets");
     }
@@ -1229,7 +1241,7 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): { hold
     console.error("Error parsing HTML:", error);
   }
   
-  return { holdings: allHoldings, scaleResult };
+  return { holdings: allHoldings, scaleResult, lastIndustry: carryIndustry };
 }
 
 // ======================================================================
@@ -1755,13 +1767,16 @@ serve(async (req) => {
               let runningTotalValue = 0;
               let skippedDuplicates = 0;
               
+              // Track industry state across segments for proper grouping
+              let carryIndustry: string | null = null;
+              
               while (currentPosition < soiEnd) {
                 segmentCount++;
                 const segmentEnd = Math.min(currentPosition + SEGMENT_SIZE, soiEnd);
                 
                 // Log every 20th segment
                 if (segmentCount % 20 === 1) {
-                  console.log(`   📦 Segment ${segmentCount}, pos ${(currentPosition / 1024 / 1024).toFixed(1)}MB, inserted ${totalInserted}`);
+                  console.log(`   📦 Segment ${segmentCount}, pos ${(currentPosition / 1024 / 1024).toFixed(1)}MB, inserted ${totalInserted}, industry=${carryIndustry || 'none'}`);
                 }
                 
                 try {
@@ -1775,9 +1790,10 @@ serve(async (req) => {
                     continue;
                   }
                   
-                  // Parse with DOM parser (but with small segment size)
-                  const segmentResult = parseHtmlScheduleOfInvestments(segment, false);
+                  // Parse with DOM parser (but with small segment size), passing carry-forward industry
+                  const segmentResult = parseHtmlScheduleOfInvestments(segment, false, carryIndustry);
                   const segmentHoldings = segmentResult.holdings;
+                  carryIndustry = segmentResult.lastIndustry; // Carry forward industry state to next segment
                   
                   if (segmentHoldings.length > 0) {
                     const newHoldings: Holding[] = [];
