@@ -268,6 +268,9 @@ function extractCandidateTableHtml(html: string): string[] {
   const normalized = html.replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
   const lower = normalized.toLowerCase();
   
+  // For very large documents like ARCC, the Schedule of Investments can be 3-4MB
+  // Strategy: Find the start of the SOI and extract a large chunk from there
+  
   // Broaden keywords to catch more variations
   const keywords = [
     "consolidated schedule of investments",
@@ -277,31 +280,60 @@ function extractCandidateTableHtml(html: string): string[] {
     "portfolio investments",
   ];
   
-  const snippets: string[] = [];
+  // Find ALL occurrences of SOI keywords to understand the document structure
+  const allMatches: { keyword: string; position: number }[] = [];
   
   for (const keyword of keywords) {
     let searchStart = 0;
     while (true) {
       const idx = lower.indexOf(keyword, searchStart);
       if (idx === -1) break;
-      
-      // Take a window around the keyword (±150kb)
-      const start = Math.max(0, idx - 150_000);
-      const end = Math.min(html.length, idx + 150_000);
-      snippets.push(html.slice(start, end));
-      
+      allMatches.push({ keyword, position: idx });
       searchStart = idx + keyword.length;
-      // Only find first occurrence per keyword to avoid too many snippets
-      break;
     }
   }
   
-  // If we didn't find any keyword, fall back to the first ~300kb of the file
-  if (snippets.length === 0) {
-    console.log("No SOI keywords found, using first 300KB");
-    snippets.push(html.slice(0, 300_000));
-  } else {
-    console.log(`Found ${snippets.length} candidate SOI regions`);
+  // Sort by position
+  allMatches.sort((a, b) => a.position - b.position);
+  
+  console.log(`Found ${allMatches.length} SOI keyword occurrences in document`);
+  
+  if (allMatches.length === 0) {
+    console.log("No SOI keywords found, using first 500KB");
+    return [html.slice(0, 500_000)];
+  }
+  
+  // For large documents, extract from the first SOI occurrence to the end of the SOI section
+  // ARCC's SOI can be 3-4MB, so we need a much larger window
+  const firstMatchPos = allMatches[0].position;
+  const lastMatchPos = allMatches[allMatches.length - 1].position;
+  
+  // Extract from ~50KB before first match to ~200KB after last match
+  // This should capture the entire SOI section
+  const start = Math.max(0, firstMatchPos - 50_000);
+  const end = Math.min(html.length, lastMatchPos + 500_000);
+  
+  // If the window is larger than 4MB, we need to be smart about it
+  const maxWindowSize = 4_000_000;
+  
+  if (end - start <= maxWindowSize) {
+    console.log(`Extracting single SOI window: ${((end - start) / 1024).toFixed(0)} KB from positions ${start} to ${end}`);
+    return [html.slice(start, end)];
+  }
+  
+  // For very large SOI sections, split into multiple overlapping chunks
+  console.log(`SOI section very large (${((end - start) / 1024).toFixed(0)} KB), splitting into chunks`);
+  const snippets: string[] = [];
+  const chunkSize = 2_000_000; // 2MB chunks
+  const overlap = 200_000; // 200KB overlap to avoid missing entries at boundaries
+  
+  let chunkStart = start;
+  while (chunkStart < end) {
+    const chunkEnd = Math.min(chunkStart + chunkSize, end);
+    snippets.push(html.slice(chunkStart, chunkEnd));
+    console.log(`  Chunk ${snippets.length}: ${(chunkStart / 1024).toFixed(0)}KB - ${(chunkEnd / 1024).toFixed(0)}KB`);
+    chunkStart = chunkEnd - overlap;
+    if (chunkEnd === end) break;
   }
   
   return snippets;
@@ -1140,31 +1172,63 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false): { hold
   // Detect scale from the HTML (look for "in thousands" or "in millions")
   const scaleResult = detectScale(html);
   
+  // Accumulate holdings from ALL snippets instead of returning on first match
+  const allHoldings: Holding[] = [];
+  
   try {
-    // First try: Extract only relevant HTML snippets
+    // Extract only relevant HTML snippets
     const snippets = extractCandidateTableHtml(html);
+    console.log(`Found ${snippets.length} candidate snippets to parse`);
     
-    for (const snippet of snippets) {
+    for (let i = 0; i < snippets.length; i++) {
+      const snippet = snippets[i];
       const doc = new DOMParser().parseFromString(snippet, "text/html");
       if (!doc) continue;
       
-      const tables = Array.from(doc.querySelectorAll("table")) as Element[];
-      const holdings = parseTables(tables, maxRowsPerTable, maxHoldings, debugMode);
+      // Calculate remaining capacity
+      const remainingCapacity = maxHoldings - allHoldings.length;
+      if (remainingCapacity <= 0) {
+        console.log(`Reached max holdings cap (${maxHoldings}), stopping snippet processing`);
+        break;
+      }
       
-      if (holdings.length > 0) {
-        console.log(`Found ${holdings.length} holdings in snippet`);
-        return { holdings, scaleResult };
+      const tables = Array.from(doc.querySelectorAll("table")) as Element[];
+      const snippetHoldings = parseTables(tables, maxRowsPerTable, remainingCapacity, debugMode);
+      
+      if (snippetHoldings.length > 0) {
+        console.log(`Snippet ${i + 1}/${snippets.length}: Found ${snippetHoldings.length} holdings`);
+        allHoldings.push(...snippetHoldings);
       }
     }
     
-    // No full-document fallback to avoid WORKER_LIMIT on large filings
-    console.log("No holdings found in snippets; returning empty result without full-document fallback");
+    // Deduplicate holdings in case of overlapping chunks
+    // Use company_name + investment_type + fair_value as a composite key
+    if (allHoldings.length > 0) {
+      const seen = new Set<string>();
+      const deduplicatedHoldings: Holding[] = [];
+      
+      for (const h of allHoldings) {
+        const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          deduplicatedHoldings.push(h);
+        }
+      }
+      
+      if (deduplicatedHoldings.length < allHoldings.length) {
+        console.log(`Deduplicated: ${allHoldings.length} -> ${deduplicatedHoldings.length} holdings`);
+      }
+      console.log(`Total unique holdings from all snippets: ${deduplicatedHoldings.length}`);
+      return { holdings: deduplicatedHoldings, scaleResult };
+    } else {
+      console.log("No holdings found in any snippets");
+    }
   }
   catch (error) {
     console.error("Error parsing HTML:", error);
   }
   
-  return { holdings: [], scaleResult };
+  return { holdings: allHoldings, scaleResult };
 }
 
 // Main serve function
