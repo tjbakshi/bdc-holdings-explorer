@@ -1353,53 +1353,81 @@ serve(async (req) => {
             // Find the boundaries of the Schedule of Investments section
             const lower = html.toLowerCase();
             
-            // Find first occurrence of "schedule of investments" (start of SOI)
+            // Find ALL occurrences of "schedule of investments" - we want the main data section, not TOC
             const soiKeywords = [
               "consolidated schedule of investments",
               "schedule of investments",
             ];
             
-            let firstOccurrence = -1;
+            // Collect all SOI occurrences
+            const soiOccurrences: number[] = [];
             for (const kw of soiKeywords) {
-              const idx = lower.indexOf(kw);
-              if (idx !== -1 && (firstOccurrence === -1 || idx < firstOccurrence)) {
-                firstOccurrence = idx;
+              let pos = 0;
+              while ((pos = lower.indexOf(kw, pos)) !== -1) {
+                soiOccurrences.push(pos);
+                pos += kw.length;
               }
             }
             
-            if (firstOccurrence === -1) {
+            soiOccurrences.sort((a, b) => a - b);
+            console.log(`   Found ${soiOccurrences.length} SOI keyword occurrences`);
+            
+            if (soiOccurrences.length === 0) {
               warnings.push(`No Schedule of Investments found in large document ${doc.name}. Skipping.`);
               console.log(`   ⚠️ No SOI section found in large document, skipping`);
               continue;
             }
             
-            // Find end markers - typically "Notes to Consolidated Financial Statements" or similar
+            // For ARCC-style documents, the SOI header appears on EVERY page
+            // We need to find the FIRST real SOI section (after table of contents)
+            // and extract from there to the end markers
+            
             const endMarkers = [
               "notes to consolidated financial statements",
               "notes to financial statements",
-              "see notes to consolidated financial statements",
-              "see notes to financial statements",
-              "</body>",
             ];
             
-            let lastOccurrence = html.length;
-            const searchFrom = firstOccurrence + 1000; // Start searching after the first SOI header
-            
+            // Find the LAST occurrence of end markers (the actual notes section)
+            let documentEnd = html.length;
             for (const marker of endMarkers) {
-              const idx = lower.indexOf(marker, searchFrom);
-              if (idx !== -1 && idx < lastOccurrence) {
-                lastOccurrence = idx;
-                console.log(`   📍 Found end marker "${marker}" at position ${idx}`);
+              let lastIdx = -1;
+              let pos = 0;
+              while ((pos = lower.indexOf(marker, pos)) !== -1) {
+                lastIdx = pos;
+                pos += marker.length;
+              }
+              if (lastIdx !== -1) {
+                documentEnd = lastIdx;
+                console.log(`   📍 Found end marker "${marker}" last occurrence at position ${lastIdx}`);
+                break; // Use the first end marker type found
+              }
+            }
+            
+            // Find where actual TABLE data starts (not just the header)
+            // Look for SOI occurrence that has a TABLE tag within 10KB after it
+            let bestStart = soiOccurrences[0];
+            for (const soiPos of soiOccurrences) {
+              // Skip if this is in the first 10% of document (likely TOC)
+              if (soiPos < html.length * 0.05) continue;
+              
+              // Check if there's a table within 10KB of this SOI
+              const nearbyHtml = lower.slice(soiPos, Math.min(soiPos + 10_000, html.length));
+              if (nearbyHtml.includes('<table')) {
+                bestStart = soiPos;
+                console.log(`   📍 Found SOI with nearby table at position ${soiPos}`);
                 break;
               }
             }
             
+            // Calculate section span
+            const sectionSpan = documentEnd - bestStart;
+            
             // Extract with some buffer
-            const start = Math.max(0, firstOccurrence - 10_000);
-            const end = Math.min(html.length, lastOccurrence + 50_000);
+            const start = Math.max(0, bestStart - 10_000);
+            const end = Math.min(html.length, documentEnd + 50_000);
             textToParse = html.slice(start, end);
             
-            console.log(`   📦 Extracted SOI section: ${(textToParse.length / 1024 / 1024).toFixed(1)} MB (${start} to ${end})`);
+            console.log(`   📦 Extracted SOI section: ${(textToParse.length / 1024 / 1024).toFixed(1)} MB (${start} to ${end}, section length: ${sectionSpan})`);
           }
           
           // Hard limit: Skip if section is still too large (shouldn't happen for just SOI)
