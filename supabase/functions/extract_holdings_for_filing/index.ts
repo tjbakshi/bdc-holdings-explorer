@@ -190,9 +190,113 @@ function findHeaderRow(table: Element, debugMode = false): Element | null {
   return null;
 }
 
+// Keywords that indicate summary/total rows (not actual holdings)
+const SKIP_KEYWORDS = [
+  "total", "subtotal", "net", "assets", "portfolio investments",
+  "investments at", "fair value at", "cost at", "balance",
+  "beginning", "ending", "change", "increase", "decrease",
+  "weighted average", "percentage", "% of", "footnote",
+  "see accompanying", "notes to", "schedule continued",
+  "non-controlled", "controlled", "affiliate", // These are section headers, not companies
+  // Industry categories (these are section headers, not companies)
+  "software and services", "health care", "commercial and professional",
+  "financial services", "consumer services", "consumer distribution",
+  "sports, media", "investment funds", "capital goods",
+  "pharmaceuticals", "biotechnology", "insurance",
+  "real estate", "transportation", "utilities", "energy",
+  "materials", "telecommunications", "technology",
+  "media and entertainment", "food and beverage", "retail",
+  // Investment type headers (section labels, not companies)
+  "first lien", "second lien", "senior secured", "subordinated",
+  "mezzanine", "equity", "preferred", "common stock", "warrants",
+  "senior subordinated loans", "other equity", "preferred equity",
+  "subordinated certificates",
+];
+
+// Patterns that indicate the row is NOT a real holding
+const SKIP_PATTERNS = [
+  /^\d+\.?\d*\s*%/, // Starts with percentage
+  /^\$[\d,]+/, // Starts with dollar amount
+  /^\(\d/, // Starts with parenthetical number
+  /^[\d,]+$/, // Just a number
+  /^-+$/, // Just dashes
+  /^—+$/, // Just em-dashes
+  /^\s*$/, // Empty or whitespace
+  /^\d{1,2}\/\d{1,2}\/\d{2,4}/, // Starts with date
+  /^[A-Z][a-z]+ \d{1,2}, \d{4}/, // Date format like "September 30, 2025"
+];
+
+// Company suffixes that strongly indicate a real holding
+const COMPANY_SUFFIXES = [
+  "inc.", "inc", "llc", "l.l.c.", "lp", "l.p.", "corp.", "corp",
+  "corporation", "company", "co.", "ltd.", "ltd", "limited",
+  "holdings", "partners", "management",
+];
+
+// Check if a row represents an actual portfolio holding
+function isRealHolding(companyName: string, fairValue: number | null, cost: number | null): { valid: boolean; reason: string } {
+  const name = companyName.trim();
+  const lowerName = name.toLowerCase();
+  
+  // Must have a non-empty name
+  if (!name || name.length < 5) {
+    return { valid: false, reason: "Name too short" };
+  }
+  
+  // Skip if matches any skip keywords
+  for (const keyword of SKIP_KEYWORDS) {
+    if (lowerName.includes(keyword)) {
+      return { valid: false, reason: `Contains skip keyword: "${keyword}"` };
+    }
+  }
+  
+  // Skip if matches skip patterns
+  for (const pattern of SKIP_PATTERNS) {
+    if (pattern.test(name)) {
+      return { valid: false, reason: `Matches skip pattern: ${pattern}` };
+    }
+  }
+  
+  // Must have fair value
+  if (fairValue === null) {
+    return { valid: false, reason: "No fair value" };
+  }
+  
+  // Skip if fair value is exactly 0 (usually summary rows)
+  if (fairValue === 0) {
+    return { valid: false, reason: "Fair value is 0" };
+  }
+  
+  // Check for company suffix (REQUIRED for acceptance)
+  // Use word boundary matching to avoid false positives
+  const hasCompanySuffix = COMPANY_SUFFIXES.some(suffix => {
+    const regex = new RegExp(`\\b${suffix.replace(/\./g, "\\.")}\\b`, "i");
+    return regex.test(lowerName);
+  });
+  
+  if (!hasCompanySuffix) {
+    // Special case: names ending with common company name patterns
+    // e.g., "Acme Enterprises" or "ABC Group" (but "group" is too generic without other suffix)
+    const endsWithEntityWord = /\b(enterprises|industries|technologies|systems|group|capital|solutions|services)\s*$/i.test(lowerName);
+    if (!endsWithEntityWord) {
+      return { valid: false, reason: "No company suffix found" };
+    }
+  }
+  
+  // Additional sanity check: name should have at least 2 words
+  const wordCount = name.split(/\s+/).filter(w => w.length > 0).length;
+  if (wordCount < 2) {
+    return { valid: false, reason: "Single word name" };
+  }
+  
+  return { valid: true, reason: "Has company suffix" };
+}
+
 // Parse tables looking for Schedule of Investments
 function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number, debugMode = false): Holding[] {
   const holdings: Holding[] = [];
+  const debugAccepted: string[] = [];
+  const debugRejected: { name: string; reason: string }[] = [];
   
   let tableIndex = 0;
   for (const table of tables) {
@@ -296,14 +400,25 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       
       if (cells.length === 0) continue;
       
-      const companyName = cells[colIndices.company]?.textContent?.trim();
+      const companyName = cells[colIndices.company]?.textContent?.trim() || "";
       if (!companyName || companyName.length < 2) continue;
       
-      // Skip subtotal/total rows
-      if (
-        companyName.toLowerCase().includes("total") ||
-        companyName.toLowerCase().includes("subtotal")
-      ) {
+      // Parse numeric values first for validation
+      const fairValue = parseNumeric(cells[colIndices.fairValue]?.textContent?.trim());
+      const cost = parseNumeric(
+        colIndices.cost >= 0 
+          ? cells[colIndices.cost]?.textContent?.trim()
+          : null
+      );
+      
+      // Use the new validation function
+      const validation = isRealHolding(companyName, fairValue, cost);
+      
+      if (!validation.valid) {
+        // Log first 5 rejected for debugging
+        if (debugRejected.length < 5) {
+          debugRejected.push({ name: companyName.substring(0, 50), reason: validation.reason });
+        }
         continue;
       }
       
@@ -340,32 +455,40 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
             ? cells[colIndices.par]?.textContent?.trim()
             : null
         ),
-        cost: parseNumeric(
-          colIndices.cost >= 0 
-            ? cells[colIndices.cost]?.textContent?.trim()
-            : null
-        ),
-        fair_value: parseNumeric(
-          cells[colIndices.fairValue]?.textContent?.trim()
-        ),
+        cost,
+        fair_value: fairValue,
       };
       
-      // Only add if we have fair value (required field)
-      if (holding.fair_value !== null) {
-        holdings.push(holding);
+      holdings.push(holding);
+      
+      // Log first 5 accepted for debugging
+      if (debugAccepted.length < 5) {
+        debugAccepted.push(companyName.substring(0, 50));
       }
       
       // Cap total holdings to prevent excessive memory usage
       if (holdings.length >= maxHoldings) {
         console.log(`Reached max holdings cap (${maxHoldings}), stopping parse`);
-        return holdings;
+        break;
       }
     }
     
-    // If we found holdings in this table, stop searching
+    // If we found holdings in this table, log debug info and stop searching
     if (holdings.length > 0) {
+      console.log(`\n=== Parsing Results ===`);
+      console.log(`✅ Accepted ${holdings.length} holdings from table ${tableIndex}`);
+      console.log(`First 5 accepted:`, debugAccepted);
+      console.log(`First 5 rejected:`, debugRejected);
+      console.log(`========================\n`);
       return holdings;
     }
+  }
+  
+  // Log debug info even if no holdings found
+  if (debugRejected.length > 0) {
+    console.log(`\n=== Parsing Results (no holdings found) ===`);
+    console.log(`First 5 rejected:`, debugRejected);
+    console.log(`============================================\n`);
   }
   
   return holdings;

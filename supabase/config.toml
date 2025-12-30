@@ -2,3 +2,6 @@ project_id = "qswmkujzegjchwllecgo"
 
 [functions.sec-ingest]
 verify_jwt = false
+
+[functions.extract_holdings_for_filing]
+verify_jwt = false
