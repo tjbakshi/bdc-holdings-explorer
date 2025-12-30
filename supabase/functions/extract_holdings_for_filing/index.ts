@@ -158,8 +158,8 @@ function extractCandidateTableHtml(html: string): string[] {
 function findHeaderRow(table: Element, debugMode = false): Element | null {
   const rows = (table as Element).querySelectorAll("tr");
   
-  // Scan first ~5 rows to find the header
-  const maxHeaderScan = Math.min(5, rows.length);
+  // Scan first ~10 rows to find the header (some tables have multi-row headers)
+  const maxHeaderScan = Math.min(10, rows.length);
   
   for (let i = 0; i < maxHeaderScan; i++) {
     const row = rows[i] as Element;
@@ -174,7 +174,8 @@ function findHeaderRow(table: Element, debugMode = false): Element | null {
                        rowText.includes("portfolio") || 
                        rowText.includes("name") ||
                        rowText.includes("issuer") ||
-                       rowText.includes("investment");
+                       rowText.includes("investment") ||
+                       rowText.includes("borrower");
     
     // Accept header if it has fair value + company, cost is optional
     if (hasFairValue && hasCompany) {
@@ -182,6 +183,16 @@ function findHeaderRow(table: Element, debugMode = false): Element | null {
         const headerCells = Array.from(row.querySelectorAll("th, td"));
         const headers = headerCells.map(h => (h as Element).textContent?.trim() || "");
         console.log("✓ Found candidate header row:", headers);
+      }
+      return row;
+    }
+    
+    // Fallback: accept if it has fair value alone (company might be in a different label)
+    if (hasFairValue && hasCost) {
+      if (debugMode) {
+        const headerCells = Array.from(row.querySelectorAll("th, td"));
+        const headers = headerCells.map(h => (h as Element).textContent?.trim() || "");
+        console.log("✓ Found fallback header row (fair + cost):", headers);
       }
       return row;
     }
@@ -316,55 +327,54 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       continue;
     }
     
-    // Find column indices
+    // Find column indices - handle colspan by tracking actual cell positions
     const headerCells = Array.from(headerRow.querySelectorAll("th, td"));
-    const headers = headerCells.map(
-      (h) => (h as Element).textContent?.toLowerCase().trim() || ""
-    );
+    
+    // Build a position-aware header map that accounts for colspan
+    interface HeaderInfo {
+      text: string;
+      position: number;
+    }
+    const headerMap: HeaderInfo[] = [];
+    let position = 0;
+    for (const cell of headerCells) {
+      const el = cell as Element;
+      const text = el.textContent?.toLowerCase().trim() || "";
+      const colspan = parseInt(el.getAttribute("colspan") || "1", 10);
+      
+      // Only add non-empty headers
+      if (text) {
+        headerMap.push({ text, position });
+      }
+      
+      position += colspan;
+    }
     
     if (debugMode) {
       console.log(`\n=== Table ${tableIndex} Headers ===`);
-      console.log("Raw headers:", headers);
+      console.log("Header map:", headerMap.map(h => `${h.text}@${h.position}`));
     }
     
+    // Find column positions using the header map
+    const findHeader = (patterns: string[]): number => {
+      for (const h of headerMap) {
+        for (const p of patterns) {
+          if (h.text.includes(p)) return h.position;
+        }
+      }
+      return -1;
+    };
+    
     const colIndices = {
-      company: headers.findIndex((h) => 
-        h.includes("company") || 
-        h.includes("portfolio") || 
-        h.includes("name") || 
-        h.includes("issuer") ||
-        h.includes("borrower") ||
-        h.includes("investment")
-      ),
-      investmentType: headers.findIndex((h) => 
-        h.includes("type") || h.includes("instrument") || h.includes("class")
-      ),
-      industry: headers.findIndex((h) => 
-        h.includes("industry") || h.includes("sector")
-      ),
-      description: headers.findIndex((h) => 
-        h.includes("description") || h.includes("notes")
-      ),
-      interestRate: headers.findIndex((h) => 
-        h.includes("interest") || h.includes("rate") || h.includes("coupon") || h.includes("spread")
-      ),
-      maturity: headers.findIndex((h) => 
-        h.includes("maturity") || h.includes("expiration") || h.includes("due")
-      ),
-      par: headers.findIndex((h) => 
-        h.includes("par") || 
-        h.includes("principal") || 
-        h.includes("face") ||
-        (h.includes("amount") && !h.includes("fair") && !h.includes("cost"))
-      ),
-      cost: headers.findIndex((h) => 
-        h.includes("cost") || h.includes("amortized")
-      ),
-      fairValue: headers.findIndex((h) => 
-        h.includes("fair") || 
-        h.includes("market") ||
-        (h.includes("value") && !h.includes("par"))
-      ),
+      company: findHeader(["company", "portfolio", "name", "issuer", "borrower"]),
+      investmentType: findHeader(["investment", "type", "instrument", "class"]),
+      industry: findHeader(["industry", "sector", "business"]),
+      description: findHeader(["description", "notes"]),
+      interestRate: findHeader(["interest", "rate", "coupon", "spread"]),
+      maturity: findHeader(["maturity", "expiration", "due"]),
+      par: findHeader(["par", "principal", "face"]),
+      cost: findHeader(["cost", "amortized"]),
+      fairValue: findHeader(["fair value", "fair", "market"]),
     };
     
     if (debugMode) {
@@ -405,16 +415,28 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       
       if (cells.length === 0) continue;
       
-      const companyName = cells[colIndices.company]?.textContent?.trim() || "";
+      // Helper to get cell at a given column position (accounting for colspan)
+      const getCellAtPosition = (pos: number): Element | null => {
+        let currentPos = 0;
+        for (const cell of cells) {
+          const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+          if (currentPos <= pos && pos < currentPos + colspan) {
+            return cell;
+          }
+          currentPos += colspan;
+        }
+        return null;
+      };
+      
+      const companyCell = getCellAtPosition(colIndices.company);
+      const companyName = companyCell?.textContent?.trim() || "";
       if (!companyName || companyName.length < 2) continue;
       
       // Parse numeric values first for validation
-      const fairValue = parseNumeric(cells[colIndices.fairValue]?.textContent?.trim());
-      const cost = parseNumeric(
-        colIndices.cost >= 0 
-          ? cells[colIndices.cost]?.textContent?.trim()
-          : null
-      );
+      const fairValueCell = getCellAtPosition(colIndices.fairValue);
+      const fairValue = parseNumeric(fairValueCell?.textContent?.trim());
+      const costCell = colIndices.cost >= 0 ? getCellAtPosition(colIndices.cost) : null;
+      const cost = parseNumeric(costCell?.textContent?.trim());
       
       // Use the new validation function
       const validation = isRealHolding(companyName, fairValue, cost);
@@ -427,39 +449,26 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
         continue;
       }
       
-      const interestRateText = 
-        colIndices.interestRate >= 0 
-          ? cells[colIndices.interestRate]?.textContent?.trim() || ""
-          : "";
+      const interestRateCell = colIndices.interestRate >= 0 ? getCellAtPosition(colIndices.interestRate) : null;
+      const interestRateText = interestRateCell?.textContent?.trim() || "";
       
       const { rate, reference } = extractInterestRate(interestRateText);
       
+      const investmentTypeCell = colIndices.investmentType >= 0 ? getCellAtPosition(colIndices.investmentType) : null;
+      const industryCell = colIndices.industry >= 0 ? getCellAtPosition(colIndices.industry) : null;
+      const descriptionCell = colIndices.description >= 0 ? getCellAtPosition(colIndices.description) : null;
+      const maturityCell = colIndices.maturity >= 0 ? getCellAtPosition(colIndices.maturity) : null;
+      const parCell = colIndices.par >= 0 ? getCellAtPosition(colIndices.par) : null;
+      
       const holding: Holding = {
         company_name: companyName,
-        investment_type: 
-          colIndices.investmentType >= 0 
-            ? cells[colIndices.investmentType]?.textContent?.trim() || null
-            : null,
-        industry: 
-          colIndices.industry >= 0 
-            ? cells[colIndices.industry]?.textContent?.trim() || null
-            : null,
-        description: 
-          colIndices.description >= 0 
-            ? cells[colIndices.description]?.textContent?.trim() || null
-            : null,
+        investment_type: investmentTypeCell?.textContent?.trim() || null,
+        industry: industryCell?.textContent?.trim() || null,
+        description: descriptionCell?.textContent?.trim() || null,
         interest_rate: rate,
         reference_rate: reference,
-        maturity_date: parseDate(
-          colIndices.maturity >= 0 
-            ? cells[colIndices.maturity]?.textContent?.trim()
-            : null
-        ),
-        par_amount: parseNumeric(
-          colIndices.par >= 0 
-            ? cells[colIndices.par]?.textContent?.trim()
-            : null
-        ),
+        maturity_date: parseDate(maturityCell?.textContent?.trim()),
+        par_amount: parseNumeric(parCell?.textContent?.trim()),
         cost,
         fair_value: fairValue,
       };
@@ -639,24 +648,47 @@ serve(async (req) => {
         console.log("=================================\n");
       }
       
-      // Try parsing each document until we find holdings
-      for (const doc of prioritizedDocs) {
+      // Try parsing each document until we find holdings (limit to 15 docs to avoid timeout)
+      const maxDocsToTry = Math.min(prioritizedDocs.length, 15);
+      
+      for (let docIdx = 0; docIdx < maxDocsToTry; docIdx++) {
+        const doc = prioritizedDocs[docIdx];
         docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accessionNoNoDashes}/${doc.name}`;
-        console.log(`\n📄 Trying document: ${doc.name}`);
+        console.log(`\n📄 Trying document ${docIdx + 1}/${maxDocsToTry}: ${doc.name}`);
         console.log(`   URL: ${docUrl}`);
         
         try {
           const html = await fetchSecFile(docUrl);
           console.log(`   Size: ${(html.length / 1024).toFixed(0)} KB`);
           
-          // Hard limit: Skip documents over 1MB to avoid WORKER_LIMIT
-          if (html.length > 1_000_000) {
-            warnings.push(`Document ${doc.name} too large to safely parse (${(html.length / 1024).toFixed(0)} KB > 1MB). Skipping.`);
-            console.log(`   ⚠️ Document too large, skipping`);
+          // For very large documents (>5MB), try to extract just the SOI section first
+          let textToParse = html;
+          if (html.length > 5_000_000) {
+            console.log(`   📦 Large document, extracting SOI sections only...`);
+            // Look for Schedule of Investments sections
+            const soiMatch = html.match(/schedule\s+of\s+investments[\s\S]{0,2000000}/gi);
+            if (soiMatch && soiMatch.length > 0) {
+              // Take first match plus surrounding context
+              const firstMatch = soiMatch[0];
+              textToParse = firstMatch;
+              console.log(`   📦 Extracted ${(textToParse.length / 1024).toFixed(0)} KB SOI section`);
+            } else {
+              warnings.push(`Document ${doc.name} too large (${(html.length / 1024).toFixed(0)} KB) and no SOI section found. Skipping.`);
+              console.log(`   ⚠️ No SOI section found in large document, skipping`);
+              continue;
+            }
+          }
+          
+          // Hard limit: Skip if still too large after extraction
+          if (textToParse.length > 5_000_000) {
+            warnings.push(`Document ${doc.name} section too large to safely parse (${(textToParse.length / 1024).toFixed(0)} KB > 5MB). Skipping.`);
+            console.log(`   ⚠️ Section still too large, skipping`);
             continue;
           }
           
-          holdings = parseHtmlScheduleOfInvestments(html, debugMode);
+          // If we haven't found holdings yet, enable debug mode on later documents
+          const useDebug = debugMode || (docIdx >= 2 && holdings.length === 0);
+          holdings = parseHtmlScheduleOfInvestments(textToParse, useDebug);
           
           console.log(`   Result: ${holdings.length} holdings found`);
           
