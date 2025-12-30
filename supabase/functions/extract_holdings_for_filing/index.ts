@@ -1353,18 +1353,67 @@ serve(async (req) => {
           const html = await fetchSecFile(docUrl);
           console.log(`   Size: ${(html.length / 1024).toFixed(0)} KB`);
           
-          // For very large documents (>5MB), pass to parseHtmlScheduleOfInvestments which handles chunking
+          // For very large documents (>5MB), extract just the SOI section to avoid memory issues
           let textToParse = html;
           if (html.length > 5_000_000) {
-            console.log(`   📦 Large document (${(html.length / 1024 / 1024).toFixed(1)} MB), will use chunked SOI extraction...`);
-            // Let parseHtmlScheduleOfInvestments handle the extraction and chunking
-            // It will find all SOI keyword occurrences and extract the full section
+            console.log(`   📦 Large document (${(html.length / 1024 / 1024).toFixed(1)} MB), extracting SOI section...`);
+            
+            // Find the boundaries of the Schedule of Investments section
+            const lower = html.toLowerCase();
+            
+            // Find first occurrence of "schedule of investments" (start of SOI)
+            const soiKeywords = [
+              "consolidated schedule of investments",
+              "schedule of investments",
+            ];
+            
+            let firstOccurrence = -1;
+            for (const kw of soiKeywords) {
+              const idx = lower.indexOf(kw);
+              if (idx !== -1 && (firstOccurrence === -1 || idx < firstOccurrence)) {
+                firstOccurrence = idx;
+              }
+            }
+            
+            if (firstOccurrence === -1) {
+              warnings.push(`No Schedule of Investments found in large document ${doc.name}. Skipping.`);
+              console.log(`   ⚠️ No SOI section found in large document, skipping`);
+              continue;
+            }
+            
+            // Find end markers - typically "Notes to Consolidated Financial Statements" or similar
+            const endMarkers = [
+              "notes to consolidated financial statements",
+              "notes to financial statements",
+              "see notes to consolidated financial statements",
+              "see notes to financial statements",
+              "</body>",
+            ];
+            
+            let lastOccurrence = html.length;
+            const searchFrom = firstOccurrence + 1000; // Start searching after the first SOI header
+            
+            for (const marker of endMarkers) {
+              const idx = lower.indexOf(marker, searchFrom);
+              if (idx !== -1 && idx < lastOccurrence) {
+                lastOccurrence = idx;
+                console.log(`   📍 Found end marker "${marker}" at position ${idx}`);
+                break;
+              }
+            }
+            
+            // Extract with some buffer
+            const start = Math.max(0, firstOccurrence - 10_000);
+            const end = Math.min(html.length, lastOccurrence + 50_000);
+            textToParse = html.slice(start, end);
+            
+            console.log(`   📦 Extracted SOI section: ${(textToParse.length / 1024 / 1024).toFixed(1)} MB (${start} to ${end})`);
           }
           
-          // Hard limit: Skip if document is larger than 10MB (edge function memory limits)
+          // Hard limit: Skip if section is still too large (shouldn't happen for just SOI)
           if (textToParse.length > 10_000_000) {
-            warnings.push(`Document ${doc.name} too large (${(html.length / 1024 / 1024).toFixed(1)} MB > 10MB). Skipping.`);
-            console.log(`   ⚠️ Document exceeds 10MB limit, skipping`);
+            warnings.push(`SOI section from ${doc.name} still too large (${(textToParse.length / 1024 / 1024).toFixed(1)} MB > 10MB). Skipping.`);
+            console.log(`   ⚠️ SOI section exceeds 10MB limit, skipping`);
             continue;
           }
           
