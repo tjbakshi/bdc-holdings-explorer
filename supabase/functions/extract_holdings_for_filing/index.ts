@@ -1342,85 +1342,279 @@ function sortHoldingsByIndustryAndCompany(holdings: Holding[]): Holding[] {
   });
 }
 
-// Parse HTML Schedule of Investments table from snippets
-// Uses GlobalIndustryRegistry for persistent industry tracking across all snippets
+// ============================================================
+// REVERSE-NUMERIC SEARCH PARSER
+// A lightweight regex-based parser that:
+// 1. Extracts all text from <td> cells, stripping HTML tags
+// 2. Identifies data rows by finding 2+ numeric values at the end
+// 3. Text-only rows become the currentIndustry
+// 4. Handles parentheses as negative numbers
+// ============================================================
+
+// Clean numeric string: remove $, (, ), commas, then parse
+// Treats (100.5) as -100.5
+function cleanAndParseNumeric(value: string): number | null {
+  if (!value) return null;
+  
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '-' || trimmed === '—' || trimmed === '–') return null;
+  
+  // Check if value is in parentheses (negative)
+  const isNegative = trimmed.startsWith('(') && trimmed.endsWith(')');
+  
+  // Remove $, (, ), commas, spaces
+  const cleaned = trimmed.replace(/[$(),\s]/g, '');
+  if (!cleaned) return null;
+  
+  const parsed = parseFloat(cleaned);
+  if (isNaN(parsed)) return null;
+  
+  return isNegative ? -parsed : parsed;
+}
+
+// Extract all text content from a cell, stripping all HTML tags
+function extractCellText(cellHtml: string): string {
+  // Remove all HTML tags
+  const text = cellHtml.replace(/<[^>]*>/g, ' ');
+  // Decode HTML entities
+  const decoded = text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&mdash;/gi, '—')
+    .replace(/&ndash;/gi, '–');
+  // Normalize whitespace
+  return decoded.replace(/\s+/g, ' ').trim();
+}
+
+// Extract cells from a table row using regex
+function extractRowCells(rowHtml: string): string[] {
+  const cells: string[] = [];
+  // Match <td...>content</td> or <th...>content</th>
+  const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
+  let match;
+  while ((match = cellRegex.exec(rowHtml)) !== null) {
+    cells.push(extractCellText(match[1]));
+  }
+  return cells;
+}
+
+// Check if a row is a data row (has 2+ numeric values at the end)
+// Returns the numeric values found at the end if it's a data row
+function analyzeRowForNumericValues(cells: string[]): { 
+  isDataRow: boolean; 
+  numericValues: { value: number; index: number }[];
+  textCells: string[];
+} {
+  const numericValues: { value: number; index: number }[] = [];
+  
+  // Scan from end to find numeric values
+  for (let i = cells.length - 1; i >= 0; i--) {
+    const value = cleanAndParseNumeric(cells[i]);
+    if (value !== null) {
+      numericValues.unshift({ value, index: i }); // Keep in order
+    } else if (numericValues.length > 0) {
+      // Stop when we hit non-numeric after finding numerics
+      break;
+    }
+  }
+  
+  // Text cells are everything before the numeric values
+  const firstNumericIndex = numericValues.length > 0 ? numericValues[0].index : cells.length;
+  const textCells = cells.slice(0, firstNumericIndex);
+  
+  return {
+    isDataRow: numericValues.length >= 2,
+    numericValues,
+    textCells
+  };
+}
+
+// Parse HTML Schedule of Investments using Reverse-Numeric Search
+// This is a lightweight regex-based parser that doesn't use DOM parsing
 function parseHtmlScheduleOfInvestments(
   html: string, 
   debugMode = false, 
   industryRegistry: GlobalIndustryRegistry
 ): { holdings: Holding[]; scaleResult: ScaleDetectionResult; } {
-  // ARCC and other large BDCs can have 500+ companies with 2-5 investment lines each
-  // Need to process at least 3000 rows to capture the full Schedule of Investments
-  const maxRowsPerTable = 3000;
   const maxHoldings = 2000;
   
   // Detect scale from the HTML (look for "in thousands" or "in millions")
   const scaleResult = detectScale(html);
   
-  // Accumulate holdings from ALL snippets instead of returning on first match
   const allHoldings: Holding[] = [];
+  let currentIndustry: string | null = industryRegistry.getActiveIndustry();
+  let currentCompany: string | null = null;
   
-  try {
-    // Extract only relevant HTML snippets
-    const snippets = extractCandidateTableHtml(html);
-    console.log(`Found ${snippets.length} candidate snippets to parse`);
-    
-    for (let i = 0; i < snippets.length; i++) {
-      const snippet = snippets[i];
-      const doc = new DOMParser().parseFromString(snippet, "text/html");
-      if (!doc) continue;
-      
-      // Calculate remaining capacity
-      const remainingCapacity = maxHoldings - allHoldings.length;
-      if (remainingCapacity <= 0) {
-        console.log(`Reached max holdings cap (${maxHoldings}), stopping snippet processing`);
-        break;
-      }
-      
-      const tables = Array.from(doc.querySelectorAll("table")) as Element[];
-      const parseResult = parseTables(tables, maxRowsPerTable, remainingCapacity, debugMode, industryRegistry);
-      const snippetHoldings = parseResult.holdings;
-      
-      if (snippetHoldings.length > 0) {
-        console.log(`Snippet ${i + 1}/${snippets.length}: Found ${snippetHoldings.length} holdings`);
-        allHoldings.push(...snippetHoldings);
-      }
+  console.log(`🔍 Starting Reverse-Numeric Search parser (${(html.length / 1024).toFixed(0)} KB)`);
+  
+  // Extract all table rows using regex
+  const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let rowMatch;
+  let rowCount = 0;
+  let dataRowCount = 0;
+  let industryRowCount = 0;
+  
+  while ((rowMatch = rowRegex.exec(html)) !== null) {
+    if (allHoldings.length >= maxHoldings) {
+      console.log(`Reached max holdings cap (${maxHoldings})`);
+      break;
     }
     
-    // Deduplicate holdings in case of overlapping chunks
-    // Use company_name + investment_type + fair_value as a composite key
-    if (allHoldings.length > 0) {
-      const seen = new Set<string>();
-      const deduplicatedHoldings: Holding[] = [];
+    rowCount++;
+    const rowHtml = rowMatch[1];
+    const cells = extractRowCells(rowHtml);
+    
+    if (cells.length === 0) continue;
+    
+    // Analyze the row for numeric values
+    const analysis = analyzeRowForNumericValues(cells);
+    
+    // Debug first 20 rows
+    if (debugMode && rowCount <= 20) {
+      console.log(`Row ${rowCount}: cells=${cells.length}, isData=${analysis.isDataRow}, nums=${analysis.numericValues.length}, text="${analysis.textCells.join(' | ').substring(0, 80)}"`);
+    }
+    
+    if (analysis.isDataRow) {
+      // This is a data row with Cost and Fair Value at the end
+      dataRowCount++;
       
-      for (const h of allHoldings) {
-        const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          deduplicatedHoldings.push(h);
+      // Get the first non-empty text cell as company/investment info
+      const firstText = analysis.textCells.find(t => t.length > 0) || '';
+      
+      // Check if this looks like a company name (has company suffix)
+      if (hasCompanySuffix(firstText)) {
+        currentCompany = cleanCompanyName(firstText);
+      }
+      
+      // Determine investment type from text cells
+      let investmentType: string | null = null;
+      for (const text of analysis.textCells) {
+        const lower = text.toLowerCase();
+        if (INVESTMENT_TYPE_LABELS.some(label => lower.includes(label))) {
+          investmentType = text;
+          break;
         }
       }
       
-      if (deduplicatedHoldings.length < allHoldings.length) {
-        console.log(`Deduplicated: ${allHoldings.length} -> ${deduplicatedHoldings.length} holdings`);
+      // If no company found in this row, use the current one
+      const companyName = currentCompany || firstText;
+      
+      // Skip if no valid company name
+      if (!companyName || companyName.length < 5) continue;
+      
+      // Extract values: last two numeric values are typically Cost and Fair Value
+      const numVals = analysis.numericValues;
+      let fairValue: number | null = null;
+      let cost: number | null = null;
+      let parAmount: number | null = null;
+      
+      if (numVals.length >= 2) {
+        fairValue = numVals[numVals.length - 1].value;
+        cost = numVals[numVals.length - 2].value;
+        if (numVals.length >= 3) {
+          parAmount = numVals[numVals.length - 3].value;
+        }
+      } else if (numVals.length === 1) {
+        fairValue = numVals[0].value;
       }
       
-      // Apply final sorting: alphabetically by company within each industry
-      const sortedHoldings = sortHoldingsByIndustryAndCompany(deduplicatedHoldings);
+      // Skip if no fair value or zero
+      if (fairValue === null || fairValue === 0) continue;
       
-      console.log(`Total unique holdings from all snippets: ${sortedHoldings.length}`);
-      const stats = industryRegistry.getStats();
-      console.log(`📂 Industry registry stats: ${stats.industries} industries, ${stats.totalCompanies} unique companies registered`);
+      // Validate the holding
+      const validation = isRealHolding(companyName, fairValue, cost, investmentType, parAmount);
+      if (!validation.valid) {
+        if (debugMode && dataRowCount <= 10) {
+          console.log(`❌ Rejected: "${companyName.substring(0, 40)}" - ${validation.reason}`);
+        }
+        continue;
+      }
       
-      return { holdings: sortedHoldings, scaleResult };
-    } else {
-      console.log("No holdings found in any snippets");
+      // Create the holding
+      const holding: Holding = {
+        company_name: cleanCompanyName(companyName),
+        investment_type: investmentType,
+        industry: currentIndustry,
+        description: null,
+        interest_rate: null,
+        reference_rate: null,
+        maturity_date: null,
+        par_amount: parAmount,
+        cost,
+        fair_value: fairValue,
+      };
+      
+      // Register company with industry
+      industryRegistry.registerCompany(holding.company_name, currentIndustry);
+      
+      allHoldings.push(holding);
+      
+      if (debugMode && allHoldings.length <= 5) {
+        console.log(`✅ Holding: "${holding.company_name.substring(0, 40)}" FV=$${fairValue} Industry="${currentIndustry}"`);
+      }
+      
+    } else if (analysis.textCells.length > 0 && analysis.numericValues.length === 0) {
+      // This might be an industry header (text only, no numbers)
+      const firstText = analysis.textCells.find(t => t.length > 0) || '';
+      
+      // Check if all other cells are empty (characteristic of industry headers)
+      const nonEmptyCount = analysis.textCells.filter(t => t.length > 0).length;
+      
+      if (firstText.length >= 3 && firstText.length <= 100 && nonEmptyCount === 1) {
+        // Check if this looks like an industry (not a skip keyword, not a company)
+        const isSkip = SKIP_KEYWORDS.some(kw => firstText.toLowerCase().includes(kw));
+        const isCompany = hasCompanySuffix(firstText);
+        const isInvestmentType = isInvestmentTypeLabel(firstText);
+        
+        if (!isSkip && !isCompany && !isInvestmentType) {
+          // Likely an industry header
+          currentIndustry = normalizeIndustryName(firstText);
+          industryRegistry.setActiveIndustry(firstText);
+          industryRowCount++;
+          currentCompany = null; // Reset company on new industry
+          
+          if (debugMode && industryRowCount <= 10) {
+            console.log(`📂 Industry: "${currentIndustry}"`);
+          }
+        }
+      }
     }
   }
-  catch (error) {
-    console.error("Error parsing HTML:", error);
+  
+  console.log(`📊 Reverse-Numeric Search complete: ${rowCount} rows scanned, ${dataRowCount} data rows, ${industryRowCount} industry headers, ${allHoldings.length} holdings extracted`);
+  
+  // Deduplicate holdings using company_name + investment_type + fair_value as key
+  if (allHoldings.length > 0) {
+    const seen = new Set<string>();
+    const deduplicatedHoldings: Holding[] = [];
+    
+    for (const h of allHoldings) {
+      const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduplicatedHoldings.push(h);
+      }
+    }
+    
+    if (deduplicatedHoldings.length < allHoldings.length) {
+      console.log(`Deduplicated: ${allHoldings.length} -> ${deduplicatedHoldings.length} holdings`);
+    }
+    
+    // Apply final sorting: alphabetically by company within each industry
+    const sortedHoldings = sortHoldingsByIndustryAndCompany(deduplicatedHoldings);
+    
+    console.log(`Total unique holdings: ${sortedHoldings.length}`);
+    const stats = industryRegistry.getStats();
+    console.log(`📂 Industry registry stats: ${stats.industries} industries, ${stats.totalCompanies} unique companies registered`);
+    
+    return { holdings: sortedHoldings, scaleResult };
   }
   
+  console.log("No holdings found");
   return { holdings: allHoldings, scaleResult };
 }
 
