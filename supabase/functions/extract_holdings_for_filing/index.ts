@@ -1580,10 +1580,88 @@ serve(async (req) => {
               }
             }
             
-            // Calculate section span - the FULL SOI section without any cap
+            // ============ CURRENT QUARTER ONLY EXTRACTION ============
+            // SEC filings often include both current quarter AND prior year-end for comparison
+            // We only want the CURRENT quarter, not the prior period
+            
+            // Look for prior period markers that indicate the start of comparison SOI
+            const priorPeriodMarkers = [
+              'december 31, 2024',
+              'december 31,2024',
+              'as of december 31, 2024',
+              'at december 31, 2024',
+              '12/31/2024',
+              '12/31/24',
+              // Also check for any "prior" or "comparison" language
+              'consolidated schedule of investments</b><br>(prior',
+              'schedule of investments (prior',
+              // For filings from other periods, check generic prior year markers
+              'december 31, 2023',
+              'december 31, 2022',
+            ];
+            
+            // Find where prior period SOI starts (after our main SOI start)
+            let priorPeriodStart = documentEnd;
+            const searchStartOffset = bestStart + 50_000; // Skip at least 50KB from start
+            
+            for (const marker of priorPeriodMarkers) {
+              const markerIdx = lower.indexOf(marker, searchStartOffset);
+              if (markerIdx !== -1 && markerIdx < priorPeriodStart) {
+                // Verify this is actually in a "Schedule of Investments" context
+                // Look back up to 5KB for SOI header
+                const contextBefore = lower.slice(Math.max(0, markerIdx - 5000), markerIdx);
+                if (contextBefore.includes('schedule of investments') || 
+                    contextBefore.includes('consolidated schedule')) {
+                  priorPeriodStart = markerIdx;
+                  console.log(`   📍 Found PRIOR PERIOD marker "${marker}" at position ${markerIdx}`);
+                }
+              }
+            }
+            
+            // Also look for a SECOND "Schedule of Investments" header that might indicate comparison
+            // Skip the first occurrence and look for the next complete header
+            const secondSoiPatterns = [
+              'consolidated schedule of investments',
+              '<b>schedule of investments',
+              '>schedule of investments<',
+            ];
+            
+            for (const pattern of secondSoiPatterns) {
+              // Start looking after the first 100KB of SOI section
+              const searchStart = bestStart + 100_000;
+              const patternIdx = lower.indexOf(pattern, searchStart);
+              
+              if (patternIdx !== -1 && patternIdx < priorPeriodStart) {
+                // Check if this is followed by a date that looks like prior period
+                const nearbyText = lower.slice(patternIdx, Math.min(patternIdx + 1000, html.length));
+                if (nearbyText.includes('december 31') || nearbyText.includes('12/31')) {
+                  priorPeriodStart = patternIdx;
+                  console.log(`   📍 Found SECOND SOI header at position ${patternIdx} (prior period)`);
+                }
+              }
+            }
+            
+            // Use the earlier of: prior period start, document end, or "Total Investments" + buffer
+            const totalInvestmentsIdx = lower.indexOf('total investments', bestStart);
+            let currentQuarterEnd = priorPeriodStart;
+            
+            if (totalInvestmentsIdx !== -1 && totalInvestmentsIdx < priorPeriodStart) {
+              // Include some buffer after "Total Investments" to capture the totals row
+              currentQuarterEnd = Math.min(priorPeriodStart, totalInvestmentsIdx + 10_000);
+              console.log(`   📍 Found "Total Investments" at ${totalInvestmentsIdx}, setting end to ${currentQuarterEnd}`);
+            }
+            
+            // Final SOI boundaries
             const soiStart = Math.max(0, bestStart - 10_000);
-            const soiEnd = Math.min(html.length, documentEnd + 50_000);
+            const soiEnd = Math.min(html.length, currentQuarterEnd);
             const totalSoiSize = soiEnd - soiStart;
+            
+            console.log(`   📊 CURRENT QUARTER SOI section only:`);
+            console.log(`      Start: ${soiStart}, End: ${soiEnd}`);
+            console.log(`      Size: ${(totalSoiSize / 1024 / 1024).toFixed(1)} MB`);
+            if (priorPeriodStart < documentEnd) {
+              console.log(`      ⚠️ Excluded prior period starting at position ${priorPeriodStart}`);
+            }
             
             console.log(`   📊 Full SOI section: ${(totalSoiSize / 1024 / 1024).toFixed(1)} MB`);
             
