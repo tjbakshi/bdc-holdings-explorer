@@ -1638,7 +1638,9 @@ serve(async (req) => {
                   
                   if (segmentHoldings.length > 0) {
                     // Deduplicate against previously seen holdings
-                    const scale = combinedScaleResult?.scale || 1; // ARCC reports in millions
+                    // For large filings using lightweight parser, values are already in the source scale
+                    // Scale: 1 = already millions, 0.001 = needs conversion from thousands
+                    const scale = combinedScaleResult?.scale || 1;
                     const newHoldings: Holding[] = [];
                     
                     for (const h of segmentHoldings) {
@@ -1651,6 +1653,8 @@ serve(async (req) => {
                     
                     if (newHoldings.length > 0) {
                       // Convert and save to DB immediately
+                      // For millions (scale=1): values stay as-is
+                      // For thousands (scale=0.001): multiply to convert to millions
                       const holdingsToInsert = newHoldings.map((h) => ({
                         filing_id: filingId,
                         company_name: h.company_name,
@@ -1660,9 +1664,9 @@ serve(async (req) => {
                         interest_rate: h.interest_rate,
                         reference_rate: h.reference_rate,
                         maturity_date: h.maturity_date,
-                        par_amount: toMillions(h.par_amount, scale),
-                        cost: toMillions(h.cost, scale),
-                        fair_value: toMillions(h.fair_value, scale),
+                        par_amount: h.par_amount != null ? Math.round((h.par_amount * scale) * 10) / 10 : null,
+                        cost: h.cost != null ? Math.round((h.cost * scale) * 10) / 10 : null,
+                        fair_value: h.fair_value != null ? Math.round((h.fair_value * scale) * 10) / 10 : null,
                       }));
                       
                       const { error: insertError } = await supabaseClient
