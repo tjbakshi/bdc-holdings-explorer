@@ -735,22 +735,38 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       // If position-based lookup failed, try finding values from the end of the row
       // SEC filings typically have: ... Principal | Amortized Cost | Fair Value | % of Net Assets
       if (fairValue === null && cells.length > 0) {
-        // Search the last 5 cells for numeric values
-        for (let j = cells.length - 1; j >= Math.max(0, cells.length - 5) && fairValue === null; j--) {
+        // Collect all numeric values from the last 6 cells, excluding percentage columns
+        const numericCells: { index: number; value: number; text: string }[] = [];
+        
+        for (let j = cells.length - 1; j >= Math.max(0, cells.length - 6); j--) {
           const cellText = cells[j].textContent?.trim() || "";
+          // Skip cells that contain % or are likely percentage values
+          if (cellText.includes('%') || cellText.includes('(') && cellText.includes(')') && cellText.length < 10) {
+            continue;
+          }
           const value = parseNumeric(cellText);
-          // Skip percentage values (e.g., "0.1%")
-          if (value !== null && !cellText.includes('%')) {
-            fairValue = value;
-            fairValueCell = cells[j];
-            // Cost should be the cell before fair value
-            if (j > 0) {
-              const prevValue = parseNumeric(cells[j - 1].textContent?.trim());
-              if (prevValue !== null) {
-                cost = prevValue;
-                costCell = cells[j - 1];
-              }
-            }
+          // Only accept positive values that look like dollar amounts
+          if (value !== null && value > 0) {
+            numericCells.push({ index: j, value, text: cellText });
+          }
+        }
+        
+        // Fair value is typically the last positive number before % of Net Assets
+        // Cost is typically the second to last positive number
+        // Sort by index (ascending) to get order: principal, cost, fair_value
+        numericCells.sort((a, b) => a.index - b.index);
+        
+        if (numericCells.length >= 1) {
+          // Last numeric cell is fair value
+          const fvCell = numericCells[numericCells.length - 1];
+          fairValue = fvCell.value;
+          fairValueCell = cells[fvCell.index];
+          
+          if (numericCells.length >= 2) {
+            // Second to last is cost
+            const costData = numericCells[numericCells.length - 2];
+            cost = costData.value;
+            costCell = cells[costData.index];
           }
         }
       }
