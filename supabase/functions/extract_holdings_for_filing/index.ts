@@ -1588,14 +1588,14 @@ serve(async (req) => {
             console.log(`   📊 Full SOI section: ${(totalSoiSize / 1024 / 1024).toFixed(1)} MB`);
             
             // For very large SOI sections (like ARCC's $28.6B portfolio), use segment-based extraction
-            // Critical: Use smaller segments (1.5MB) and save to DB after EACH segment to avoid memory accumulation
-            const SEGMENT_SIZE = 1_500_000; // 1.5MB per segment - smaller to avoid memory issues
-            const OVERLAP_SIZE = 100_000; // 100KB overlap to avoid cutting holdings
+            // Use smaller segments (500KB) with the DOM parser for better accuracy
+            const SEGMENT_SIZE = 500_000; // 500KB per segment - small to work with DOM parser
+            const OVERLAP_SIZE = 50_000; // 50KB overlap to avoid cutting holdings
             
             if (totalSoiSize > 4_000_000) {
               const numSegments = Math.ceil(totalSoiSize / SEGMENT_SIZE);
-              console.log(`   📦 Large SOI section detected, using segmented DB-save approach...`);
-              console.log(`   📦 Will process ${numSegments} segments of ~1.5MB, saving to DB after each`);
+              console.log(`   📦 Large SOI section, using segmented DOM-parser approach...`);
+              console.log(`   📦 Will process ${numSegments} segments of ~500KB, saving to DB after each`);
               
               // First delete any existing holdings for this filing to avoid duplicates
               const { error: deleteError } = await supabaseClient
@@ -1607,9 +1607,12 @@ serve(async (req) => {
                 console.error(`   ⚠️ Error clearing existing holdings:`, deleteError);
               }
               
+              // Detect scale from the first part of the document
+              const segmentScaleResult = detectScale(html.slice(soiStart, Math.min(soiStart + 100_000, soiEnd)));
+              console.log(`   📊 Scale detected: ${segmentScaleResult.detected}`);
+              
               // Track holdings keys across segments for deduplication
               const seenHoldingKeys = new Set<string>();
-              let combinedScaleResult: ScaleDetectionResult | null = null;
               let currentPosition = soiStart;
               let segmentCount = 0;
               let totalInserted = 0;
@@ -1619,28 +1622,21 @@ serve(async (req) => {
                 segmentCount++;
                 const segmentEnd = Math.min(currentPosition + SEGMENT_SIZE, soiEnd);
                 
-                const segmentMBStart = ((currentPosition - soiStart) / 1024 / 1024).toFixed(1);
-                const segmentMBEnd = ((segmentEnd - soiStart) / 1024 / 1024).toFixed(1);
-                console.log(`   📦 Segment ${segmentCount}/${numSegments}: MB ${segmentMBStart}-${segmentMBEnd}`);
+                // Log every 5th segment to reduce log spam
+                if (segmentCount % 5 === 1 || segmentCount === numSegments) {
+                  console.log(`   📦 Segment ${segmentCount}/${numSegments}`);
+                }
                 
                 try {
-                  // Extract and parse this segment using the LIGHTWEIGHT regex parser (no DOM)
+                  // Extract this segment and parse with DOM parser
                   const segment = html.slice(currentPosition, segmentEnd);
-                  
-                  // Detect scale on first segment only
-                  if (!combinedScaleResult) {
-                    combinedScaleResult = detectScale(segment);
-                    console.log(`   📊 Scale detected: ${combinedScaleResult.detected}`);
-                  }
-                  
-                  // Use lightweight regex parser - much faster and lower memory
-                  const segmentHoldings = parseLargeFilingSegment(segment);
+                  const segmentResult = parseHtmlScheduleOfInvestments(segment, false);
+                  const segmentHoldings = segmentResult.holdings;
                   
                   if (segmentHoldings.length > 0) {
                     // Deduplicate against previously seen holdings
-                    // For large filings using lightweight parser, values are already in the source scale
                     // Scale: 1 = already millions, 0.001 = needs conversion from thousands
-                    const scale = combinedScaleResult?.scale || 1;
+                    const scale = segmentScaleResult?.scale || 1;
                     const newHoldings: Holding[] = [];
                     
                     for (const h of segmentHoldings) {
@@ -1679,13 +1675,12 @@ serve(async (req) => {
                         totalInserted += holdingsToInsert.length;
                         const segmentValue = holdingsToInsert.reduce((sum, h) => sum + (h.fair_value || 0), 0);
                         runningTotalValue += segmentValue;
-                        console.log(`   ✅ Saved ${holdingsToInsert.length} new holdings ($${segmentValue.toFixed(1)}M) | Total: ${totalInserted} ($${runningTotalValue.toFixed(1)}M)`);
+                        // Log every 5 segments or when done
+                        if (segmentCount % 5 === 0 || segmentCount === numSegments) {
+                          console.log(`   ✅ Progress: ${totalInserted} holdings ($${runningTotalValue.toFixed(1)}M)`);
+                        }
                       }
-                    } else {
-                      console.log(`   ⚪ Segment ${segmentCount}: All ${segmentHoldings.length} holdings were duplicates`);
                     }
-                  } else {
-                    console.log(`   ⚪ Segment ${segmentCount}: No holdings found`);
                   }
                 } catch (segmentError) {
                   console.error(`   ⚠️ Error processing segment ${segmentCount}:`, segmentError);
@@ -1700,13 +1695,13 @@ serve(async (req) => {
                 currentPosition = nextPosition;
                 
                 // Brief pause to allow garbage collection
-                await new Promise(resolve => setTimeout(resolve, 10));
+                await new Promise(resolve => setTimeout(resolve, 5));
               }
               
               console.log(`   📦 Segmented extraction complete!`);
               console.log(`   📊 Total: ${totalInserted} holdings, $${runningTotalValue.toFixed(1)}M`);
               
-              if (combinedScaleResult) scaleResult = combinedScaleResult;
+              scaleResult = segmentScaleResult;
               
               // For segmented extraction, we've already saved to DB, so mark filing as parsed and return
               if (totalInserted > 0) {
