@@ -1294,14 +1294,10 @@ serve(async (req) => {
       const indexJson = await fetchSecFile(indexUrl);
       const index = JSON.parse(indexJson);
       
-      // Log all available documents for debugging
-      if (debugMode && index.directory?.item) {
-        console.log("\n=== Available documents in index.json ===");
-        index.directory.item.forEach((item: any, idx: number) => {
-          console.log(`${idx + 1}. ${item.name} (type: ${item.type || 'N/A'})`);
-        });
-        console.log("=====================================\n");
-      }
+      // Quick summary of documents (don't log all to save time)
+      const totalDocs = index.directory?.item?.length || 0;
+      const primaryDoc = index.directory?.item?.find((i: any) => i.type === "primary");
+      console.log(`\n📁 Found ${totalDocs} documents. Primary: ${primaryDoc?.name || 'none'}`);
       
       // Find all .htm documents (not just primary)
       const htmDocs = (index.directory?.item || []).filter(
@@ -1332,13 +1328,9 @@ serve(async (req) => {
         return 0;
       });
       
-      if (debugMode) {
-        console.log("\n=== Document processing order ===");
-        prioritizedDocs.forEach((doc: any, idx: number) => {
-          console.log(`${idx + 1}. ${doc.name} (type: ${doc.type || 'N/A'})`);
-        });
-        console.log("=================================\n");
-      }
+      // Log first few documents for reference
+      console.log(`   Processing order: ${prioritizedDocs.slice(0, 5).map((d: any) => d.name).join(', ')}${prioritizedDocs.length > 5 ? '...' : ''}`);
+      console.log(`   Total HTM docs: ${htmDocs.length}`);
       
       // Try parsing each document until we find holdings (limit to 15 docs to avoid timeout)
       const maxDocsToTry = Math.min(prioritizedDocs.length, 15);
