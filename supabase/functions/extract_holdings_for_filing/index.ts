@@ -2095,6 +2095,9 @@ serve(async (req) => {
             let activeIndustry: string | null = null;
             let rowsProcessed = 0;
             
+            // STICKY TEXT BUFFERING: Track pending text from rows without numbers
+            let pendingTextBuffer: string | null = null;
+            
             // Non-portfolio items to skip (balance sheet items, financial statement entries, etc.)
             const NON_PORTFOLIO_ITEMS = [
               // Balance sheet items
@@ -2187,12 +2190,15 @@ serve(async (req) => {
                   rowsProcessed++;
                   const rowHtml = rowMatch[1];
                   
-                  // Extract cells
+                  // Extract cells - keep BOTH raw HTML and cleaned text
                   const cells: string[] = [];
+                  const rawCellsHtml: string[] = [];
                   const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
                   let cellMatch;
                   while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
-                    const cellText = cellMatch[1]
+                    const rawHtml = cellMatch[1];
+                    rawCellsHtml.push(rawHtml);
+                    const cellText = rawHtml
                       .replace(nbspRegex, ' ')
                       .replace(tagRemoveRegex, '')
                       .replace(/\s+/g, ' ')
@@ -2206,6 +2212,12 @@ serve(async (req) => {
                   }
                   
                   if (cells.length < 2) continue;
+                  
+                  // FIX #3: IMPROVED INDUSTRY DETECTION (Bold/Italic Trick)
+                  // Check for industry headers BEFORE numeric parsing
+                  // Industries often have <b>, <i>, or font-weight:bold and single colspan cell
+                  const hasBoldOrItalic = /<b[^>]*>|<i[^>]*>|font-weight:\s*bold|font-style:\s*italic/i.test(rowHtml);
+                  const hasColspan = /colspan\s*=\s*["']?\d+["']?/i.test(rowHtml);
                   
                   // REVERSE-NUMERIC SEARCH: Find numeric values at the end
                   const numericCells: { value: number; index: number }[] = [];
@@ -2222,63 +2234,140 @@ serve(async (req) => {
                   // Text cells are everything before the numeric values
                   const firstNumericIndex = numericCells.length > 0 ? numericCells[0].index : cells.length;
                   const textCells = cells.slice(0, firstNumericIndex);
+                  const rawTextCellsHtml = rawCellsHtml.slice(0, firstNumericIndex);
+                  
+                  // Industry Header Detection: Has bold/italic OR colspan, zero numeric values
+                  if (numericCells.length === 0 && textCells.length > 0) {
+                    const nonEmptyTextCells = textCells.filter(t => t.trim().length > 0);
+                    
+                    // Single text cell with bold/italic styling = industry header
+                    if (nonEmptyTextCells.length === 1 || (hasBoldOrItalic && hasColspan)) {
+                      const candidateIndustry = nonEmptyTextCells[0]?.trim() || textCells[0]?.trim() || '';
+                      
+                      if (candidateIndustry.length >= 3 && candidateIndustry.length <= 100) {
+                        const lowerCandidate = candidateIndustry.toLowerCase();
+                        
+                        // Check NOT a skip keyword, company, investment type, total, or header
+                        const isSkip = SKIP_KEYWORDS.some(kw => lowerCandidate.includes(kw));
+                        const isCompany = hasCompanySuffix(candidateIndustry);
+                        const isInvestType = isInvestmentTypeLabel(candidateIndustry);
+                        const isTotalRow = /^(total|subtotal|sub-total|sum|aggregate)\b/i.test(candidateIndustry);
+                        const isHeaderOrNote = /^(note|see |the |as of|for the|during|page \d|schedule of|consolidated)/i.test(candidateIndustry);
+                        const isNonPortfolio = NON_PORTFOLIO_ITEMS.some(item => lowerCandidate.includes(item));
+                        
+                        if (!isSkip && !isCompany && !isInvestType && !isTotalRow && !isHeaderOrNote && !isNonPortfolio) {
+                          // This is an industry header - SET IT
+                          activeIndustry = normalizeIndustryName(candidateIndustry);
+                          industryRegistry.setActiveIndustry(candidateIndustry);
+                          if (industryRegistry.getStats().industries <= 15) {
+                            console.log(`   📂 Industry detected: "${activeIndustry}" (bold/italic: ${hasBoldOrItalic})`);
+                          }
+                          pendingTextBuffer = null; // Clear buffer on industry switch
+                          continue;
+                        }
+                      }
+                    }
+                    
+                    // STICKY TEXT BUFFERING: Text row with no numbers = save for next row
+                    const allText = textCells.join(' ').trim();
+                    if (allText.length >= 5 && allText.length <= 150) {
+                      // Check if this looks like a company name start (not a header/label)
+                      const lowerText = allText.toLowerCase();
+                      const isSkipText = SKIP_KEYWORDS.some(kw => lowerText.includes(kw)) ||
+                                         /^(note|see |the |as of|for the|during|schedule)/i.test(allText) ||
+                                         NON_PORTFOLIO_ITEMS.some(item => lowerText.includes(item));
+                      
+                      if (!isSkipText) {
+                        pendingTextBuffer = allText;
+                      }
+                    }
+                    continue;
+                  }
                   
                   // DATA ROW: Has at least 2 numeric values at end (Cost + Fair Value)
                   if (numericCells.length >= 2) {
-                    const firstCell = textCells[0] || '';
-                    if (!firstCell || firstCell.length < 3) continue;
+                    let firstCell = textCells[0] || '';
+                    
+                    // STICKY BUFFER: If first cell is empty/short but we have pending text, use it
+                    if ((!firstCell || firstCell.length < 5) && pendingTextBuffer) {
+                      firstCell = pendingTextBuffer;
+                      pendingTextBuffer = null;
+                    } else if (firstCell && firstCell.length >= 5 && pendingTextBuffer) {
+                      // Both have text - prepend buffer to stitch multi-line company name
+                      firstCell = `${pendingTextBuffer} ${firstCell}`;
+                      pendingTextBuffer = null;
+                    }
+                    
+                    if (!firstCell || firstCell.length < 3) {
+                      pendingTextBuffer = null;
+                      continue;
+                    }
                     
                     // FIX #1: TOTAL FILTER - Skip rows containing Total/Subtotal/Sum/Aggregate
                     const lowerFirstCell = firstCell.toLowerCase();
                     if (/^(total|subtotal|sub-total|sum|aggregate)\b/i.test(firstCell) || 
                         lowerFirstCell.includes('total ') || lowerFirstCell.includes('subtotal')) {
+                      pendingTextBuffer = null;
                       continue;
                     }
                     
                     // Skip headers, notes, and balance sheet items
-                    if (/^(net|balance|notes|schedule|see accompanying|fair value|cost|principal|company|investment type)/i.test(firstCell)) continue;
-                    
-                    // Skip date entries that got captured as company names
-                    if (/^(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d/i.test(firstCell)) continue;
-                    
-                    // Skip entries that are just category labels (no entity suffix, very generic)
-                    if (/^(subordinated notes|other liabilities|other assets|derivative|net change)/i.test(firstCell)) continue;
-                    
-                    const isNonPortfolioItem = NON_PORTFOLIO_ITEMS.some(item => lowerFirstCell.includes(item));
-                    if (isNonPortfolioItem) continue;
-                    
-                    const companyName = cleanCompanyName(firstCell);
-                    if (!companyName || companyName.length < 5) continue;
-                    
-                    // Skip if looks like a date format (e.g., "April 29, 2025")
-                    if (/^\w+\s+\d{1,2},?\s+\d{4}$/.test(companyName)) continue;
-                    
-                    // FIX #2: MIDDLE-SWEEP METADATA EXTRACTION
-                    const middleCells = textCells.slice(1);
-                    const middleText = middleCells.join(' ');
-                    
-                    // Extract Interest Rate
-                    let interestRate: string | null = null;
-                    const rateMatch = middleText.match(/(\d+\.?\d*)\s*%/);
-                    if (rateMatch) {
-                      interestRate = rateMatch[0];
+                    if (/^(net|balance|notes|schedule|see accompanying|fair value|cost|principal|company|investment type)/i.test(firstCell)) {
+                      pendingTextBuffer = null;
+                      continue;
                     }
                     
-                    // Extract Reference Rate
+                    // Skip date entries that got captured as company names
+                    if (/^(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d/i.test(firstCell)) {
+                      pendingTextBuffer = null;
+                      continue;
+                    }
+                    
+                    // Skip entries that are just category labels (no entity suffix, very generic)
+                    if (/^(subordinated notes|other liabilities|other assets|derivative|net change)/i.test(firstCell)) {
+                      pendingTextBuffer = null;
+                      continue;
+                    }
+                    
+                    const isNonPortfolioItem = NON_PORTFOLIO_ITEMS.some(item => lowerFirstCell.includes(item));
+                    if (isNonPortfolioItem) {
+                      pendingTextBuffer = null;
+                      continue;
+                    }
+                    
+                    const companyName = cleanCompanyName(firstCell);
+                    if (!companyName || companyName.length < 5) {
+                      pendingTextBuffer = null;
+                      continue;
+                    }
+                    
+                    // Skip if looks like a date format (e.g., "April 29, 2025")
+                    if (/^\w+\s+\d{1,2},?\s+\d{4}$/.test(companyName)) {
+                      pendingTextBuffer = null;
+                      continue;
+                    }
+                    
+                    // FIX #2: AGGRESSIVE METADATA REGEX ON RAW HTML
+                    // Run regex on raw HTML before tags are stripped
+                    const middleCellsRawHtml = rawTextCellsHtml.slice(1).join(' ');
+                    const middleText = textCells.slice(1).join(' ');
+                    
+                    // Extract Interest Rate - AGGRESSIVE REGEX on RAW HTML
+                    let interestRate: string | null = null;
+                    const rateMatchRaw = middleCellsRawHtml.match(/(\d{1,2}\.?\d{0,3})\s*%/);
+                    if (rateMatchRaw) {
+                      interestRate = `${rateMatchRaw[1]}%`;
+                    }
+                    
+                    // Extract Reference Rate - AGGRESSIVE REGEX on RAW HTML
                     let referenceRate: string | null = null;
-                    const refPatterns = [
-                      { pattern: /\bSOFR\b/i, name: 'SOFR' },
-                      { pattern: /\bLIBOR\b/i, name: 'LIBOR' },
-                      { pattern: /\bPRIME\b/i, name: 'Prime' },
-                      { pattern: /\bL\s*\+/i, name: 'LIBOR' },
-                      { pattern: /\bS\s*\+/i, name: 'SOFR' },
-                      { pattern: /\bP\s*\+/i, name: 'Prime' },
-                    ];
-                    for (const { pattern, name } of refPatterns) {
-                      if (pattern.test(middleText)) {
-                        referenceRate = name;
-                        break;
-                      }
+                    const refMatchRaw = middleCellsRawHtml.match(/(S\s*\+\s*\d|L\s*\+\s*\d|P\s*\+\s*\d|Prime|Sofr|Libor)/i);
+                    if (refMatchRaw) {
+                      const refText = refMatchRaw[1].toUpperCase().replace(/\s+/g, '');
+                      if (refText.startsWith('S')) referenceRate = 'SOFR';
+                      else if (refText.startsWith('L')) referenceRate = 'LIBOR';
+                      else if (refText.startsWith('P')) referenceRate = 'Prime';
+                      else referenceRate = refText;
                     }
                     
                     // Extract Maturity Date
@@ -2299,7 +2388,7 @@ serve(async (req) => {
                     
                     // Extract Investment Type
                     let investmentType: string | null = null;
-                    for (const text of middleCells) {
+                    for (const text of textCells.slice(1)) {
                       const lower = text.toLowerCase();
                       if (INVESTMENT_TYPE_LABELS.some(t => lower.includes(t))) {
                         investmentType = text;
@@ -2321,29 +2410,42 @@ serve(async (req) => {
                       fairValue = numericCells[numericCells.length - 1].value;
                     }
                     
-                    if (fairValue === null || fairValue === 0) continue;
+                    if (fairValue === null || fairValue === 0) {
+                      pendingTextBuffer = null;
+                      continue;
+                    }
                     
-                    // SANITY CHECK: Real BDC holdings must have POSITIVE fair values
-                    // and reasonable magnitudes. Values in the range $0.1M to $1000M are typical.
-                    // Skip negative values and obvious XBRL numeric IDs
-                    if (fairValue < 0 || fairValue > 2000 || fairValue < 0.05) {
+                    // SANITY CHECK: Relaxed lower-bound from $0.05M to $0.01M
+                    // Real BDC holdings must have POSITIVE fair values
+                    if (fairValue < 0 || fairValue > 2000 || fairValue < 0.01) {
+                      pendingTextBuffer = null;
                       continue;
                     }
                     
                     // Also skip if cost is wildly negative (indicates XBRL ID capture)
                     if (cost !== null && cost < -100) {
+                      pendingTextBuffer = null;
                       continue;
                     }
                     
                     // Validation - ensure it's not a skip keyword
                     const lowerName = companyName.toLowerCase();
                     const isSkipWord = SKIP_KEYWORDS.some(kw => lowerName.includes(kw));
-                    if (isSkipWord) continue;
+                    if (isSkipWord) {
+                      pendingTextBuffer = null;
+                      continue;
+                    }
                     
                     // Must have at least 2 words or end with company suffix
                     const wordCount = companyName.split(/\s+/).filter(w => w.length > 0).length;
                     const hasEntitySuffix = hasCompanySuffix(companyName);
-                    if (wordCount < 2 && !hasEntitySuffix) continue;
+                    
+                    // DEBUG: Log rows that fail isRealHolding-like checks
+                    if (wordCount < 2 && !hasEntitySuffix) {
+                      console.log(`   ❌ Rejected holding: "${companyName.substring(0, 50)}" (reason: wordCount=${wordCount}, hasEntitySuffix=${hasEntitySuffix})`);
+                      pendingTextBuffer = null;
+                      continue;
+                    }
                     
                     const holding: Holding = {
                       company_name: companyName,
@@ -2365,41 +2467,12 @@ serve(async (req) => {
                       
                       // Debug logging for first few holdings
                       if (allHoldings.length <= 5) {
-                        console.log(`   ✅ Holding: "${companyName.substring(0, 40)}" FV=$${fairValue} Rate=${interestRate} Industry="${holding.industry}"`);
+                        console.log(`   ✅ Holding: "${companyName.substring(0, 40)}" FV=$${fairValue} Rate=${interestRate} Ref=${referenceRate} Industry="${holding.industry}"`);
                       }
                     }
                     
-                  } else if (numericCells.length === 0 && textCells.length > 0) {
-                    // FIX #3: IMPROVED INDUSTRY DETECTION
-                    // If a row has exactly one non-empty text cell and ZERO numeric values,
-                    // and it's not a skip keyword, set it as the activeIndustry
-                    
-                    const nonEmptyTextCells = textCells.filter(t => t.trim().length > 0);
-                    
-                    if (nonEmptyTextCells.length === 1) {
-                      const candidateIndustry = nonEmptyTextCells[0].trim();
-                      
-                      if (candidateIndustry.length >= 3 && candidateIndustry.length <= 100) {
-                        const lowerCandidate = candidateIndustry.toLowerCase();
-                        
-                        // Check NOT a skip keyword, company, investment type, total, or header
-                        const isSkip = SKIP_KEYWORDS.some(kw => lowerCandidate.includes(kw));
-                        const isCompany = hasCompanySuffix(candidateIndustry);
-                        const isInvestType = isInvestmentTypeLabel(candidateIndustry);
-                        const isTotalRow = /^(total|subtotal|sub-total|sum|aggregate)\b/i.test(candidateIndustry);
-                        const isHeaderOrNote = /^(note|see |the |as of|for the|during|page \d|schedule of|consolidated)/i.test(candidateIndustry);
-                        const isNonPortfolio = NON_PORTFOLIO_ITEMS.some(item => lowerCandidate.includes(item));
-                        
-                        if (!isSkip && !isCompany && !isInvestType && !isTotalRow && !isHeaderOrNote && !isNonPortfolio) {
-                          // This is likely an industry header - SET IT and let it STICK
-                          activeIndustry = normalizeIndustryName(candidateIndustry);
-                          industryRegistry.setActiveIndustry(candidateIndustry);
-                          if (industryRegistry.getStats().industries <= 15) {
-                            console.log(`   📂 Industry detected: "${activeIndustry}"`);
-                          }
-                        }
-                      }
-                    }
+                    // Clear buffer after successful holding
+                    pendingTextBuffer = null;
                   }
                 }
               } catch (chunkError) {
