@@ -1954,20 +1954,52 @@ serve(async (req) => {
               console.error(`   ⚠️ Error clearing existing holdings:`, deleteError);
             }
             
-            // Fetch first 500KB to detect scale and find SOI section boundaries (larger chunk)
-            const headerChunk = await fetchSecFileChunked(docUrl, 0, 500_000);
+            // Fetch first 3MB to find SOI section start (ARCC SOI starts around 2.6MB in)
+            const HEADER_CHUNK_SIZE = 3_000_000;
+            const headerChunk = await fetchSecFileChunked(docUrl, 0, Math.min(HEADER_CHUNK_SIZE, fileSize));
             const scaleResult = detectScale(headerChunk);
             console.log(`   📊 Scale detected: ${scaleResult.detected}`);
             const scale = scaleResult.scale;
             
-            // Find where SOI section likely starts
+            // Find the ACTUAL Schedule of Investments table start
+            // Look for the SOI header followed by table structure
             const lowerHeader = headerChunk.toLowerCase();
-            let soiStartGuess = lowerHeader.indexOf('schedule of investments');
+            
+            // Find "consolidated schedule of investments" or "schedule of investments"
+            // Skip table of contents references by looking for the actual section with table headers
+            let soiStartGuess = -1;
+            const soiPatterns = [
+              'consolidated schedule of investments',
+              'schedule of investments (unaudited)',
+              'schedule of investments'
+            ];
+            
+            for (const pattern of soiPatterns) {
+              let searchStart = 0;
+              while (true) {
+                const idx = lowerHeader.indexOf(pattern, searchStart);
+                if (idx === -1) break;
+                
+                // Check if this looks like the actual SOI section (has "fair value" or "company" nearby)
+                const contextWindow = lowerHeader.substring(idx, Math.min(idx + 2000, lowerHeader.length));
+                const hasFairValue = contextWindow.includes('fair value');
+                const hasCompany = contextWindow.includes('company') || contextWindow.includes('portfolio');
+                const hasTable = contextWindow.includes('<table');
+                
+                if (hasFairValue || hasCompany || hasTable) {
+                  soiStartGuess = idx;
+                  console.log(`   📍 SOI section found at position ${idx} (pattern: "${pattern}")`);
+                  break;
+                }
+                
+                searchStart = idx + pattern.length;
+              }
+              if (soiStartGuess !== -1) break;
+            }
+            
             if (soiStartGuess === -1) {
-              console.log(`   ⚠️ SOI not found in first 500KB, starting from beginning`);
+              console.log(`   ⚠️ SOI not found in first ${(HEADER_CHUNK_SIZE / 1024 / 1024).toFixed(1)}MB, starting from beginning`);
               soiStartGuess = 0;
-            } else {
-              console.log(`   📍 SOI found at position ${soiStartGuess} in header chunk`);
             }
             
             // Process file in 200KB chunks, accumulating holdings
@@ -1977,6 +2009,19 @@ serve(async (req) => {
             const seenKeys = new Set<string>();
             let activeIndustry: string | null = null;
             let rowsProcessed = 0;
+            
+            // Non-portfolio items to skip (balance sheet items, etc.)
+            const NON_PORTFOLIO_ITEMS = [
+              'cash and cash equivalents', 'restricted cash', 'interest receivable',
+              'accounts payable', 'accounts receivable', 'accrued', 'deferred',
+              'management fee', 'incentive fee', 'payable', 'receivable',
+              'accumulated', 'undistributed', 'retained earnings', 'paid-in capital',
+              'common stock', 'preferred stock', 'treasury stock',
+              'total assets', 'total liabilities', 'total equity',
+              'net assets', 'net asset value', 'stockholders',
+              'commitments and contingencies', 'note ', 'notes ',
+              '(in millions)', '(dollar amounts'
+            ];
             
             // Regex patterns for parsing - create new one each chunk to reset lastIndex
             const tagRemoveRegex = /<[^>]+>/g;
@@ -1997,16 +2042,24 @@ serve(async (req) => {
                 const chunkHtml = await fetchSecFileChunked(docUrl, chunkStart, chunkEnd);
                 const chunkLower = chunkHtml.toLowerCase();
                 
-                // Stop if we hit the notes section or prior period
-                if (chunkLower.includes('notes to consolidated financial statements') ||
-                    chunkLower.includes('notes to financial statements')) {
-                  console.log(`   📍 Found notes section in chunk ${chunkCount}, stopping`);
+                // Stop if we hit the END of SOI (Total Investments) - not notes in preamble
+                // Only stop on "Total Investments" pattern which marks actual end of SOI
+                const totalInvestmentsMatch = chunkLower.match(/total\s+investments(?:\s+at\s+fair\s+value)?/);
+                const hasActualNotes = chunkLower.includes('note 1') || chunkLower.includes('note 2') || 
+                                       chunkLower.includes('notes to consolidated');
+                
+                // Only stop if we've found substantial holdings AND hit the actual notes section
+                if (allHoldings.length > 50 && hasActualNotes && chunkCount > 10) {
+                  console.log(`   📍 Found notes section after holdings in chunk ${chunkCount}, stopping`);
                   break;
                 }
-                // Check for prior period date (December of previous year)
-                if (chunkCount > 5 && (chunkLower.includes('december 31, 2024') || chunkLower.includes('december 31, 2023'))) {
-                  console.log(`   📍 Found prior period date in chunk ${chunkCount}, stopping`);
-                  break;
+                
+                // Stop at prior period only if we've found substantial holdings
+                if (allHoldings.length > 50 && chunkCount > 10) {
+                  if (chunkLower.includes('december 31, 2024') || chunkLower.includes('december 31, 2023')) {
+                    console.log(`   📍 Found prior period date in chunk ${chunkCount}, stopping`);
+                    break;
+                  }
                 }
                 
                 // Parse rows from this chunk - create new regex each time to reset lastIndex
@@ -2030,91 +2083,131 @@ serve(async (req) => {
                   }
                   
                   // Log first few rows for debugging
-                  if (chunkCount === 1 && rowsProcessed <= 5) {
-                    console.log(`   Row ${rowsProcessed}: ${cells.length} cells, first="${cells[0]?.substring(0, 40)}"`);
+                  if (chunkCount <= 2 && rowsProcessed <= 10) {
+                    console.log(`   Row ${rowsProcessed}: ${cells.length} cells, first="${cells[0]?.substring(0, 50)}"`);
                   }
                   
-                  if (cells.length < 3) continue;
+                  if (cells.length < 2) continue;
                   
-                  const firstCell = cells[0];
-                  if (!firstCell) continue;
+                  // REVERSE-NUMERIC SEARCH: Find numeric values at the end
+                  const numericCells: { value: number; index: number }[] = [];
+                  for (let i = cells.length - 1; i >= 0; i--) {
+                    const val = cleanAndParseNumeric(cells[i]);
+                    if (val !== null) {
+                      numericCells.unshift({ value: val, index: i });
+                    } else if (numericCells.length > 0) {
+                      // Stop when we hit non-numeric after finding some
+                      break;
+                    }
+                  }
                   
-                  // Check for industry header
-                  const isIndustryRow = cells.length > 2 && 
-                    firstCell.length > 3 && firstCell.length < 80 &&
-                    cells.slice(1).every(c => !c || c === '-' || c === '—');
+                  // Text cells are everything before the numeric values
+                  const firstNumericIndex = numericCells.length > 0 ? numericCells[0].index : cells.length;
+                  const textCells = cells.slice(0, firstNumericIndex);
                   
-                  if (isIndustryRow && !isInvestmentTypeLabel(firstCell)) {
-                    const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Co\.|Company)\b/i.test(firstCell);
-                    const isTotalRow = /^(total|subtotal|sub-total)/i.test(firstCell);
+                  // DATA ROW: Has at least 2 numeric values at end (Cost + Fair Value)
+                  if (numericCells.length >= 2) {
+                    const firstCell = textCells[0] || '';
+                    if (!firstCell || firstCell.length < 3) continue;
                     
-                    if (!hasCompanyEntity && !isTotalRow) {
+                    // Skip headers, totals, notes, and balance sheet items
+                    if (/^(total|subtotal|net|balance|notes|schedule|see accompanying|fair value|cost|principal|company|investment type)/i.test(firstCell)) continue;
+                    
+                    const lowerFirstCell = firstCell.toLowerCase();
+                    const isNonPortfolioItem = NON_PORTFOLIO_ITEMS.some(item => lowerFirstCell.includes(item));
+                    if (isNonPortfolioItem) continue;
+                    
+                    const companyName = cleanCompanyName(firstCell);
+                    if (!companyName || companyName.length < 5) continue;
+                    
+                    // Extract values: last 2+ are typically Cost and Fair Value
+                    let parAmount: number | null = null;
+                    let cost: number | null = null;
+                    let fairValue: number | null = null;
+                    
+                    if (numericCells.length >= 3) {
+                      parAmount = numericCells[numericCells.length - 3].value;
+                      cost = numericCells[numericCells.length - 2].value;
+                      fairValue = numericCells[numericCells.length - 1].value;
+                    } else {
+                      cost = numericCells[numericCells.length - 2].value;
+                      fairValue = numericCells[numericCells.length - 1].value;
+                    }
+                    
+                    if (fairValue === null || fairValue === 0) continue;
+                    
+                    // Less strict validation for chunked parsing - allow more companies
+                    // Just ensure it's not a skip keyword and has reasonable length
+                    const lowerName = companyName.toLowerCase();
+                    const isSkipWord = SKIP_KEYWORDS.some(kw => lowerName.includes(kw));
+                    if (isSkipWord) continue;
+                    
+                    // Must have at least 2 words or end with company suffix
+                    const wordCount = companyName.split(/\s+/).filter(w => w.length > 0).length;
+                    const hasEntitySuffix = hasCompanySuffix(companyName);
+                    if (wordCount < 2 && !hasEntitySuffix) continue;
+                    
+                    // Get investment type from second text cell if available
+                    let investmentType: string | null = null;
+                    if (textCells.length > 1) {
+                      const potentialType = textCells[1]?.toLowerCase() || '';
+                      if (INVESTMENT_TYPE_LABELS.some(t => potentialType.includes(t))) {
+                        investmentType = textCells[1];
+                      }
+                    }
+                    
+                    const holding: Holding = {
+                      company_name: companyName,
+                      investment_type: investmentType,
+                      industry: activeIndustry || industryRegistry.getActiveIndustry(),
+                      fair_value: fairValue,
+                      cost: cost,
+                      par_amount: parAmount,
+                    };
+                    
+                    const key = `${holding.company_name}|${holding.investment_type || ''}|${holding.fair_value || ''}`;
+                    if (!seenKeys.has(key)) {
+                      seenKeys.add(key);
+                      allHoldings.push(holding);
+                      industryRegistry.registerCompany(companyName, holding.industry || null);
+                      
+                      // Debug logging for first few holdings
+                      if (allHoldings.length <= 5) {
+                        console.log(`   ✅ Holding: "${companyName.substring(0, 40)}" FV=$${fairValue} Industry="${holding.industry}"`);
+                      }
+                    }
+                    
+                  } else if (numericCells.length === 0 && textCells.length > 0) {
+                    // INDUSTRY HEADER: Text only, no numbers
+                    const firstCell = textCells[0];
+                    if (!firstCell || firstCell.length < 3 || firstCell.length > 100) continue;
+                    
+                    // Check if only first cell has text (characteristic of industry headers)
+                    const nonEmptyCount = textCells.filter(t => t.length > 0).length;
+                    if (nonEmptyCount !== 1) continue;
+                    
+                    // Skip non-industry items (notes, balance sheet categories, etc.)
+                    const lowerFirstCell = firstCell.toLowerCase();
+                    const isNonIndustry = NON_PORTFOLIO_ITEMS.some(item => lowerFirstCell.includes(item)) ||
+                                          /^(note|see |the |as of|for the|during|page \d)/i.test(firstCell);
+                    if (isNonIndustry) continue;
+                    
+                    // Not a company (no suffix) and not a skip keyword
+                    const hasEntity = hasCompanySuffix(firstCell);
+                    const isSkip = SKIP_KEYWORDS.some(kw => lowerFirstCell.includes(kw));
+                    const isInvestType = isInvestmentTypeLabel(firstCell);
+                    
+                    // Must look like a known industry category or be in the ARCC list
+                    const looksLikeIndustry = isExactIndustryCategory(firstCell) || 
+                                              isIndustrySectionHeader(firstCell);
+                    
+                    if (!hasEntity && !isSkip && !isInvestType && looksLikeIndustry) {
                       activeIndustry = normalizeIndustryName(firstCell);
                       industryRegistry.setActiveIndustry(activeIndustry);
-                      continue;
+                      if (industryRegistry.getStats().industries <= 10) {
+                        console.log(`   📂 Industry: "${activeIndustry}"`);
+                      }
                     }
-                  }
-                  
-                  // Try to extract holding
-                  const companyName = cleanCompanyName(firstCell);
-                  if (!companyName || companyName.length < 5) continue;
-                  if (/^(total|subtotal|net|balance|notes|schedule|see accompanying)/i.test(companyName)) continue;
-                  
-                  // Find numeric values
-                  const numericCells: { value: number; index: number }[] = [];
-                  for (let i = cells.length - 1; i >= 1; i--) {
-                    const val = parseNumeric(cells[i]);
-                    if (val !== null) {
-                      numericCells.push({ value: val, index: i });
-                      if (numericCells.length >= 4) break;
-                    }
-                  }
-                  
-                  if (numericCells.length === 0) continue;
-                  numericCells.reverse();
-                  
-                  let parAmount: number | null = null;
-                  let cost: number | null = null;
-                  let fairValue: number | null = null;
-                  
-                  if (numericCells.length >= 3) {
-                    parAmount = numericCells[0].value;
-                    cost = numericCells[numericCells.length - 2].value;
-                    fairValue = numericCells[numericCells.length - 1].value;
-                  } else if (numericCells.length === 2) {
-                    cost = numericCells[0].value;
-                    fairValue = numericCells[1].value;
-                  } else {
-                    fairValue = numericCells[0].value;
-                  }
-                  
-                  if (fairValue === null || fairValue === 0) continue;
-                  
-                  let investmentType: string | null = null;
-                  if (cells.length > 1) {
-                    const potentialType = cells[1]?.toLowerCase() || '';
-                    if (INVESTMENT_TYPE_LABELS.some(t => potentialType.includes(t))) {
-                      investmentType = cells[1];
-                    }
-                  }
-                  
-                  const validation = isRealHolding(companyName, fairValue, cost, investmentType, parAmount);
-                  if (!validation.valid) continue;
-                  
-                  const holding: Holding = {
-                    company_name: companyName,
-                    investment_type: investmentType,
-                    industry: activeIndustry || industryRegistry.getActiveIndustry(),
-                    fair_value: fairValue,
-                    cost: cost,
-                    par_amount: parAmount,
-                  };
-                  
-                  const key = `${holding.company_name}|${holding.investment_type || ''}|${holding.fair_value || ''}`;
-                  if (!seenKeys.has(key)) {
-                    seenKeys.add(key);
-                    allHoldings.push(holding);
-                    industryRegistry.registerCompany(companyName, holding.industry || null);
                   }
                 }
               } catch (chunkError) {
