@@ -2200,6 +2200,12 @@ serve(async (req) => {
                     rawCellsHtml.push(rawHtml);
                     const cellText = rawHtml
                       .replace(nbspRegex, ' ')
+                      .replace(/&#160;/g, ' ')    // Non-breaking space entity
+                      .replace(/&#8212;/g, '—')    // Em-dash entity
+                      .replace(/&#8211;/g, '–')    // En-dash entity
+                      .replace(/&#38;/g, '&')      // Ampersand entity
+                      .replace(/&mdash;/g, '—')
+                      .replace(/&ndash;/g, '–')
                       .replace(tagRemoveRegex, '')
                       .replace(/\s+/g, ' ')
                       .trim();
@@ -2328,7 +2334,17 @@ serve(async (req) => {
                     }
                     
                     // Skip headers, notes, and balance sheet items
+                    // Also skip table header concatenations like "Amortized Cost Fair Value..."
                     if (/^(net|balance|notes|schedule|see accompanying|fair value|cost|principal|company|investment type)/i.test(firstCell)) {
+                      pendingTextBuffer = null;
+                      continue;
+                    }
+                    
+                    // Skip entries that look like concatenated table headers
+                    if (lowerFirstCell.includes('fair value') || 
+                        lowerFirstCell.includes('amortized cost') ||
+                        lowerFirstCell.includes('par amount') ||
+                        /^[\s—–-]*$/.test(firstCell)) {
                       pendingTextBuffer = null;
                       continue;
                     }
