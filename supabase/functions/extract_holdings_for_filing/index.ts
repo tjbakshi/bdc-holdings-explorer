@@ -1641,14 +1641,26 @@ serve(async (req) => {
               }
             }
             
-            // Use the earlier of: prior period start, document end, or "Total Investments" + buffer
-            const totalInvestmentsIdx = lower.indexOf('total investments', bestStart);
+            // Find the LAST "Total Investments" BEFORE the prior period marker
+            // This is the actual end of the current quarter's SOI
+            // (The first "Total Investments" might be a subtotal within the SOI)
+            let lastTotalInvestmentsIdx = -1;
+            let searchPos = bestStart;
+            while (true) {
+              const idx = lower.indexOf('total investments', searchPos);
+              if (idx === -1 || idx >= priorPeriodStart) break;
+              lastTotalInvestmentsIdx = idx;
+              searchPos = idx + 20;
+            }
+            
             let currentQuarterEnd = priorPeriodStart;
             
-            if (totalInvestmentsIdx !== -1 && totalInvestmentsIdx < priorPeriodStart) {
+            if (lastTotalInvestmentsIdx !== -1) {
               // Include some buffer after "Total Investments" to capture the totals row
-              currentQuarterEnd = Math.min(priorPeriodStart, totalInvestmentsIdx + 10_000);
-              console.log(`   📍 Found "Total Investments" at ${totalInvestmentsIdx}, setting end to ${currentQuarterEnd}`);
+              currentQuarterEnd = Math.min(priorPeriodStart, lastTotalInvestmentsIdx + 10_000);
+              console.log(`   📍 Found LAST "Total Investments" at ${lastTotalInvestmentsIdx}, setting end to ${currentQuarterEnd}`);
+            } else {
+              console.log(`   📍 No "Total Investments" found before prior period, using prior period start`);
             }
             
             // Final SOI boundaries
