@@ -106,6 +106,7 @@ export type Database = {
           maturity_date: string | null
           par_amount: number | null
           reference_rate: string | null
+          row_number: number | null
         }
         Insert: {
           company_name: string
@@ -121,6 +122,7 @@ export type Database = {
           maturity_date?: string | null
           par_amount?: number | null
           reference_rate?: string | null
+          row_number?: number | null
         }
         Update: {
           company_name?: string
@@ -136,6 +138,7 @@ export type Database = {
           maturity_date?: string | null
           par_amount?: number | null
           reference_rate?: string | null
+          row_number?: number | null
         }
         Relationships: [
           {
