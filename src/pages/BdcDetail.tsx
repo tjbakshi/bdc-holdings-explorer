@@ -232,6 +232,7 @@ const BdcDetail = () => {
   const handleResetFiling = async (filingId: string) => {
     setIsResetting(filingId);
     try {
+      // Step 1: Reset the filing (delete holdings and reset status)
       const { data, error } = await supabase.functions.invoke("manage-data", {
         body: { action: "reset_filing", filingId },
       });
@@ -241,8 +242,26 @@ const BdcDetail = () => {
 
       toast({
         title: "Filing Reset",
-        description: data.message,
+        description: "Holdings deleted. Now re-extracting data...",
       });
+
+      // Step 2: Re-extract holdings for the filing
+      const { data: extractData, error: extractError } = await supabase.functions.invoke("extract_holdings_for_filing", {
+        body: { filing_id: filingId },
+      });
+
+      if (extractError) {
+        console.error("Extract error:", extractError);
+        toast({
+          title: "Extraction Started",
+          description: "Reset complete. Extraction may still be processing in the background.",
+        });
+      } else {
+        toast({
+          title: "Filing Re-Parsed",
+          description: extractData?.message || "Holdings have been re-extracted successfully.",
+        });
+      }
 
       // Invalidate queries to refresh the UI
       queryClient.invalidateQueries({ queryKey: ["filings", bdcId] });
