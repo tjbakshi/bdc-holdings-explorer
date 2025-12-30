@@ -1585,59 +1585,66 @@ serve(async (req) => {
             // We only want the CURRENT quarter, not the prior period
             
             // Look for prior period markers that indicate the start of comparison SOI
+            // Common patterns for prior period in Q3/10-Q filings
             const priorPeriodMarkers = [
               'december 31, 2024',
-              'december 31,2024',
+              'december 31,2024', 
+              'december&#160;31, 2024', // HTML encoded space
+              'december&nbsp;31, 2024',
               'as of december 31, 2024',
               'at december 31, 2024',
               '12/31/2024',
               '12/31/24',
-              // Also check for any "prior" or "comparison" language
-              'consolidated schedule of investments</b><br>(prior',
-              'schedule of investments (prior',
-              // For filings from other periods, check generic prior year markers
+              // Patterns with schedule of investments + date together
+              'schedule of investments</b><br/>december 31',
+              'schedule of investments</b><br>december 31',
+              'schedule of investments (december 31',
+              'schedule of investments<br/>december 31',
+              // Generic prior markers
               'december 31, 2023',
               'december 31, 2022',
             ];
             
             // Find where prior period SOI starts (after our main SOI start)
             let priorPeriodStart = documentEnd;
-            const searchStartOffset = bestStart + 50_000; // Skip at least 50KB from start
+            const searchStartOffset = bestStart + 100_000; // Skip at least 100KB from start (the current quarter header area)
             
             for (const marker of priorPeriodMarkers) {
               const markerIdx = lower.indexOf(marker, searchStartOffset);
               if (markerIdx !== -1 && markerIdx < priorPeriodStart) {
-                // Verify this is actually in a "Schedule of Investments" context
-                // Look back up to 5KB for SOI header
-                const contextBefore = lower.slice(Math.max(0, markerIdx - 5000), markerIdx);
-                if (contextBefore.includes('schedule of investments') || 
-                    contextBefore.includes('consolidated schedule')) {
+                // This marker could be the prior period SOI - verify it looks like an SOI section
+                // Check for table structure nearby (within 20KB after)
+                const nearbyAfter = lower.slice(markerIdx, Math.min(markerIdx + 20_000, html.length));
+                if (nearbyAfter.includes('<table') || nearbyAfter.includes('portfolio company') || nearbyAfter.includes('fair value')) {
                   priorPeriodStart = markerIdx;
                   console.log(`   📍 Found PRIOR PERIOD marker "${marker}" at position ${markerIdx}`);
+                  break; // Use the first valid one found
                 }
               }
             }
             
-            // Also look for a SECOND "Schedule of Investments" header that might indicate comparison
-            // Skip the first occurrence and look for the next complete header
-            const secondSoiPatterns = [
-              'consolidated schedule of investments',
-              '<b>schedule of investments',
-              '>schedule of investments<',
-            ];
-            
-            for (const pattern of secondSoiPatterns) {
-              // Start looking after the first 100KB of SOI section
-              const searchStart = bestStart + 100_000;
-              const patternIdx = lower.indexOf(pattern, searchStart);
-              
-              if (patternIdx !== -1 && patternIdx < priorPeriodStart) {
-                // Check if this is followed by a date that looks like prior period
-                const nearbyText = lower.slice(patternIdx, Math.min(patternIdx + 1000, html.length));
-                if (nearbyText.includes('december 31') || nearbyText.includes('12/31')) {
-                  priorPeriodStart = patternIdx;
-                  console.log(`   📍 Found SECOND SOI header at position ${patternIdx} (prior period)`);
+            // If no prior period found by markers, look for a second "Schedule of Investments" header
+            if (priorPeriodStart === documentEnd) {
+              // Count SOI occurrences to find the second one (which would be the prior period)
+              let soiCount = 0;
+              let searchFrom = bestStart;
+              while (soiCount < 5) {
+                const soiIdx = lower.indexOf('schedule of investments', searchFrom);
+                if (soiIdx === -1) break;
+                soiCount++;
+                
+                // Skip the first 2 occurrences (could be title + current quarter header)
+                // The 3rd occurrence is likely the prior period
+                if (soiCount === 3 && soiIdx > bestStart + 500_000) {
+                  // Check if this has a December date nearby
+                  const nearbyText = lower.slice(soiIdx, Math.min(soiIdx + 5000, html.length));
+                  if (nearbyText.includes('december') || nearbyText.includes('12/31')) {
+                    priorPeriodStart = soiIdx;
+                    console.log(`   📍 Found 3rd SOI header at position ${soiIdx} (likely prior period)`);
+                    break;
+                  }
                 }
+                searchFrom = soiIdx + 30;
               }
             }
             
