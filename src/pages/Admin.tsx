@@ -24,7 +24,7 @@ export default function Admin() {
   const [loading, setLoading] = useState<string | null>(null);
   const [logs, setLogs] = useState<IngestLog[]>([]);
   const [parsingFilingIds, setParsingFilingIds] = useState<Set<string>>(new Set());
-  const [backfillCik, setBackfillCik] = useState<string>("");
+  const [backfillBdcId, setBackfillBdcId] = useState<string>("");
 
   const { data: bdcs } = useQuery({
     queryKey: ["bdcs-admin"],
@@ -309,16 +309,10 @@ export default function Admin() {
     }
   };
 
-  const handleBackfillSec = async () => {
-    if (!backfillCik.trim()) {
-      toast({ title: "Error", description: "Please enter a CIK", variant: "destructive" });
-      return;
-    }
-
-    setLoading("backfill");
+  const handleBackfillSec = async (cik: string, bdcName: string) => {
     try {
       const { data, error } = await supabase.functions.invoke("sec-ingest", {
-        body: { cik: backfillCik.trim() },
+        body: { cik },
       });
 
       if (error) throw error;
@@ -333,17 +327,77 @@ export default function Admin() {
         data.cik
       );
 
-      toast({
-        title: "Success",
-        description: `Ingested ${data.filingsInserted} new filings for ${data.companyName}`,
-      });
-
-      setBackfillCik("");
-      refetchFilings();
+      return { success: true, filingsInserted: data.filingsInserted, companyName: data.companyName };
     } catch (error: unknown) {
       const errorMsg = error instanceof Error ? error.message : "Unknown error";
-      toast({ title: "Error", description: errorMsg, variant: "destructive" });
-      addLog("sec-ingest", `Error: ${errorMsg}`, backfillCik);
+      addLog("sec-ingest", `Error for ${bdcName}: ${errorMsg}`, cik);
+      return { success: false, error: errorMsg };
+    }
+  };
+
+  const handleBackfillSingle = async () => {
+    if (!backfillBdcId) {
+      toast({ title: "Error", description: "Please select a BDC", variant: "destructive" });
+      return;
+    }
+
+    const bdc = bdcs?.find((b) => b.id === backfillBdcId);
+    if (!bdc) return;
+
+    setLoading("backfill");
+    try {
+      const result = await handleBackfillSec(bdc.cik, bdc.bdc_name);
+      
+      if (result.success) {
+        toast({
+          title: "Success",
+          description: `Ingested ${result.filingsInserted} new filings for ${result.companyName}`,
+        });
+      } else {
+        toast({ title: "Error", description: result.error, variant: "destructive" });
+      }
+
+      setBackfillBdcId("");
+      refetchFilings();
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const handleBackfillAll = async () => {
+    if (!bdcs || bdcs.length === 0) {
+      toast({ title: "Error", description: "No BDCs available", variant: "destructive" });
+      return;
+    }
+
+    setLoading("backfill-all");
+    let totalFilings = 0;
+    let successCount = 0;
+    let errorCount = 0;
+
+    try {
+      for (const bdc of bdcs) {
+        const result = await handleBackfillSec(bdc.cik, bdc.bdc_name);
+        
+        if (result.success) {
+          totalFilings += result.filingsInserted || 0;
+          successCount++;
+        } else {
+          errorCount++;
+        }
+      }
+
+      addLog(
+        "sec-ingest",
+        `Backfill all complete: ${successCount} BDCs processed, ${totalFilings} filings inserted, ${errorCount} errors`
+      );
+
+      toast({
+        title: "Complete",
+        description: `Processed ${successCount} BDCs, inserted ${totalFilings} filings${errorCount > 0 ? `, ${errorCount} errors` : ""}`,
+      });
+
+      refetchFilings();
     } finally {
       setLoading(null);
     }
@@ -370,31 +424,52 @@ export default function Admin() {
               Backfill SEC Filings
             </CardTitle>
             <CardDescription>
-              Enter a CIK to fetch all 10-K/10-Q filings from SEC
+              Fetch all 10-K/10-Q filings from SEC for a BDC
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            <Input
-              type="text"
-              placeholder="e.g. 0001287750"
-              value={backfillCik}
-              onChange={(e) => setBackfillCik(e.target.value)}
-              disabled={loading === "backfill"}
-            />
-            <Button
-              onClick={handleBackfillSec}
-              disabled={!backfillCik.trim() || loading === "backfill"}
-              className="w-full"
-            >
-              {loading === "backfill" ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Fetching...
-                </>
-              ) : (
-                "Backfill SEC Filings"
-              )}
-            </Button>
+            <Select value={backfillBdcId} onValueChange={setBackfillBdcId} disabled={loading === "backfill" || loading === "backfill-all"}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select a BDC" />
+              </SelectTrigger>
+              <SelectContent>
+                {bdcs?.map((bdc) => (
+                  <SelectItem key={bdc.id} value={bdc.id}>
+                    {bdc.bdc_name} ({bdc.ticker || bdc.cik})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <div className="flex gap-2">
+              <Button
+                onClick={handleBackfillSingle}
+                disabled={!backfillBdcId || loading === "backfill" || loading === "backfill-all"}
+                className="flex-1"
+              >
+                {loading === "backfill" ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Fetching...
+                  </>
+                ) : (
+                  "Backfill"
+                )}
+              </Button>
+              <Button
+                onClick={handleBackfillAll}
+                disabled={loading === "backfill" || loading === "backfill-all"}
+                variant="secondary"
+              >
+                {loading === "backfill-all" ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    All...
+                  </>
+                ) : (
+                  "Backfill All"
+                )}
+              </Button>
+            </div>
           </CardContent>
         </Card>
 
