@@ -5,10 +5,17 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-// Zero-pad CIK to 10 digits
+// Zero-pad CIK to 10 digits (for SEC API)
 function padCik(cik: string): string {
   const cleaned = cik.replace(/\D/g, "");
   return cleaned.padStart(10, "0");
+}
+
+// Normalize CIK by stripping leading zeros (for database)
+function normalizeCik(cik: string): string {
+  const cleaned = cik.replace(/\D/g, "");
+  const stripped = cleaned.replace(/^0+/, "");
+  return stripped || "0";
 }
 
 // Fetch with retry on 429
@@ -68,24 +75,26 @@ Deno.serve(async (req) => {
     }
 
     const paddedCik = padCik(cik);
-    console.log(`Starting SEC ingest for CIK: ${paddedCik}`);
+    const normalizedCik = normalizeCik(cik);
+    console.log(`Starting SEC ingest for CIK: ${paddedCik} (normalized: ${normalizedCik})`);
 
-    // Create ingestion run record
+    // Create ingestion run record (uses normalized CIK)
     const { data: runData, error: runError } = await supabase
       .from("ingestion_runs")
-      .insert({ cik: paddedCik, status: "running" })
+      .insert({ cik: normalizedCik, status: "running" })
       .select("id")
       .single();
 
     if (runError) {
       console.error("Failed to create ingestion run:", runError);
-      throw new Error("Failed to create ingestion run record");
+      throw new Error(`Failed to create ingestion run record: ${runError.message}`);
     }
     runId = runData.id;
+    console.log(`Created ingestion run: ${runId}`);
 
-    // Fetch SEC submissions data
+    // Fetch SEC submissions data (uses padded CIK for SEC API)
     const secUrl = `https://data.sec.gov/submissions/CIK${paddedCik}.json`;
-    console.log(`Fetching: ${secUrl}`);
+    console.log(`Fetching SEC data: ${secUrl}`);
 
     const secResponse = await fetchWithRetry(secUrl, {
       headers: {
@@ -102,23 +111,29 @@ Deno.serve(async (req) => {
     const companyName = secData.name || `CIK ${paddedCik}`;
     console.log(`Company: ${companyName}`);
 
-    // Ensure BDC exists (upsert by CIK)
-    const { data: existingBdc } = await supabase
+    // Ensure BDC exists (uses normalized CIK for database)
+    console.log(`Looking up BDC with normalized CIK: ${normalizedCik}`);
+    const { data: existingBdc, error: lookupError } = await supabase
       .from("bdcs")
       .select("id")
-      .eq("cik", paddedCik)
+      .eq("cik", normalizedCik)
       .maybeSingle();
+
+    if (lookupError) {
+      console.error("BDC lookup error:", lookupError);
+    }
 
     let bdcId: string;
     if (existingBdc) {
       bdcId = existingBdc.id;
       console.log(`Found existing BDC: ${bdcId}`);
     } else {
-      // Create new BDC record
+      // Create new BDC record (CIK will be normalized by trigger)
+      console.log(`Creating new BDC with CIK: ${normalizedCik}`);
       const { data: newBdc, error: bdcError } = await supabase
         .from("bdcs")
         .insert({
-          cik: paddedCik,
+          cik: normalizedCik,
           bdc_name: companyName,
           ticker: secData.tickers?.[0] || null,
           fiscal_year_end_month: 12,
@@ -128,6 +143,7 @@ Deno.serve(async (req) => {
         .single();
 
       if (bdcError) {
+        console.error("BDC insert error:", bdcError);
         throw new Error(`Failed to create BDC: ${bdcError.message}`);
       }
       bdcId = newBdc.id;
@@ -207,7 +223,7 @@ Deno.serve(async (req) => {
     return new Response(
       JSON.stringify({
         success: true,
-        cik: paddedCik,
+        cik: normalizedCik,
         companyName,
         bdcId,
         filingsFound: filings.length,
