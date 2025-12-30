@@ -107,6 +107,7 @@ export type Database = {
           par_amount: number | null
           reference_rate: string | null
           row_number: number | null
+          source_pos: number | null
         }
         Insert: {
           company_name: string
@@ -123,6 +124,7 @@ export type Database = {
           par_amount?: number | null
           reference_rate?: string | null
           row_number?: number | null
+          source_pos?: number | null
         }
         Update: {
           company_name?: string
@@ -139,6 +141,7 @@ export type Database = {
           par_amount?: number | null
           reference_rate?: string | null
           row_number?: number | null
+          source_pos?: number | null
         }
         Relationships: [
           {

@@ -20,6 +20,7 @@ interface Holding {
   par_amount?: number | null;
   cost?: number | null;
   fair_value?: number | null;
+  source_pos?: number; // Approximate character position in original HTML
 }
 
 interface ScaleDetectionResult {
@@ -1805,6 +1806,8 @@ serve(async (req) => {
                         cost: h.cost != null ? Math.round((h.cost * scale) * 10) / 10 : null,
                         fair_value: h.fair_value != null ? Math.round((h.fair_value * scale) * 10) / 10 : null,
                         row_number: nextRowNumber + idx,
+                        // Track approximate HTML position for ordering
+                        source_pos: currentPosition + idx,
                       }));
                       
                       const { error: insertError } = await supabaseClient
