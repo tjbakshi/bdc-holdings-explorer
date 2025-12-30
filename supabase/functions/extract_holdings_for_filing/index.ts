@@ -832,10 +832,36 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     
     for (let i = headerRowIndex + 1; i < rowsToProcess; i++) {
       const row = rows[i] as Element;
-      const cellNodes = Array.from(row.querySelectorAll("td"));
-      const cells = cellNodes.map(c => c as Element);
+      // Check for both td and th cells (industry headers may use th)
+      const tdCells = Array.from(row.querySelectorAll("td"));
+      const thCells = Array.from(row.querySelectorAll("th"));
+      const allCellNodes = tdCells.length > 0 ? tdCells : thCells;
+      const cells = allCellNodes.map(c => c as Element);
       
       if (cells.length === 0) continue;
+      
+      // Get the first cell text (could be in first td or th)
+      const firstCellText = cells[0]?.textContent?.trim() || "";
+      
+      // Check if this is an industry section header FIRST (before company parsing)
+      // Industry headers often have: only one cell, or first cell with colspan, or matching industry names
+      if (firstCellText && firstCellText.length >= 3) {
+        // Check if it's an exact ARCC industry category
+        if (isExactIndustryCategory(firstCellText)) {
+          currentIndustry = normalizeIndustryName(firstCellText);
+          currentCompany = null;
+          console.log(`📂 Industry section (exact match): ${currentIndustry}`);
+          continue;
+        }
+        
+        // Check using structural analysis
+        if (isRowAnIndustrySectionHeader(cells, firstCellText, expectedCellCount)) {
+          currentIndustry = normalizeIndustryName(firstCellText);
+          currentCompany = null;
+          console.log(`📂 Industry section (structural): ${currentIndustry}`);
+          continue;
+        }
+      }
       
       const companyCell = getCellAtPosition(cells, colIndices.company);
       const companyCellText = companyCell?.textContent?.trim() || "";
@@ -846,17 +872,6 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       // Get the industry/business description cell (may also serve as industry indicator)
       const industryCell = colIndices.industry >= 0 ? getCellAtPosition(cells, colIndices.industry) : null;
       const industryCellText = industryCell?.textContent?.trim() || "";
-      
-      // Check if this row is an industry section header (using enhanced detection)
-      if (companyCellText && isRowAnIndustrySectionHeader(cells, companyCellText, expectedCellCount)) {
-        // This row is an industry section header - update current industry with normalization
-        currentIndustry = normalizeIndustryName(companyCellText);
-        currentCompany = null; // Reset company when entering new industry section
-        if (debugMode) {
-          console.log(`📂 Industry section: ${currentIndustry}`);
-        }
-        continue;
-      }
       
       // Check if the first cell has a company name (new company) or is empty (continuation of previous)
       let effectiveCompanyName: string;
