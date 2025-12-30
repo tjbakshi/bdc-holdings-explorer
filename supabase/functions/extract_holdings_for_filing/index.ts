@@ -842,6 +842,15 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       return null;
     };
     
+    // Helper to calculate cell position accounting for colspan
+    const getCellPosition = (cells: Element[], cellIndex: number): number => {
+      let pos = 0;
+      for (let i = 0; i < cellIndex && i < cells.length; i++) {
+        pos += parseInt(cells[i].getAttribute("colspan") || "1", 10);
+      }
+      return pos;
+    };
+    
     // Helper to find cell by searching for numeric value near expected position
     const findValueCell = (cells: Element[], expectedPos: number, searchLabel?: string): Element | null => {
       // First try exact position
@@ -856,13 +865,28 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       if (searchLabel === 'fairValue' || searchLabel === 'cost' || searchLabel === 'par') {
         for (let i = cells.length - 1; i >= Math.max(0, cells.length - 5); i--) {
           const cell = cells[i];
+          
+          // CRITICAL: Skip the shares/units column - contains share counts, not dollar values
+          // This prevents 37,020 (share count) from being picked as fair value
+          if (colIndices.sharesUnits >= 0) {
+            const cellPos = getCellPosition(cells, i);
+            if (cellPos === colIndices.sharesUnits) {
+              continue;
+            }
+          }
+          
           const value = parseNumeric(cell.textContent?.trim());
           if (value !== null && value > 0) {
-            // For fairValue, check if this is the last numeric cell
+            // For fairValue, check if this is the last numeric cell (excluding shares/units)
             if (searchLabel === 'fairValue') {
-              // Verify no more numeric cells after this
+              // Verify no more numeric cells after this (excluding shares/units column)
               let isLast = true;
               for (let j = i + 1; j < cells.length; j++) {
+                // Skip shares/units column when checking
+                if (colIndices.sharesUnits >= 0) {
+                  const jPos = getCellPosition(cells, j);
+                  if (jPos === colIndices.sharesUnits) continue;
+                }
                 if (parseNumeric(cells[j].textContent?.trim()) !== null) {
                   isLast = false;
                   break;
@@ -870,9 +894,13 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
               }
               if (isLast) return cell;
             } else if (searchLabel === 'cost') {
-              // Cost is typically second to last numeric
+              // Cost is typically second to last numeric (excluding shares/units)
               let numericCount = 0;
               for (let j = i; j < cells.length; j++) {
+                if (colIndices.sharesUnits >= 0) {
+                  const jPos = getCellPosition(cells, j);
+                  if (jPos === colIndices.sharesUnits) continue;
+                }
                 if (parseNumeric(cells[j].textContent?.trim()) !== null) numericCount++;
               }
               if (numericCount === 2) return cell;
