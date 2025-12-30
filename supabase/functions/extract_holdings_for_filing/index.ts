@@ -1485,18 +1485,86 @@ function parseHtmlScheduleOfInvestments(
       // Get the first non-empty text cell as company/investment info
       const firstText = analysis.textCells.find(t => t.length > 0) || '';
       
+      // FIX #1: TOTAL FILTER - Skip rows containing Total/Subtotal/Sum/Aggregate
+      const lowerFirstText = firstText.toLowerCase();
+      if (/^(total|subtotal|sub-total|sum|aggregate)\b/i.test(firstText) || 
+          lowerFirstText.includes('total ') || lowerFirstText.includes('subtotal')) {
+        if (debugMode && dataRowCount <= 10) {
+          console.log(`⏭️ Skipping total row: "${firstText.substring(0, 50)}"`);
+        }
+        continue;
+      }
+      
       // Check if this looks like a company name (has company suffix)
       if (hasCompanySuffix(firstText)) {
         currentCompany = cleanCompanyName(firstText);
       }
       
-      // Determine investment type from text cells
+      // FIX #2: MIDDLE-SWEEP METADATA EXTRACTION
+      // Everything between Company Name (first text cell) and first numeric value contains metadata
+      const middleCells = analysis.textCells.slice(1); // Everything after the company name
+      const middleText = middleCells.join(' ');
+      
+      // Extract Interest Rate: patterns like 12.5% or 10%
+      let interestRate: string | null = null;
+      const rateMatch = middleText.match(/(\d+\.?\d*)\s*%/);
+      if (rateMatch) {
+        interestRate = rateMatch[0];
+      }
+      
+      // Extract Reference Rate: L (Libor), S (SOFR), P (Prime), or keywords
+      let referenceRate: string | null = null;
+      const refRatePatterns = [
+        { pattern: /\bSOFR\b/i, name: 'SOFR' },
+        { pattern: /\bLIBOR\b/i, name: 'LIBOR' },
+        { pattern: /\bPRIME\b/i, name: 'Prime' },
+        { pattern: /\bL\s*\+/i, name: 'LIBOR' },
+        { pattern: /\bS\s*\+/i, name: 'SOFR' },
+        { pattern: /\bP\s*\+/i, name: 'Prime' },
+      ];
+      for (const { pattern, name } of refRatePatterns) {
+        if (pattern.test(middleText)) {
+          referenceRate = name;
+          break;
+        }
+      }
+      
+      // Extract Maturity Date: MM/DD/YYYY or Month YYYY patterns
+      let maturityDate: string | null = null;
+      const datePatterns = [
+        /(\d{1,2})\/(\d{1,2})\/(\d{4})/, // MM/DD/YYYY
+        /(\d{1,2})\/(\d{4})/, // MM/YYYY
+        /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}/i,
+        /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}/i,
+      ];
+      for (const pattern of datePatterns) {
+        const dateMatch = middleText.match(pattern);
+        if (dateMatch) {
+          maturityDate = parseDate(dateMatch[0]);
+          break;
+        }
+      }
+      
+      // Determine investment type from middle cells (remaining text after rate/date extraction)
       let investmentType: string | null = null;
-      for (const text of analysis.textCells) {
+      for (const text of middleCells) {
         const lower = text.toLowerCase();
         if (INVESTMENT_TYPE_LABELS.some(label => lower.includes(label))) {
           investmentType = text;
           break;
+        }
+      }
+      // If no explicit investment type found, use any substantial middle cell text
+      if (!investmentType) {
+        for (const text of middleCells) {
+          // Skip if it's just a rate, date, or reference rate we already captured
+          if (text.length > 5 && !rateMatch?.[0]?.includes(text) && !/^\d{1,2}\//.test(text)) {
+            const hasLetters = /[a-zA-Z]{3,}/.test(text);
+            if (hasLetters) {
+              investmentType = text.trim();
+              break;
+            }
+          }
         }
       }
       
@@ -1534,15 +1602,15 @@ function parseHtmlScheduleOfInvestments(
         continue;
       }
       
-      // Create the holding
+      // Create the holding with extracted metadata
       const holding: Holding = {
         company_name: cleanCompanyName(companyName),
         investment_type: investmentType,
         industry: currentIndustry,
         description: null,
-        interest_rate: null,
-        reference_rate: null,
-        maturity_date: null,
+        interest_rate: interestRate,
+        reference_rate: referenceRate,
+        maturity_date: maturityDate,
         par_amount: parAmount,
         cost,
         fair_value: fairValue,
@@ -1554,31 +1622,48 @@ function parseHtmlScheduleOfInvestments(
       allHoldings.push(holding);
       
       if (debugMode && allHoldings.length <= 5) {
-        console.log(`✅ Holding: "${holding.company_name.substring(0, 40)}" FV=$${fairValue} Industry="${currentIndustry}"`);
+        console.log(`✅ Holding: "${holding.company_name.substring(0, 40)}" FV=$${fairValue} Rate=${interestRate} Industry="${currentIndustry}"`);
       }
       
-    } else if (analysis.textCells.length > 0 && analysis.numericValues.length === 0) {
-      // This might be an industry header (text only, no numbers)
-      const firstText = analysis.textCells.find(t => t.length > 0) || '';
+    } else if (analysis.numericValues.length === 0 && analysis.textCells.length > 0) {
+      // FIX #3: IMPROVED INDUSTRY DETECTION FOR ARCC
+      // If a row has exactly one non-empty text cell and ZERO numeric values,
+      // and it's not a skip keyword, set it as the activeIndustry
       
-      // Check if all other cells are empty (characteristic of industry headers)
-      const nonEmptyCount = analysis.textCells.filter(t => t.length > 0).length;
+      const nonEmptyTextCells = analysis.textCells.filter(t => t.trim().length > 0);
       
-      if (firstText.length >= 3 && firstText.length <= 100 && nonEmptyCount === 1) {
-        // Check if this looks like an industry (not a skip keyword, not a company)
-        const isSkip = SKIP_KEYWORDS.some(kw => firstText.toLowerCase().includes(kw));
-        const isCompany = hasCompanySuffix(firstText);
-        const isInvestmentType = isInvestmentTypeLabel(firstText);
+      if (nonEmptyTextCells.length === 1) {
+        const candidateIndustry = nonEmptyTextCells[0].trim();
         
-        if (!isSkip && !isCompany && !isInvestmentType) {
-          // Likely an industry header
-          currentIndustry = normalizeIndustryName(firstText);
-          industryRegistry.setActiveIndustry(firstText);
-          industryRowCount++;
-          currentCompany = null; // Reset company on new industry
+        // Must be reasonable length for an industry name
+        if (candidateIndustry.length >= 3 && candidateIndustry.length <= 100) {
+          const lowerCandidate = candidateIndustry.toLowerCase();
           
-          if (debugMode && industryRowCount <= 10) {
-            console.log(`📂 Industry: "${currentIndustry}"`);
+          // Check it's NOT a skip keyword
+          const isSkip = SKIP_KEYWORDS.some(kw => lowerCandidate.includes(kw));
+          
+          // Check it's NOT a company (no entity suffix)
+          const isCompany = hasCompanySuffix(candidateIndustry);
+          
+          // Check it's NOT an investment type label
+          const isInvestmentType = isInvestmentTypeLabel(candidateIndustry);
+          
+          // Check it's NOT a total/subtotal row
+          const isTotalRow = /^(total|subtotal|sub-total|sum|aggregate)\b/i.test(candidateIndustry);
+          
+          // Check it's NOT a header or note
+          const isHeaderOrNote = /^(note|see |the |as of|for the|during|page \d|schedule of|consolidated)/i.test(candidateIndustry);
+          
+          if (!isSkip && !isCompany && !isInvestmentType && !isTotalRow && !isHeaderOrNote) {
+            // This is likely an industry header - SET IT and let it STICK
+            currentIndustry = normalizeIndustryName(candidateIndustry);
+            industryRegistry.setActiveIndustry(candidateIndustry);
+            industryRowCount++;
+            currentCompany = null; // Reset company on new industry
+            
+            if (debugMode && industryRowCount <= 10) {
+              console.log(`📂 Industry detected: "${currentIndustry}"`);
+            }
           }
         }
       }
@@ -2110,15 +2195,75 @@ serve(async (req) => {
                     const firstCell = textCells[0] || '';
                     if (!firstCell || firstCell.length < 3) continue;
                     
-                    // Skip headers, totals, notes, and balance sheet items
-                    if (/^(total|subtotal|net|balance|notes|schedule|see accompanying|fair value|cost|principal|company|investment type)/i.test(firstCell)) continue;
-                    
+                    // FIX #1: TOTAL FILTER - Skip rows containing Total/Subtotal/Sum/Aggregate
                     const lowerFirstCell = firstCell.toLowerCase();
+                    if (/^(total|subtotal|sub-total|sum|aggregate)\b/i.test(firstCell) || 
+                        lowerFirstCell.includes('total ') || lowerFirstCell.includes('subtotal')) {
+                      continue;
+                    }
+                    
+                    // Skip headers, notes, and balance sheet items
+                    if (/^(net|balance|notes|schedule|see accompanying|fair value|cost|principal|company|investment type)/i.test(firstCell)) continue;
+                    
                     const isNonPortfolioItem = NON_PORTFOLIO_ITEMS.some(item => lowerFirstCell.includes(item));
                     if (isNonPortfolioItem) continue;
                     
                     const companyName = cleanCompanyName(firstCell);
                     if (!companyName || companyName.length < 5) continue;
+                    
+                    // FIX #2: MIDDLE-SWEEP METADATA EXTRACTION
+                    const middleCells = textCells.slice(1);
+                    const middleText = middleCells.join(' ');
+                    
+                    // Extract Interest Rate
+                    let interestRate: string | null = null;
+                    const rateMatch = middleText.match(/(\d+\.?\d*)\s*%/);
+                    if (rateMatch) {
+                      interestRate = rateMatch[0];
+                    }
+                    
+                    // Extract Reference Rate
+                    let referenceRate: string | null = null;
+                    const refPatterns = [
+                      { pattern: /\bSOFR\b/i, name: 'SOFR' },
+                      { pattern: /\bLIBOR\b/i, name: 'LIBOR' },
+                      { pattern: /\bPRIME\b/i, name: 'Prime' },
+                      { pattern: /\bL\s*\+/i, name: 'LIBOR' },
+                      { pattern: /\bS\s*\+/i, name: 'SOFR' },
+                      { pattern: /\bP\s*\+/i, name: 'Prime' },
+                    ];
+                    for (const { pattern, name } of refPatterns) {
+                      if (pattern.test(middleText)) {
+                        referenceRate = name;
+                        break;
+                      }
+                    }
+                    
+                    // Extract Maturity Date
+                    let maturityDate: string | null = null;
+                    const datePats = [
+                      /(\d{1,2})\/(\d{1,2})\/(\d{4})/,
+                      /(\d{1,2})\/(\d{4})/,
+                      /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}/i,
+                      /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}/i,
+                    ];
+                    for (const pat of datePats) {
+                      const dm = middleText.match(pat);
+                      if (dm) {
+                        maturityDate = parseDate(dm[0]);
+                        break;
+                      }
+                    }
+                    
+                    // Extract Investment Type
+                    let investmentType: string | null = null;
+                    for (const text of middleCells) {
+                      const lower = text.toLowerCase();
+                      if (INVESTMENT_TYPE_LABELS.some(t => lower.includes(t))) {
+                        investmentType = text;
+                        break;
+                      }
+                    }
                     
                     // Extract values: last 2+ are typically Cost and Fair Value
                     let parAmount: number | null = null;
@@ -2136,8 +2281,7 @@ serve(async (req) => {
                     
                     if (fairValue === null || fairValue === 0) continue;
                     
-                    // Less strict validation for chunked parsing - allow more companies
-                    // Just ensure it's not a skip keyword and has reasonable length
+                    // Validation - ensure it's not a skip keyword
                     const lowerName = companyName.toLowerCase();
                     const isSkipWord = SKIP_KEYWORDS.some(kw => lowerName.includes(kw));
                     if (isSkipWord) continue;
@@ -2147,19 +2291,13 @@ serve(async (req) => {
                     const hasEntitySuffix = hasCompanySuffix(companyName);
                     if (wordCount < 2 && !hasEntitySuffix) continue;
                     
-                    // Get investment type from second text cell if available
-                    let investmentType: string | null = null;
-                    if (textCells.length > 1) {
-                      const potentialType = textCells[1]?.toLowerCase() || '';
-                      if (INVESTMENT_TYPE_LABELS.some(t => potentialType.includes(t))) {
-                        investmentType = textCells[1];
-                      }
-                    }
-                    
                     const holding: Holding = {
                       company_name: companyName,
                       investment_type: investmentType,
                       industry: activeIndustry || industryRegistry.getActiveIndustry(),
+                      interest_rate: interestRate,
+                      reference_rate: referenceRate,
+                      maturity_date: maturityDate,
                       fair_value: fairValue,
                       cost: cost,
                       par_amount: parAmount,
@@ -2173,39 +2311,39 @@ serve(async (req) => {
                       
                       // Debug logging for first few holdings
                       if (allHoldings.length <= 5) {
-                        console.log(`   ✅ Holding: "${companyName.substring(0, 40)}" FV=$${fairValue} Industry="${holding.industry}"`);
+                        console.log(`   ✅ Holding: "${companyName.substring(0, 40)}" FV=$${fairValue} Rate=${interestRate} Industry="${holding.industry}"`);
                       }
                     }
                     
                   } else if (numericCells.length === 0 && textCells.length > 0) {
-                    // INDUSTRY HEADER: Text only, no numbers
-                    const firstCell = textCells[0];
-                    if (!firstCell || firstCell.length < 3 || firstCell.length > 100) continue;
+                    // FIX #3: IMPROVED INDUSTRY DETECTION
+                    // If a row has exactly one non-empty text cell and ZERO numeric values,
+                    // and it's not a skip keyword, set it as the activeIndustry
                     
-                    // Check if only first cell has text (characteristic of industry headers)
-                    const nonEmptyCount = textCells.filter(t => t.length > 0).length;
-                    if (nonEmptyCount !== 1) continue;
+                    const nonEmptyTextCells = textCells.filter(t => t.trim().length > 0);
                     
-                    // Skip non-industry items (notes, balance sheet categories, etc.)
-                    const lowerFirstCell = firstCell.toLowerCase();
-                    const isNonIndustry = NON_PORTFOLIO_ITEMS.some(item => lowerFirstCell.includes(item)) ||
-                                          /^(note|see |the |as of|for the|during|page \d)/i.test(firstCell);
-                    if (isNonIndustry) continue;
-                    
-                    // Not a company (no suffix) and not a skip keyword
-                    const hasEntity = hasCompanySuffix(firstCell);
-                    const isSkip = SKIP_KEYWORDS.some(kw => lowerFirstCell.includes(kw));
-                    const isInvestType = isInvestmentTypeLabel(firstCell);
-                    
-                    // Must look like a known industry category or be in the ARCC list
-                    const looksLikeIndustry = isExactIndustryCategory(firstCell) || 
-                                              isIndustrySectionHeader(firstCell);
-                    
-                    if (!hasEntity && !isSkip && !isInvestType && looksLikeIndustry) {
-                      activeIndustry = normalizeIndustryName(firstCell);
-                      industryRegistry.setActiveIndustry(activeIndustry);
-                      if (industryRegistry.getStats().industries <= 10) {
-                        console.log(`   📂 Industry: "${activeIndustry}"`);
+                    if (nonEmptyTextCells.length === 1) {
+                      const candidateIndustry = nonEmptyTextCells[0].trim();
+                      
+                      if (candidateIndustry.length >= 3 && candidateIndustry.length <= 100) {
+                        const lowerCandidate = candidateIndustry.toLowerCase();
+                        
+                        // Check NOT a skip keyword, company, investment type, total, or header
+                        const isSkip = SKIP_KEYWORDS.some(kw => lowerCandidate.includes(kw));
+                        const isCompany = hasCompanySuffix(candidateIndustry);
+                        const isInvestType = isInvestmentTypeLabel(candidateIndustry);
+                        const isTotalRow = /^(total|subtotal|sub-total|sum|aggregate)\b/i.test(candidateIndustry);
+                        const isHeaderOrNote = /^(note|see |the |as of|for the|during|page \d|schedule of|consolidated)/i.test(candidateIndustry);
+                        const isNonPortfolio = NON_PORTFOLIO_ITEMS.some(item => lowerCandidate.includes(item));
+                        
+                        if (!isSkip && !isCompany && !isInvestType && !isTotalRow && !isHeaderOrNote && !isNonPortfolio) {
+                          // This is likely an industry header - SET IT and let it STICK
+                          activeIndustry = normalizeIndustryName(candidateIndustry);
+                          industryRegistry.setActiveIndustry(candidateIndustry);
+                          if (industryRegistry.getStats().industries <= 15) {
+                            console.log(`   📂 Industry detected: "${activeIndustry}"`);
+                          }
+                        }
                       }
                     }
                   }
