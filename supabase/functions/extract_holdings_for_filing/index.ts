@@ -1679,18 +1679,34 @@ serve(async (req) => {
             
             // For very large SOI sections (like ARCC's $28.6B portfolio), use small-segment DOM parsing
             // This gives accurate data while staying within CPU limits
+            // Supports resuming from where a previous run timed out
             
             if (totalSoiSize > 4_000_000) {
               console.log(`   📦 Large SOI section (${(totalSoiSize / 1024 / 1024).toFixed(1)} MB), using small-segment DOM parsing...`);
               
-              // First delete any existing holdings for this filing to avoid duplicates
-              const { error: deleteError } = await supabaseClient
+              // Check if we're resuming an existing extraction or starting fresh
+              const { data: existingHoldings, error: checkError } = await supabaseClient
                 .from("holdings")
-                .delete()
-                .eq("filing_id", filingId);
+                .select("company_name, investment_type, fair_value")
+                .eq("filing_id", filingId)
+                .limit(1000);
               
-              if (deleteError) {
-                console.error(`   ⚠️ Error clearing existing holdings:`, deleteError);
+              const existingCount = existingHoldings?.length || 0;
+              const isResume = existingCount > 50; // More than 50 suggests a partial extraction
+              
+              if (!isResume) {
+                // Starting fresh - delete any existing holdings
+                const { error: deleteError } = await supabaseClient
+                  .from("holdings")
+                  .delete()
+                  .eq("filing_id", filingId);
+                
+                if (deleteError) {
+                  console.error(`   ⚠️ Error clearing existing holdings:`, deleteError);
+                }
+                console.log(`   📦 Starting fresh extraction`);
+              } else {
+                console.log(`   📦 RESUMING extraction (${existingCount} holdings already exist)`);
               }
               
               // Detect scale from the first part of the document
@@ -1698,23 +1714,32 @@ serve(async (req) => {
               console.log(`   📊 Scale detected: ${segmentScaleResult.detected}`);
               const scale = segmentScaleResult?.scale || 1;
               
-              // Use very small segments (200KB) to stay within CPU limits
-              const SEGMENT_SIZE = 200_000;
-              const OVERLAP_SIZE = 20_000;
-              
+              // Build set of existing holding keys for deduplication
               const seenHoldingKeys = new Set<string>();
+              if (isResume && existingHoldings) {
+                for (const h of existingHoldings) {
+                  const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
+                  seenHoldingKeys.add(key);
+                }
+              }
+              
+              // Use very small segments (150KB) to stay within CPU limits
+              const SEGMENT_SIZE = 150_000;
+              const OVERLAP_SIZE = 15_000;
+              
               let currentPosition = soiStart;
               let segmentCount = 0;
               let totalInserted = 0;
               let runningTotalValue = 0;
+              let skippedDuplicates = 0;
               
               while (currentPosition < soiEnd) {
                 segmentCount++;
                 const segmentEnd = Math.min(currentPosition + SEGMENT_SIZE, soiEnd);
                 
-                // Log every 10th segment
-                if (segmentCount % 10 === 1) {
-                  console.log(`   📦 Segment ${segmentCount}, position ${(currentPosition / 1024 / 1024).toFixed(1)}MB`);
+                // Log every 20th segment
+                if (segmentCount % 20 === 1) {
+                  console.log(`   📦 Segment ${segmentCount}, pos ${(currentPosition / 1024 / 1024).toFixed(1)}MB, inserted ${totalInserted}`);
                 }
                 
                 try {
@@ -1740,6 +1765,8 @@ serve(async (req) => {
                       if (!seenHoldingKeys.has(key)) {
                         seenHoldingKeys.add(key);
                         newHoldings.push(h);
+                      } else {
+                        skippedDuplicates++;
                       }
                     }
                     
@@ -1777,9 +1804,24 @@ serve(async (req) => {
                 currentPosition = nextPosition;
               }
               
-              console.log(`   📊 Total: ${totalInserted} holdings, $${runningTotalValue.toFixed(1)}M`);
+              console.log(`   📊 This run: ${totalInserted} new holdings, $${runningTotalValue.toFixed(1)}M`);
+              console.log(`   📊 Skipped ${skippedDuplicates} duplicates`);
               
-              if (totalInserted > 0) {
+              // Get final count
+              const { count: finalCount } = await supabaseClient
+                .from("holdings")
+                .select("*", { count: "exact", head: true })
+                .eq("filing_id", filingId);
+              
+              const { data: totalValueData } = await supabaseClient
+                .from("holdings")
+                .select("fair_value")
+                .eq("filing_id", filingId);
+              
+              const finalTotalValue = totalValueData?.reduce((sum, h) => sum + (h.fair_value || 0), 0) || 0;
+              
+              // Mark as parsed if we have a reasonable number of holdings
+              if ((finalCount || 0) > 100) {
                 await supabaseClient
                   .from("filings")
                   .update({ 
@@ -1787,18 +1829,21 @@ serve(async (req) => {
                     value_scale: segmentScaleResult?.detected || 'unknown'
                   })
                   .eq("id", filingId);
-                
-                return new Response(
-                  JSON.stringify({
-                    filingId,
-                    holdingsInserted: totalInserted,
-                    totalValue: runningTotalValue,
-                    valueScale: segmentScaleResult?.detected || 'unknown',
-                    method: 'segmented-dom',
-                  }),
-                  { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-                );
               }
+              
+              return new Response(
+                JSON.stringify({
+                  filingId,
+                  holdingsInserted: totalInserted,
+                  totalHoldings: finalCount,
+                  totalValue: finalTotalValue,
+                  valueScale: segmentScaleResult?.detected || 'unknown',
+                  method: 'segmented-dom',
+                  resumed: isResume,
+                  complete: currentPosition >= soiEnd,
+                }),
+                { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+              );
             }
             
             // For smaller SOI sections, use standard DOM parsing
