@@ -2095,8 +2095,9 @@ serve(async (req) => {
             let activeIndustry: string | null = null;
             let rowsProcessed = 0;
             
-            // Non-portfolio items to skip (balance sheet items, etc.)
+            // Non-portfolio items to skip (balance sheet items, financial statement entries, etc.)
             const NON_PORTFOLIO_ITEMS = [
+              // Balance sheet items
               'cash and cash equivalents', 'restricted cash', 'interest receivable',
               'accounts payable', 'accounts receivable', 'accrued', 'deferred',
               'management fee', 'incentive fee', 'payable', 'receivable',
@@ -2105,7 +2106,28 @@ serve(async (req) => {
               'total assets', 'total liabilities', 'total equity',
               'net assets', 'net asset value', 'stockholders',
               'commitments and contingencies', 'note ', 'notes ',
-              '(in millions)', '(dollar amounts'
+              '(in millions)', '(dollar amounts',
+              // Income statement / cash flow items
+              'capital in excess', 'borrowings on debt', 'proceeds from',
+              'existing portfolio', 'per share data', 'per share:', 
+              'net investment income', 'net realized', 'net unrealized',
+              'net increase', 'net decrease', 'dividends', 'distributions',
+              'interest expense', 'interest and credit', 'administrative and other',
+              'capital structuring', 'other income', 'other expense',
+              // Table headers / labels that look like data
+              'title of each class', 'par value', 'trading symbol', 
+              'name of exchange', 'name of each exchange',
+              'state or other jurisdiction', 'incorporation or organization',
+              // Class descriptions without company context (equity subcomponents)  
+              'class a common', 'class b common', 'class c common', 'class d common', 
+              'class e common', 'class a units', 'class b units', 'class c units',
+              'class d units', 'class e units', 'class x units',
+              'warrant to purchase units', 'warrant to purchase shares',
+              'class a redeemable', 'class b redeemable', 'class c redeemable',
+              'class d redeemable', 'class e redeemable', 'class f redeemable',
+              'class g redeemable', 'class h redeemable', 'class i redeemable',
+              'class b preferred', 'class a preferred',
+              'class b limited liability',
             ];
             
             // Regex patterns for parsing - create new one each chunk to reset lastIndex
