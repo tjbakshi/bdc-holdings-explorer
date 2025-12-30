@@ -211,6 +211,10 @@ const SKIP_KEYWORDS = [
   "mezzanine", "equity", "preferred", "common stock", "warrants",
   "senior subordinated loans", "other equity", "preferred equity",
   "subordinated certificates",
+  // Accounting/transaction terms (not company names)
+  "contributed capital", "management fees", "distributions",
+  "income", "expenses", "interest expense", "dividend",
+  "unrealized", "realized", "gain", "loss",
 ];
 
 // Patterns that indicate the row is NOT a real holding
@@ -227,11 +231,12 @@ const SKIP_PATTERNS = [
 ];
 
 // Company suffixes that strongly indicate a real holding
+// More restrictive list - only true legal entity suffixes
 const COMPANY_SUFFIXES = [
   "inc.", "inc", "llc", "l.l.c.", "lp", "l.p.", "corp.", "corp",
   "corporation", "company", "co.", "ltd.", "ltd", "limited",
-  "holdings", "partners", "management",
 ];
+
 
 // Check if a row represents an actual portfolio holding
 function isRealHolding(companyName: string, fairValue: number | null, cost: number | null): { valid: boolean; reason: string } {
