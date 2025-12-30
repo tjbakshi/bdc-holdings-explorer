@@ -2269,6 +2269,8 @@ serve(async (req) => {
                         /^(income|expense|revenue|depreciation|amortization)/i,
                         /^(equity|debt|credit|borrowing|dividend|distribution)/i,
                         /^(current|non-current|long-term|short-term)/i,
+                        /^(new|existing|unfunded|funded|commitment)/i,
+                        /^(investment|portfolio)\s+(commitments?|activity|summary)/i,
                       ];
                       const isFalsePositive = falsePositivePatterns.some(p => p.test(candidateIndustry));
                       
