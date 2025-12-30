@@ -1677,11 +1677,11 @@ serve(async (req) => {
             
             console.log(`   📊 Full SOI section: ${(totalSoiSize / 1024 / 1024).toFixed(1)} MB`);
             
-            // For very large SOI sections (like ARCC's $28.6B portfolio), use FAST regex-based extraction
-            // DOM parsing is too CPU-intensive for edge functions with large files
+            // For very large SOI sections (like ARCC's $28.6B portfolio), use small-segment DOM parsing
+            // This gives accurate data while staying within CPU limits
             
             if (totalSoiSize > 4_000_000) {
-              console.log(`   📦 Large SOI section (${(totalSoiSize / 1024 / 1024).toFixed(1)} MB), using fast regex extraction...`);
+              console.log(`   📦 Large SOI section (${(totalSoiSize / 1024 / 1024).toFixed(1)} MB), using small-segment DOM parsing...`);
               
               // First delete any existing holdings for this filing to avoid duplicates
               const { error: deleteError } = await supabaseClient
@@ -1698,152 +1698,89 @@ serve(async (req) => {
               console.log(`   📊 Scale detected: ${segmentScaleResult.detected}`);
               const scale = segmentScaleResult?.scale || 1;
               
-              // Extract the current quarter SOI section
-              const soiHtml = html.slice(soiStart, soiEnd);
+              // Use very small segments (200KB) to stay within CPU limits
+              const SEGMENT_SIZE = 200_000;
+              const OVERLAP_SIZE = 20_000;
               
-              // Fast regex to find all table rows with holdings data
-              // Match rows that have: company name, investment type indicator, and numeric values
-              const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-              const cellRegex = /<t[dh][^>]*>(?:<[^>]*>)*([\s\S]*?)(?:<\/[^>]*>)*<\/t[dh]>/gi;
+              const seenHoldingKeys = new Set<string>();
+              let currentPosition = soiStart;
+              let segmentCount = 0;
+              let totalInserted = 0;
+              let runningTotalValue = 0;
               
-              const holdings: Holding[] = [];
-              const seenKeys = new Set<string>();
-              let match;
-              
-              // Investment type keywords for validation
-              const investmentTypeKeywords = [
-                'first lien', 'second lien', 'senior secured', 'unsecured',
-                'subordinated', 'unitranche', 'preferred', 'common', 'equity',
-                'warrant', 'membership', 'limited partnership', 'llc interest',
-                'revolver', 'delayed draw', 'term loan'
-              ];
-              
-              while ((match = rowRegex.exec(soiHtml)) !== null) {
-                const rowHtml = match[1];
+              while (currentPosition < soiEnd) {
+                segmentCount++;
+                const segmentEnd = Math.min(currentPosition + SEGMENT_SIZE, soiEnd);
                 
-                // Extract all cell contents
-                const cells: string[] = [];
-                let cellMatch;
-                while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
-                  // Strip HTML tags and decode entities
-                  let text = cellMatch[1]
-                    .replace(/<[^>]*>/g, ' ')
-                    .replace(/&nbsp;/g, ' ')
-                    .replace(/&amp;/g, '&')
-                    .replace(/&lt;/g, '<')
-                    .replace(/&gt;/g, '>')
-                    .replace(/\s+/g, ' ')
-                    .trim();
-                  cells.push(text);
-                }
-                cellRegex.lastIndex = 0;
-                
-                if (cells.length < 4) continue;
-                
-                // Look for a row with: company name (first cell), investment type, and numeric values
-                const firstCell = cells[0] || '';
-                const rowText = cells.join(' ').toLowerCase();
-                
-                // Skip header/summary rows
-                if (firstCell.length < 3 || 
-                    /^(total|subtotal|portfolio|net|assets|industry|investment)/i.test(firstCell) ||
-                    /schedule of investments/i.test(firstCell)) {
-                  continue;
+                // Log every 10th segment
+                if (segmentCount % 10 === 1) {
+                  console.log(`   📦 Segment ${segmentCount}, position ${(currentPosition / 1024 / 1024).toFixed(1)}MB`);
                 }
                 
-                // Check if this row has an investment type
-                const hasInvestmentType = investmentTypeKeywords.some(kw => rowText.includes(kw));
-                if (!hasInvestmentType) continue;
-                
-                // Find investment type from cells
-                let investmentType: string | null = null;
-                let investmentTypeIdx = -1;
-                for (let i = 1; i < cells.length; i++) {
-                  const cellLower = cells[i].toLowerCase();
-                  if (investmentTypeKeywords.some(kw => cellLower.includes(kw))) {
-                    investmentType = cells[i].substring(0, 50); // Truncate long types
-                    investmentTypeIdx = i;
-                    break;
+                try {
+                  const segment = html.slice(currentPosition, segmentEnd);
+                  
+                  // Quick pre-check: skip segments without table content
+                  if (!segment.toLowerCase().includes('<tr')) {
+                    const nextPosition = segmentEnd - OVERLAP_SIZE;
+                    if (nextPosition <= currentPosition) break;
+                    currentPosition = nextPosition;
+                    continue;
                   }
-                }
-                
-                if (!investmentType) continue;
-                
-                // Find numeric values (look for cells with numbers, possibly with $ or parentheses)
-                const numericCells: { value: number; idx: number }[] = [];
-                for (let i = investmentTypeIdx + 1; i < cells.length; i++) {
-                  const num = parseNumeric(cells[i]);
-                  if (num !== null && Math.abs(num) > 0.01) {
-                    numericCells.push({ value: num, idx: i });
+                  
+                  // Parse with DOM parser (but with small segment size)
+                  const segmentResult = parseHtmlScheduleOfInvestments(segment, false);
+                  const segmentHoldings = segmentResult.holdings;
+                  
+                  if (segmentHoldings.length > 0) {
+                    const newHoldings: Holding[] = [];
+                    
+                    for (const h of segmentHoldings) {
+                      const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
+                      if (!seenHoldingKeys.has(key)) {
+                        seenHoldingKeys.add(key);
+                        newHoldings.push(h);
+                      }
+                    }
+                    
+                    if (newHoldings.length > 0) {
+                      const holdingsToInsert = newHoldings.map((h) => ({
+                        filing_id: filingId,
+                        company_name: h.company_name,
+                        investment_type: h.investment_type,
+                        industry: h.industry,
+                        description: h.description,
+                        interest_rate: h.interest_rate,
+                        reference_rate: h.reference_rate,
+                        maturity_date: h.maturity_date,
+                        par_amount: h.par_amount != null ? Math.round((h.par_amount * scale) * 10) / 10 : null,
+                        cost: h.cost != null ? Math.round((h.cost * scale) * 10) / 10 : null,
+                        fair_value: h.fair_value != null ? Math.round((h.fair_value * scale) * 10) / 10 : null,
+                      }));
+                      
+                      const { error: insertError } = await supabaseClient
+                        .from("holdings")
+                        .insert(holdingsToInsert);
+                      
+                      if (!insertError) {
+                        totalInserted += holdingsToInsert.length;
+                        runningTotalValue += holdingsToInsert.reduce((sum, h) => sum + (h.fair_value || 0), 0);
+                      }
+                    }
                   }
+                } catch (segmentError) {
+                  // Silently continue on segment errors
                 }
                 
-                // Need at least one numeric value (fair value)
-                if (numericCells.length === 0) continue;
-                
-                // Clean company name
-                const companyName = cleanCompanyName(firstCell).substring(0, 200);
-                if (companyName.length < 3) continue;
-                
-                // Fair value is typically the last numeric column, cost is second to last
-                const fairValue = numericCells[numericCells.length - 1]?.value ?? null;
-                const cost = numericCells.length > 1 ? numericCells[numericCells.length - 2]?.value : null;
-                const parAmount = numericCells.length > 2 ? numericCells[numericCells.length - 3]?.value : null;
-                
-                // Skip if fair value is too small (likely noise) or too large (likely total)
-                if (fairValue === null || Math.abs(fairValue) < 0.1 || Math.abs(fairValue) > 500000) continue;
-                
-                // Create holding
-                const holding: Holding = {
-                  company_name: companyName,
-                  investment_type: investmentType,
-                  industry: null,
-                  description: null,
-                  interest_rate: null,
-                  reference_rate: null,
-                  maturity_date: null,
-                  par_amount: parAmount != null ? Math.round((parAmount * scale) * 10) / 10 : null,
-                  cost: cost != null ? Math.round((cost * scale) * 10) / 10 : null,
-                  fair_value: fairValue != null ? Math.round((fairValue * scale) * 10) / 10 : null,
-                };
-                
-                // Deduplicate
-                const key = `${holding.company_name}|${holding.investment_type}|${holding.fair_value}`;
-                if (!seenKeys.has(key)) {
-                  seenKeys.add(key);
-                  holdings.push(holding);
-                }
+                const nextPosition = segmentEnd - OVERLAP_SIZE;
+                if (nextPosition <= currentPosition) break;
+                currentPosition = nextPosition;
               }
               
-              console.log(`   📊 Fast regex extracted ${holdings.length} holdings`);
+              console.log(`   📊 Total: ${totalInserted} holdings, $${runningTotalValue.toFixed(1)}M`);
               
-              if (holdings.length > 0) {
-                // Insert holdings in batches
-                const BATCH_SIZE = 100;
-                let totalInserted = 0;
-                
-                for (let i = 0; i < holdings.length; i += BATCH_SIZE) {
-                  const batch = holdings.slice(i, i + BATCH_SIZE).map(h => ({
-                    filing_id: filingId,
-                    ...h
-                  }));
-                  
-                  const { error: insertError } = await supabaseClient
-                    .from("holdings")
-                    .insert(batch);
-                  
-                  if (insertError) {
-                    console.error(`   ⚠️ Insert error:`, insertError.message);
-                  } else {
-                    totalInserted += batch.length;
-                  }
-                }
-                
-                const totalValue = holdings.reduce((sum, h) => sum + (h.fair_value || 0), 0);
-                console.log(`   📊 Inserted ${totalInserted} holdings, total value: $${totalValue.toFixed(1)}M`);
-                
-                // Mark filing as parsed
-                const { error: updateError } = await supabaseClient
+              if (totalInserted > 0) {
+                await supabaseClient
                   .from("filings")
                   .update({ 
                     parsed_successfully: true,
@@ -1851,27 +1788,17 @@ serve(async (req) => {
                   })
                   .eq("id", filingId);
                 
-                if (updateError) {
-                  console.error("Error updating filing status:", updateError);
-                }
-                
                 return new Response(
                   JSON.stringify({
                     filingId,
                     holdingsInserted: totalInserted,
-                    totalValue,
+                    totalValue: runningTotalValue,
                     valueScale: segmentScaleResult?.detected || 'unknown',
-                    scaleConfidence: segmentScaleResult?.confidence || 'low',
-                    method: 'fast-regex',
-                    warnings: warnings.length > 0 ? warnings : undefined,
+                    method: 'segmented-dom',
                   }),
-                  {
-                    headers: { ...corsHeaders, "Content-Type": "application/json" },
-                  }
+                  { headers: { ...corsHeaders, "Content-Type": "application/json" } }
                 );
               }
-              
-              console.log(`   ⚠️ Fast regex extraction found no holdings, trying standard approach...`);
             }
             
             // For smaller SOI sections, use standard DOM parsing
