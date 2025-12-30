@@ -599,7 +599,8 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     let currentIndustry: string | null = null;
     
     // Helper to get cell at a given column position (accounting for colspan)
-    const getCellAtPosition = (cells: Element[], pos: number): Element | null => {
+    // Also supports fallback to cell index if position-based lookup fails
+    const getCellAtPosition = (cells: Element[], pos: number, fallbackIndex?: number): Element | null => {
       let currentPos = 0;
       for (const cell of cells) {
         const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
@@ -608,7 +609,53 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
         }
         currentPos += colspan;
       }
+      // If position-based lookup failed, try fallback index
+      if (fallbackIndex !== undefined && fallbackIndex >= 0 && fallbackIndex < cells.length) {
+        return cells[fallbackIndex];
+      }
       return null;
+    };
+    
+    // Helper to find cell by searching for numeric value near expected position
+    const findValueCell = (cells: Element[], expectedPos: number, searchLabel?: string): Element | null => {
+      // First try exact position
+      const exactCell = getCellAtPosition(cells, expectedPos);
+      if (exactCell) {
+        const value = parseNumeric(exactCell.textContent?.trim());
+        if (value !== null) return exactCell;
+      }
+      
+      // If exact position fails, search backwards from end for numeric values
+      // Fair value, cost, par are typically the last few columns
+      if (searchLabel === 'fairValue' || searchLabel === 'cost' || searchLabel === 'par') {
+        for (let i = cells.length - 1; i >= Math.max(0, cells.length - 5); i--) {
+          const cell = cells[i];
+          const value = parseNumeric(cell.textContent?.trim());
+          if (value !== null && value > 0) {
+            // For fairValue, check if this is the last numeric cell
+            if (searchLabel === 'fairValue') {
+              // Verify no more numeric cells after this
+              let isLast = true;
+              for (let j = i + 1; j < cells.length; j++) {
+                if (parseNumeric(cells[j].textContent?.trim()) !== null) {
+                  isLast = false;
+                  break;
+                }
+              }
+              if (isLast) return cell;
+            } else if (searchLabel === 'cost') {
+              // Cost is typically second to last numeric
+              let numericCount = 0;
+              for (let j = i; j < cells.length; j++) {
+                if (parseNumeric(cells[j].textContent?.trim()) !== null) numericCount++;
+              }
+              if (numericCount === 2) return cell;
+            }
+          }
+        }
+      }
+      
+      return exactCell;
     };
     
     // Cap the number of rows we process per table to prevent blowup
@@ -679,11 +726,34 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
         continue;
       }
       
-      // Parse numeric values for validation
-      const fairValueCell = getCellAtPosition(cells, colIndices.fairValue);
-      const fairValue = parseNumeric(fairValueCell?.textContent?.trim());
-      const costCell = colIndices.cost >= 0 ? getCellAtPosition(cells, colIndices.cost) : null;
-      const cost = parseNumeric(costCell?.textContent?.trim());
+      // Parse numeric values for validation - use smart cell finding for key values
+      let fairValueCell = findValueCell(cells, colIndices.fairValue, 'fairValue');
+      let fairValue = parseNumeric(fairValueCell?.textContent?.trim());
+      let costCell = colIndices.cost >= 0 ? findValueCell(cells, colIndices.cost, 'cost') : null;
+      let cost = parseNumeric(costCell?.textContent?.trim());
+      
+      // If position-based lookup failed, try finding values from the end of the row
+      // SEC filings typically have: ... Principal | Amortized Cost | Fair Value | % of Net Assets
+      if (fairValue === null && cells.length > 0) {
+        // Search the last 5 cells for numeric values
+        for (let j = cells.length - 1; j >= Math.max(0, cells.length - 5) && fairValue === null; j--) {
+          const cellText = cells[j].textContent?.trim() || "";
+          const value = parseNumeric(cellText);
+          // Skip percentage values (e.g., "0.1%")
+          if (value !== null && !cellText.includes('%')) {
+            fairValue = value;
+            fairValueCell = cells[j];
+            // Cost should be the cell before fair value
+            if (j > 0) {
+              const prevValue = parseNumeric(cells[j - 1].textContent?.trim());
+              if (prevValue !== null) {
+                cost = prevValue;
+                costCell = cells[j - 1];
+              }
+            }
+          }
+        }
+      }
       
       // Debug logging for first few rows
       if (debugMode && i <= headerRowIndex + 20) {
