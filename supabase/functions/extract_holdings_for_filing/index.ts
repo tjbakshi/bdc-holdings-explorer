@@ -1132,8 +1132,10 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
 
 // Parse HTML Schedule of Investments table from snippets
 function parseHtmlScheduleOfInvestments(html: string, debugMode = false): { holdings: Holding[]; scaleResult: ScaleDetectionResult } {
-  const maxRowsPerTable = 500;
-  const maxHoldings = 1000;
+  // ARCC and other large BDCs can have 500+ companies with 2-5 investment lines each
+  // Need to process at least 3000 rows to capture the full Schedule of Investments
+  const maxRowsPerTable = 3000;
+  const maxHoldings = 2000;
   
   // Detect scale from the HTML (look for "in thousands" or "in millions")
   const scaleResult = detectScale(html);
