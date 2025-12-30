@@ -72,8 +72,8 @@ const BdcDetail = () => {
         .from("holdings")
         .select("*")
         .eq("filing_id", selectedFilingId)
-        .order("row_number", { ascending: true, nullsFirst: false })
-        .order("created_at", { ascending: true });
+        .order("source_pos", { ascending: true, nullsFirst: false })
+        .order("row_number", { ascending: true, nullsFirst: false });
       
       if (error) throw error;
       return data;
