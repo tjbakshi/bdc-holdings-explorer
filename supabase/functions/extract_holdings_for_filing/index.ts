@@ -787,6 +787,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       spread: findHeader(["spread"]),
       maturity: findHeader(["maturity date", "maturity", "expiration", "due date", "due"]),
       par: findHeader(["par", "principal", "face"]),
+      sharesUnits: findHeader(["shares", "unit"]), // Track shares/units column to exclude from value parsing
       cost: findHeader(["cost", "amortized"]),
       fairValue: findHeader(["fair value", "fairvalue", "fair", "market"]),
     };
@@ -994,21 +995,38 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       let cost = parseNumeric(costCell?.textContent?.trim());
       
       // If position-based lookup failed, try finding values from the end of the row
-      // SEC filings typically have: ... Principal | Amortized Cost | Fair Value | % of Net Assets
+      // SEC filings typically have: ... Shares/Units | Principal | Amortized Cost | Fair Value | % of Net Assets
       if (fairValue === null && cells.length > 0) {
-        // Collect all numeric values from the last 6 cells, excluding percentage columns
-        const numericCells: { index: number; value: number; text: string }[] = [];
+        // Collect all numeric values from the last 6 cells, excluding percentage columns and shares/units column
+        const numericCells: { index: number; value: number; text: string; position: number }[] = [];
+        
+        // Calculate position for each cell to compare against sharesUnits column position
+        let currentPos = 0;
+        const cellPositions: number[] = [];
+        for (const cell of cells) {
+          cellPositions.push(currentPos);
+          currentPos += parseInt(cell.getAttribute("colspan") || "1", 10);
+        }
         
         for (let j = cells.length - 1; j >= Math.max(0, cells.length - 6); j--) {
           const cellText = cells[j].textContent?.trim() || "";
+          const cellPosition = cellPositions[j];
+          
           // Skip cells that contain % or are likely percentage values
           if (cellText.includes('%') || cellText.includes('(') && cellText.includes(')') && cellText.length < 10) {
             continue;
           }
+          
+          // CRITICAL FIX: Skip the shares/units column - this contains share counts, not dollar values
+          // The shares/units column can have large values (e.g., 37,020) that get mistaken for fair value
+          if (colIndices.sharesUnits >= 0 && cellPosition === colIndices.sharesUnits) {
+            continue;
+          }
+          
           const value = parseNumeric(cellText);
           // Only accept positive values that look like dollar amounts
           if (value !== null && value > 0) {
-            numericCells.push({ index: j, value, text: cellText });
+            numericCells.push({ index: j, value, text: cellText, position: cellPosition });
           }
         }
         
