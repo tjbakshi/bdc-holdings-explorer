@@ -345,7 +345,15 @@ const SKIP_KEYWORDS = [
   "weighted average", "percentage", "% of", "footnote",
   "see accompanying", "notes to", "schedule continued",
   "non-controlled", "controlled", "affiliate", // These are section headers, not companies
-  // Industry categories (these are section headers, not companies)
+  // Accounting/transaction terms (not company names)
+  "contributed capital", "management fees", "distributions",
+  "income", "expenses", "interest expense", "dividend",
+  "unrealized", "realized", "gain", "loss",
+];
+
+// Industry section headers - these are section labels, not company names
+// We want to track these as current industry for subsequent rows
+const INDUSTRY_HEADERS = [
   "software and services", "health care", "commercial and professional",
   "financial services", "consumer services", "consumer distribution",
   "sports, media", "investment funds", "capital goods",
@@ -353,15 +361,16 @@ const SKIP_KEYWORDS = [
   "real estate", "transportation", "utilities", "energy",
   "materials", "telecommunications", "technology",
   "media and entertainment", "food and beverage", "retail",
-  // Investment type headers (section labels, not companies)
+  "diversified financials", "consumer durables", "automobiles",
+  "retailing", "food, beverage", "household", "personal products",
+];
+
+// Investment type labels that indicate this is a type description, not a company
+const INVESTMENT_TYPE_LABELS = [
   "first lien", "second lien", "senior secured", "subordinated",
   "mezzanine", "equity", "preferred", "common stock", "warrants",
   "senior subordinated loans", "other equity", "preferred equity",
-  "subordinated certificates",
-  // Accounting/transaction terms (not company names)
-  "contributed capital", "management fees", "distributions",
-  "income", "expenses", "interest expense", "dividend",
-  "unrealized", "realized", "gain", "loss",
+  "subordinated certificates", "unitranche",
 ];
 
 // Patterns that indicate the row is NOT a real holding
@@ -374,16 +383,43 @@ const SKIP_PATTERNS = [
   /^—+$/, // Just em-dashes
   /^\s*$/, // Empty or whitespace
   /^\d{1,2}\/\d{1,2}\/\d{2,4}/, // Starts with date
-  /^[A-Z][a-z]+ \d{1,2}, \d{4}/, // Date format like "September 30, 2025"
+  /^[A-Za-z]+ \d{1,2}, \d{4}/, // Date format like "September 30, 2025"
 ];
 
 // Company suffixes that strongly indicate a real holding
-// More restrictive list - only true legal entity suffixes
 const COMPANY_SUFFIXES = [
   "inc.", "inc", "llc", "l.l.c.", "lp", "l.p.", "corp.", "corp",
   "corporation", "company", "co.", "ltd.", "ltd", "limited",
 ];
 
+// Check if text is an industry section header
+function isIndustrySectionHeader(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+  return INDUSTRY_HEADERS.some(h => lower === h || lower.startsWith(h + " "));
+}
+
+// Check if text is an investment type label (not a company name)
+function isInvestmentTypeLabel(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+  return INVESTMENT_TYPE_LABELS.some(t => lower.startsWith(t) && lower.length < 50);
+}
+
+// Check if a company name appears valid (has legal suffix or entity pattern)
+function hasCompanySuffix(name: string): boolean {
+  const lowerName = name.toLowerCase();
+  
+  // Check for company suffix
+  const hasSuffix = COMPANY_SUFFIXES.some(suffix => {
+    const regex = new RegExp(`\\b${suffix.replace(/\./g, "\\.")}\\b`, "i");
+    return regex.test(lowerName);
+  });
+  
+  if (hasSuffix) return true;
+  
+  // Special case: names ending with common company name patterns
+  const endsWithEntityWord = /\b(enterprises|industries|technologies|systems|group|capital|solutions|services|holdings)\s*$/i.test(lowerName);
+  return endsWithEntityWord;
+}
 
 // Check if a row represents an actual portfolio holding
 function isRealHolding(companyName: string, fairValue: number | null, cost: number | null): { valid: boolean; reason: string } {
@@ -393,6 +429,16 @@ function isRealHolding(companyName: string, fairValue: number | null, cost: numb
   // Must have a non-empty name
   if (!name || name.length < 5) {
     return { valid: false, reason: "Name too short" };
+  }
+  
+  // Skip if it's an industry section header
+  if (isIndustrySectionHeader(name)) {
+    return { valid: false, reason: "Industry section header" };
+  }
+  
+  // Skip if it's an investment type label
+  if (isInvestmentTypeLabel(name)) {
+    return { valid: false, reason: "Investment type label" };
   }
   
   // Skip if matches any skip keywords
@@ -419,20 +465,9 @@ function isRealHolding(companyName: string, fairValue: number | null, cost: numb
     return { valid: false, reason: "Fair value is 0" };
   }
   
-  // Check for company suffix (REQUIRED for acceptance)
-  // Use word boundary matching to avoid false positives
-  const hasCompanySuffix = COMPANY_SUFFIXES.some(suffix => {
-    const regex = new RegExp(`\\b${suffix.replace(/\./g, "\\.")}\\b`, "i");
-    return regex.test(lowerName);
-  });
-  
-  if (!hasCompanySuffix) {
-    // Special case: names ending with common company name patterns
-    // e.g., "Acme Enterprises" or "ABC Group" (but "group" is too generic without other suffix)
-    const endsWithEntityWord = /\b(enterprises|industries|technologies|systems|group|capital|solutions|services)\s*$/i.test(lowerName);
-    if (!endsWithEntityWord) {
-      return { valid: false, reason: "No company suffix found" };
-    }
+  // Check for company suffix
+  if (!hasCompanySuffix(name)) {
+    return { valid: false, reason: "No company suffix found" };
   }
   
   // Additional sanity check: name should have at least 2 words
@@ -444,7 +479,7 @@ function isRealHolding(companyName: string, fairValue: number | null, cost: numb
   return { valid: true, reason: "Has company suffix" };
 }
 
-// Parse tables looking for Schedule of Investments
+// Parse tables looking for Schedule of Investments with multi-line investment support
 function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number, debugMode = false): Holding[] {
   const holdings: Holding[] = [];
   const debugAccepted: string[] = [];
@@ -530,7 +565,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       console.log(`✓ Table ${tableIndex}: Valid structure, attempting to parse rows...`);
     }
     
-    // Parse data rows
+    // Parse data rows with multi-line investment tracking
     const rows = (table as Element).querySelectorAll("tr");
     
     // Find the index of the header row
@@ -542,6 +577,23 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       }
     }
     
+    // State for tracking current company across multi-line investments
+    let currentCompany: string | null = null;
+    let currentIndustry: string | null = null;
+    
+    // Helper to get cell at a given column position (accounting for colspan)
+    const getCellAtPosition = (cells: Element[], pos: number): Element | null => {
+      let currentPos = 0;
+      for (const cell of cells) {
+        const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+        if (currentPos <= pos && pos < currentPos + colspan) {
+          return cell;
+        }
+        currentPos += colspan;
+      }
+      return null;
+    };
+    
     // Cap the number of rows we process per table to prevent blowup
     const rowsToProcess = Math.min(rows.length, headerRowIndex + maxRowsPerTable + 1);
     
@@ -552,61 +604,97 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       
       if (cells.length === 0) continue;
       
-      // Helper to get cell at a given column position (accounting for colspan)
-      const getCellAtPosition = (pos: number): Element | null => {
-        let currentPos = 0;
-        for (const cell of cells) {
-          const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
-          if (currentPos <= pos && pos < currentPos + colspan) {
-            return cell;
-          }
-          currentPos += colspan;
-        }
-        return null;
-      };
+      const companyCell = getCellAtPosition(cells, colIndices.company);
+      const companyCellText = companyCell?.textContent?.trim() || "";
       
-      const companyCell = getCellAtPosition(colIndices.company);
-      const companyName = companyCell?.textContent?.trim() || "";
-      if (!companyName || companyName.length < 2) continue;
+      // Get the industry/business description cell (may also serve as industry indicator)
+      const industryCell = colIndices.industry >= 0 ? getCellAtPosition(cells, colIndices.industry) : null;
+      const industryCellText = industryCell?.textContent?.trim() || "";
       
-      // Parse numeric values first for validation
-      const fairValueCell = getCellAtPosition(colIndices.fairValue);
-      const fairValue = parseNumeric(fairValueCell?.textContent?.trim());
-      const costCell = colIndices.cost >= 0 ? getCellAtPosition(colIndices.cost) : null;
-      const cost = parseNumeric(costCell?.textContent?.trim());
-      
-      // Use the new validation function
-      const validation = isRealHolding(companyName, fairValue, cost);
-      
-      if (!validation.valid) {
-        // Log first 5 rejected for debugging
-        if (debugRejected.length < 5) {
-          debugRejected.push({ name: companyName.substring(0, 50), reason: validation.reason });
+      // Check if this row is an industry section header
+      if (companyCellText && isIndustrySectionHeader(companyCellText)) {
+        // This row is an industry section header - update current industry
+        currentIndustry = companyCellText;
+        currentCompany = null; // Reset company when entering new industry section
+        if (debugMode) {
+          console.log(`📂 Industry section: ${currentIndustry}`);
         }
         continue;
       }
       
-      const interestRateCell = colIndices.interestRate >= 0 ? getCellAtPosition(colIndices.interestRate) : null;
+      // Check if the first cell has a company name (new company) or is empty (continuation of previous)
+      let effectiveCompanyName: string;
+      let effectiveIndustry: string | null;
+      
+      if (companyCellText && companyCellText.length >= 5) {
+        // Non-empty company cell - this is a new company
+        // Check if it has a company suffix before accepting as new company
+        if (hasCompanySuffix(companyCellText)) {
+          currentCompany = companyCellText;
+          // Industry can come from: the industry/business column OR the current section header
+          effectiveIndustry = industryCellText || currentIndustry;
+          currentIndustry = effectiveIndustry || currentIndustry;
+        } else {
+          // Might be an investment type label or subtotal - skip as company
+          if (debugRejected.length < 10) {
+            debugRejected.push({ name: companyCellText.substring(0, 50), reason: "No company suffix (continuation row handling)" });
+          }
+          // Don't update currentCompany, treat as potential investment line for current company
+          effectiveIndustry = currentIndustry;
+        }
+        effectiveCompanyName = currentCompany || companyCellText;
+      } else if (currentCompany) {
+        // Empty or short company cell - this is a continuation row for the current company
+        effectiveCompanyName = currentCompany;
+        effectiveIndustry = currentIndustry;
+      } else {
+        // No current company and no company name - skip this row
+        continue;
+      }
+      
+      // Parse numeric values for validation
+      const fairValueCell = getCellAtPosition(cells, colIndices.fairValue);
+      const fairValue = parseNumeric(fairValueCell?.textContent?.trim());
+      const costCell = colIndices.cost >= 0 ? getCellAtPosition(cells, colIndices.cost) : null;
+      const cost = parseNumeric(costCell?.textContent?.trim());
+      
+      // Skip rows without fair value (could be subtotals, headers, or empty lines)
+      if (fairValue === null || fairValue === 0) {
+        // Don't log as rejected - these are expected empty rows in multi-line format
+        continue;
+      }
+      
+      // Validate the effective company name for the holding
+      const validation = isRealHolding(effectiveCompanyName, fairValue, cost);
+      
+      if (!validation.valid) {
+        // Log first 10 rejected for debugging
+        if (debugRejected.length < 10) {
+          debugRejected.push({ name: effectiveCompanyName.substring(0, 50), reason: validation.reason });
+        }
+        continue;
+      }
+      
+      // Extract investment details
+      const interestRateCell = colIndices.interestRate >= 0 ? getCellAtPosition(cells, colIndices.interestRate) : null;
       const interestRateText = interestRateCell?.textContent?.trim() || "";
       
       const { rate, reference } = extractInterestRate(interestRateText);
       
-      // Get spread column value for reference_rate (overrides extracted reference if present)
-      const spreadCell = colIndices.spread >= 0 ? getCellAtPosition(colIndices.spread) : null;
+      // Get spread column value for reference_rate
+      const spreadCell = colIndices.spread >= 0 ? getCellAtPosition(cells, colIndices.spread) : null;
       const spreadText = spreadCell?.textContent?.trim() || "";
-      // Use spread column if available, otherwise fall back to extracted reference from interest rate
       const referenceRate = spreadText || reference;
       
-      const investmentTypeCell = colIndices.investmentType >= 0 ? getCellAtPosition(colIndices.investmentType) : null;
-      const industryCell = colIndices.industry >= 0 ? getCellAtPosition(colIndices.industry) : null;
-      const descriptionCell = colIndices.description >= 0 ? getCellAtPosition(colIndices.description) : null;
-      const maturityCell = colIndices.maturity >= 0 ? getCellAtPosition(colIndices.maturity) : null;
-      const parCell = colIndices.par >= 0 ? getCellAtPosition(colIndices.par) : null;
+      const investmentTypeCell = colIndices.investmentType >= 0 ? getCellAtPosition(cells, colIndices.investmentType) : null;
+      const descriptionCell = colIndices.description >= 0 ? getCellAtPosition(cells, colIndices.description) : null;
+      const maturityCell = colIndices.maturity >= 0 ? getCellAtPosition(cells, colIndices.maturity) : null;
+      const parCell = colIndices.par >= 0 ? getCellAtPosition(cells, colIndices.par) : null;
       
       const holding: Holding = {
-        company_name: companyName,
+        company_name: effectiveCompanyName,
         investment_type: investmentTypeCell?.textContent?.trim() || null,
-        industry: industryCell?.textContent?.trim() || null,
+        industry: effectiveIndustry,
         description: descriptionCell?.textContent?.trim() || null,
         interest_rate: rate,
         reference_rate: referenceRate || null,
@@ -618,9 +706,10 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       
       holdings.push(holding);
       
-      // Log first 5 accepted for debugging
-      if (debugAccepted.length < 5) {
-        debugAccepted.push(companyName.substring(0, 50));
+      // Log first 10 accepted for debugging
+      if (debugAccepted.length < 10) {
+        const investType = holding.investment_type || 'unknown';
+        debugAccepted.push(`${effectiveCompanyName.substring(0, 40)} [${investType.substring(0, 20)}] FV=$${fairValue}`);
       }
       
       // Cap total holdings to prevent excessive memory usage
@@ -632,10 +721,13 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     
     // If we found holdings in this table, log debug info and stop searching
     if (holdings.length > 0) {
+      // Count unique companies
+      const uniqueCompanies = new Set(holdings.map(h => h.company_name)).size;
+      
       console.log(`\n=== Parsing Results ===`);
-      console.log(`✅ Accepted ${holdings.length} holdings from table ${tableIndex}`);
-      console.log(`First 5 accepted:`, debugAccepted);
-      console.log(`First 5 rejected:`, debugRejected);
+      console.log(`✅ Accepted ${holdings.length} investment records from ${uniqueCompanies} unique companies`);
+      console.log(`First 10 accepted:`, debugAccepted);
+      console.log(`First 10 rejected:`, debugRejected);
       console.log(`========================\n`);
       return holdings;
     }
@@ -644,7 +736,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
   // Log debug info even if no holdings found
   if (debugRejected.length > 0) {
     console.log(`\n=== Parsing Results (no holdings found) ===`);
-    console.log(`First 5 rejected:`, debugRejected);
+    console.log(`First 10 rejected:`, debugRejected);
     console.log(`============================================\n`);
   }
   
