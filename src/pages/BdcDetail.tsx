@@ -121,6 +121,21 @@ const BdcDetail = () => {
     return new Date(dateStr).toLocaleDateString();
   };
 
+  // Calculate portfolio summary totals
+  const portfolioSummary = holdings ? {
+    totalPar: holdings.reduce((sum, h) => sum + (h.par_amount || 0), 0),
+    totalCost: holdings.reduce((sum, h) => sum + (h.cost || 0), 0),
+    totalFairValue: holdings.reduce((sum, h) => sum + (h.fair_value || 0), 0),
+  } : null;
+
+  const summaryFmvPar = portfolioSummary && portfolioSummary.totalPar > 0 
+    ? ((portfolioSummary.totalFairValue / portfolioSummary.totalPar) * 100).toFixed(2) + "%" 
+    : "—";
+  
+  const summaryFmvCost = portfolioSummary && portfolioSummary.totalCost > 0 
+    ? ((portfolioSummary.totalFairValue / portfolioSummary.totalCost) * 100).toFixed(2) + "%" 
+    : "—";
+
   if (bdcLoading) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
@@ -235,6 +250,34 @@ const BdcDetail = () => {
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
+                  {/* Portfolio Summary */}
+                  {portfolioSummary && (
+                    <div className="mb-6 p-4 bg-muted/50 rounded-lg border">
+                      <h3 className="text-sm font-semibold mb-3 text-muted-foreground uppercase tracking-wide">Portfolio Summary</h3>
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                        <div>
+                          <p className="text-xs text-muted-foreground">Total Par</p>
+                          <p className="text-lg font-semibold font-mono">{formatCurrencyMillions(portfolioSummary.totalPar)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-muted-foreground">Total Cost</p>
+                          <p className="text-lg font-semibold font-mono">{formatCurrencyMillions(portfolioSummary.totalCost)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-muted-foreground">Total Fair Value</p>
+                          <p className="text-lg font-semibold font-mono">{formatCurrencyMillions(portfolioSummary.totalFairValue)}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-muted-foreground">FMV % Par</p>
+                          <p className="text-lg font-semibold">{summaryFmvPar}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-muted-foreground">FMV % Cost</p>
+                          <p className="text-lg font-semibold">{summaryFmvCost}</p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   <TooltipProvider>
                     <div className="rounded-lg border overflow-x-auto">
                       <Table>
