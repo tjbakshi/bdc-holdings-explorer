@@ -1678,14 +1678,14 @@ serve(async (req) => {
             console.log(`   📊 Full SOI section: ${(totalSoiSize / 1024 / 1024).toFixed(1)} MB`);
             
             // For very large SOI sections (like ARCC's $28.6B portfolio), use segment-based extraction
-            // Use smaller segments (500KB) with the DOM parser for better accuracy
-            const SEGMENT_SIZE = 500_000; // 500KB per segment - small to work with DOM parser
-            const OVERLAP_SIZE = 50_000; // 50KB overlap to avoid cutting holdings
+            // Use very small segments (300KB) with quick pre-checks to avoid heavy DOM parsing
+            const SEGMENT_SIZE = 300_000; // 300KB per segment - very small for fast parsing
+            const OVERLAP_SIZE = 30_000; // 30KB overlap to avoid cutting holdings
             
             if (totalSoiSize > 4_000_000) {
-              const numSegments = Math.ceil(totalSoiSize / SEGMENT_SIZE);
+              const numSegments = Math.ceil(totalSoiSize / (SEGMENT_SIZE - OVERLAP_SIZE));
               console.log(`   📦 Large SOI section, using segmented DOM-parser approach...`);
-              console.log(`   📦 Will process ${numSegments} segments of ~500KB, saving to DB after each`);
+              console.log(`   📦 Will process ~${numSegments} segments of ~300KB, saving to DB after each`);
               
               // First delete any existing holdings for this filing to avoid duplicates
               const { error: deleteError } = await supabaseClient
@@ -1718,8 +1718,20 @@ serve(async (req) => {
                 }
                 
                 try {
-                  // Extract this segment and parse with DOM parser
+                  // Extract this segment 
                   const segment = html.slice(currentPosition, segmentEnd);
+                  
+                  // Quick pre-check: skip segments without table markers (saves CPU)
+                  const lowerSegment = segment.toLowerCase();
+                  if (!lowerSegment.includes('<table') && !lowerSegment.includes('<tr')) {
+                    // No table content, skip this segment
+                    const nextPosition = segmentEnd - OVERLAP_SIZE;
+                    if (nextPosition <= currentPosition) break;
+                    currentPosition = nextPosition;
+                    continue;
+                  }
+                  
+                  // Parse with DOM parser
                   const segmentResult = parseHtmlScheduleOfInvestments(segment, false);
                   const segmentHoldings = segmentResult.holdings;
                   
@@ -1765,8 +1777,8 @@ serve(async (req) => {
                         totalInserted += holdingsToInsert.length;
                         const segmentValue = holdingsToInsert.reduce((sum, h) => sum + (h.fair_value || 0), 0);
                         runningTotalValue += segmentValue;
-                        // Log every 5 segments or when done
-                        if (segmentCount % 5 === 0 || segmentCount === numSegments) {
+                        // Log every 10 segments or when done
+                        if (segmentCount % 10 === 0) {
                           console.log(`   ✅ Progress: ${totalInserted} holdings ($${runningTotalValue.toFixed(1)}M)`);
                         }
                       }
@@ -1784,8 +1796,10 @@ serve(async (req) => {
                 }
                 currentPosition = nextPosition;
                 
-                // Brief pause to allow garbage collection
-                await new Promise(resolve => setTimeout(resolve, 5));
+                // Brief pause every 5 segments to allow garbage collection  
+                if (segmentCount % 5 === 0) {
+                  await new Promise(resolve => setTimeout(resolve, 10));
+                }
               }
               
               console.log(`   📦 Segmented extraction complete!`);
