@@ -687,13 +687,26 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       const referenceRate = spreadText || reference;
       
       const investmentTypeCell = colIndices.investmentType >= 0 ? getCellAtPosition(cells, colIndices.investmentType) : null;
+      const investmentType = investmentTypeCell?.textContent?.trim() || null;
+      
+      // Skip subtotal rows - these have fair value but no investment type
+      // Real investment rows should have an investment type like "First lien senior secured loan"
+      // Exception: equity positions may not have investment type in some filings
+      if (!investmentType && colIndices.investmentType >= 0) {
+        // This is likely a subtotal row - skip it
+        if (debugRejected.length < 10) {
+          debugRejected.push({ name: `${effectiveCompanyName.substring(0, 40)} (FV=$${fairValue})`, reason: "Subtotal row (no investment type)" });
+        }
+        continue;
+      }
+      
       const descriptionCell = colIndices.description >= 0 ? getCellAtPosition(cells, colIndices.description) : null;
       const maturityCell = colIndices.maturity >= 0 ? getCellAtPosition(cells, colIndices.maturity) : null;
       const parCell = colIndices.par >= 0 ? getCellAtPosition(cells, colIndices.par) : null;
       
       const holding: Holding = {
         company_name: effectiveCompanyName,
-        investment_type: investmentTypeCell?.textContent?.trim() || null,
+        investment_type: investmentType,
         industry: effectiveIndustry,
         description: descriptionCell?.textContent?.trim() || null,
         interest_rate: rate,
