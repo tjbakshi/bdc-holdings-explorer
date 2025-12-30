@@ -1353,28 +1353,18 @@ serve(async (req) => {
           const html = await fetchSecFile(docUrl);
           console.log(`   Size: ${(html.length / 1024).toFixed(0)} KB`);
           
-          // For very large documents (>5MB), try to extract just the SOI section first
+          // For very large documents (>5MB), pass to parseHtmlScheduleOfInvestments which handles chunking
           let textToParse = html;
           if (html.length > 5_000_000) {
-            console.log(`   📦 Large document, extracting SOI sections only...`);
-            // Look for Schedule of Investments sections
-            const soiMatch = html.match(/schedule\s+of\s+investments[\s\S]{0,2000000}/gi);
-            if (soiMatch && soiMatch.length > 0) {
-              // Take first match plus surrounding context
-              const firstMatch = soiMatch[0];
-              textToParse = firstMatch;
-              console.log(`   📦 Extracted ${(textToParse.length / 1024).toFixed(0)} KB SOI section`);
-            } else {
-              warnings.push(`Document ${doc.name} too large (${(html.length / 1024).toFixed(0)} KB) and no SOI section found. Skipping.`);
-              console.log(`   ⚠️ No SOI section found in large document, skipping`);
-              continue;
-            }
+            console.log(`   📦 Large document (${(html.length / 1024 / 1024).toFixed(1)} MB), will use chunked SOI extraction...`);
+            // Let parseHtmlScheduleOfInvestments handle the extraction and chunking
+            // It will find all SOI keyword occurrences and extract the full section
           }
           
-          // Hard limit: Skip if still too large after extraction
-          if (textToParse.length > 5_000_000) {
-            warnings.push(`Document ${doc.name} section too large to safely parse (${(textToParse.length / 1024).toFixed(0)} KB > 5MB). Skipping.`);
-            console.log(`   ⚠️ Section still too large, skipping`);
+          // Hard limit: Skip if document is larger than 10MB (edge function memory limits)
+          if (textToParse.length > 10_000_000) {
+            warnings.push(`Document ${doc.name} too large (${(html.length / 1024 / 1024).toFixed(1)} MB > 10MB). Skipping.`);
+            console.log(`   ⚠️ Document exceeds 10MB limit, skipping`);
             continue;
           }
           
