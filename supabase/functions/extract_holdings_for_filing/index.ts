@@ -368,47 +368,101 @@ const SKIP_KEYWORDS = [
   "unrealized", "realized", "gain", "loss",
 ];
 
-// Industry section headers - these are section labels, not company names
-// We want to track these as current industry for subsequent rows
-// This list is expanded to cover more industry patterns seen in SEC filings
-const INDUSTRY_PATTERNS = [
-  // Technology & Software
-  /^technology/i, /^software/i, /^internet/i, /^it services/i,
-  /^technology hardware/i, /^semiconductors/i, /^electronic/i,
-  /^software and services/i, /^technology services/i,
+// ARCC's exact industry categories from their SEC filings
+// These are the section headers that appear in the Schedule of Investments
+const ARCC_INDUSTRY_CATEGORIES = [
+  // Services sectors
+  'Software and Services',
+  'Consumer Services',
+  'Commercial and Professional Services',
+  
   // Healthcare
-  /^health care/i, /^healthcare/i, /^pharmaceuticals/i, /^biotechnology/i,
-  /^life sciences/i, /^medical/i, /^biotech/i, /^health care equipment/i,
+  'Health Care Equipment and Services',
+  'Pharmaceuticals, Biotechnology and Life Sciences',
+  
+  // Consumer sectors
+  'Consumer Discretionary Distribution and Retail',
+  'Consumer Durables and Apparel',
+  'Consumer Staples Distribution and Retail',
+  'Household and Personal Products',
+  'Food, Beverage and Tobacco',
+  
   // Financial
-  /^financial/i, /^insurance/i, /^banking/i, /^capital markets/i,
-  /^diversified financials/i, /^real estate/i, /^financial services/i,
-  // Consumer
-  /^consumer/i, /^retail/i, /^food/i, /^beverage/i, /^household/i,
-  /^personal products/i, /^textiles/i, /^apparel/i, /^leisure/i,
-  /^consumer services/i, /^consumer discretionary/i, /^consumer staples/i,
-  /^consumer distribution/i, /^food, beverage/i, /^food and beverage/i,
-  // Industrial
-  /^industrial/i, /^manufacturing/i, /^capital goods/i, /^machinery/i,
-  /^aerospace/i, /^defense/i, /^construction/i, /^building/i,
-  /^commercial and professional/i, /^commercial services/i,
-  // Services
-  /^commercial/i, /^professional services/i, /^business services/i,
-  /^support services/i, /^education/i, /^transportation/i,
-  // Utilities & Energy
-  /^utilities/i, /^energy/i, /^oil/i, /^gas utilities/i, /^electric utilities/i,
-  /^power/i, /^renewable/i, /^electric/i, /^water utilities/i,
-  // Media & Communications
-  /^media/i, /^communications/i, /^telecommunication/i, /^entertainment/i,
-  /^broadcasting/i, /^advertising/i, /^media and entertainment/i,
-  /^sports/i, /^sports,? media/i,
-  // Materials
-  /^materials/i, /^chemicals/i, /^metals/i, /^mining/i, /^paper/i,
-  // Other common SEC industry categories
-  /^automobiles/i, /^auto/i, /^hotels/i, /^restaurants/i, /^gaming/i,
-  /^investment funds/i, /^distribution/i, /^logistics/i,
-  /^environmental/i, /^containers/i, /^packaging/i,
-  /^retailing/i, /^household products/i,
+  'Financial Services',
+  'Insurance',
+  'Banks',
+  
+  // Industrial/Business
+  'Capital Goods',
+  'Transportation',
+  'Materials',
+  
+  // Technology
+  'Technology Hardware and Equipment',
+  'Semiconductors and Semiconductor Equipment',
+  'Media and Entertainment',
+  'Telecommunication Services',
+  
+  // Energy/Utilities
+  'Energy',
+  'Utilities',
+  'Gas Utilities',
+  
+  // Real Estate
+  'Real Estate Management and Development',
+  'Equity Real Estate Investment Trusts (REITs)',
+  
+  // Other
+  'Automobiles and Components',
+  'Food and Staples Retailing',
+  'Retailing',
 ];
+
+// Industry name mappings for normalization (variant -> standard)
+const INDUSTRY_NAME_MAPPINGS: Record<string, string> = {
+  'software & services': 'Software and Services',
+  'healthcare equipment & services': 'Health Care Equipment and Services',
+  'commercial & professional services': 'Commercial and Professional Services',
+  'pharma, biotech & life sciences': 'Pharmaceuticals, Biotechnology and Life Sciences',
+  'technology hardware & equipment': 'Technology Hardware and Equipment',
+  'media & entertainment': 'Media and Entertainment',
+  'real estate': 'Real Estate Management and Development',
+  'reits': 'Equity Real Estate Investment Trusts (REITs)',
+  'consumer discretionary': 'Consumer Discretionary Distribution and Retail',
+  'consumer staples': 'Consumer Staples Distribution and Retail',
+  'food & beverage': 'Food, Beverage and Tobacco',
+  'food and beverage': 'Food, Beverage and Tobacco',
+  'telecom services': 'Telecommunication Services',
+  'telecommunications': 'Telecommunication Services',
+  'semiconductors': 'Semiconductors and Semiconductor Equipment',
+};
+
+// Normalize industry name to standard format
+function normalizeIndustryName(industryText: string): string {
+  const cleaned = industryText.trim();
+  const lower = cleaned.toLowerCase();
+  
+  // Check if we have a direct mapping
+  if (INDUSTRY_NAME_MAPPINGS[lower]) {
+    return INDUSTRY_NAME_MAPPINGS[lower];
+  }
+  
+  // Check if it's an exact match to a known category (case-insensitive)
+  for (const category of ARCC_INDUSTRY_CATEGORIES) {
+    if (lower === category.toLowerCase()) {
+      return category;
+    }
+  }
+  
+  return cleaned;
+}
+
+// Check if text is an exact ARCC industry category
+function isExactIndustryCategory(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+  return ARCC_INDUSTRY_CATEGORIES.some(cat => cat.toLowerCase() === lower) ||
+         Object.keys(INDUSTRY_NAME_MAPPINGS).includes(lower);
+}
 
 // Investment type labels that indicate this is a type description, not a company
 const INVESTMENT_TYPE_LABELS = [
@@ -442,16 +496,30 @@ function isIndustrySectionHeader(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed || trimmed.length < 3) return false;
   
+  // First check for exact ARCC industry category match
+  if (isExactIndustryCategory(trimmed)) {
+    return true;
+  }
+  
   // Industry headers don't have company entity suffixes
-  const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Co\.|Company|Enterprises|Partners)\b/i.test(trimmed);
+  const hasCompanyEntity = /\b(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Co\.|Company|Enterprises|Partners|Group)\b/i.test(trimmed);
   if (hasCompanyEntity) return false;
   
   // Industry headers typically don't have $ amounts or percentages
   const hasNumericValues = /\$[\d,]+|\d+\.\d+%|\d{1,3}(?:,\d{3})+/.test(trimmed);
   if (hasNumericValues) return false;
   
-  // Check if it matches known industry patterns
-  for (const pattern of INDUSTRY_PATTERNS) {
+  // Additional pattern matching for industries not in the exact list
+  const industryPatterns = [
+    /^software/i, /^technology/i, /^health care/i, /^healthcare/i,
+    /^financial/i, /^consumer/i, /^commercial/i, /^capital goods/i,
+    /^transportation/i, /^materials/i, /^energy/i, /^utilities/i,
+    /^media/i, /^telecommunication/i, /^insurance/i, /^banks/i,
+    /^real estate/i, /^automobiles/i, /^food/i, /^retail/i,
+    /^pharmaceuticals/i, /^semiconductors/i, /^household/i,
+  ];
+  
+  for (const pattern of industryPatterns) {
     if (pattern.test(trimmed)) {
       return true;
     }
@@ -781,8 +849,8 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       
       // Check if this row is an industry section header (using enhanced detection)
       if (companyCellText && isRowAnIndustrySectionHeader(cells, companyCellText, expectedCellCount)) {
-        // This row is an industry section header - update current industry
-        currentIndustry = companyCellText;
+        // This row is an industry section header - update current industry with normalization
+        currentIndustry = normalizeIndustryName(companyCellText);
         currentCompany = null; // Reset company when entering new industry section
         if (debugMode) {
           console.log(`📂 Industry section: ${currentIndustry}`);
@@ -975,6 +1043,23 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       for (const [ind, companies] of Object.entries(industryGroups)) {
         console.log(`   ${ind}: ${companies.length} companies (${companies.slice(0, 3).join(', ')}${companies.length > 3 ? '...' : ''})`);
       }
+      
+      // Validate expected major industries for ARCC
+      const expectedMajorIndustries = [
+        'Software and Services',
+        'Health Care Equipment and Services',
+        'Financial Services',
+        'Consumer Services',
+        'Capital Goods',
+      ];
+      const foundIndustryNames = Array.from(uniqueIndustries) as string[];
+      const missingIndustries = expectedMajorIndustries.filter(exp => 
+        !foundIndustryNames.some(found => found?.toLowerCase() === exp.toLowerCase())
+      );
+      if (missingIndustries.length > 0 && missingIndustries.length < expectedMajorIndustries.length) {
+        console.log(`⚠️ Some expected industries not found: ${missingIndustries.join(', ')}`);
+      }
+      
       console.log(`First 10 accepted:`, debugAccepted);
       console.log(`First 10 rejected:`, debugRejected);
       console.log(`========================\n`);
