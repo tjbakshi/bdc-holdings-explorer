@@ -1,6 +1,6 @@
 import { useState, useMemo } from "react";
 import { useParams, Link } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import {
   Select,
@@ -20,14 +20,30 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { ArrowLeft, Download, Search } from "lucide-react";
+import { ArrowLeft, Download, Search, RotateCcw, Trash2, AlertTriangle } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+import { useToast } from "@/hooks/use-toast";
 import * as XLSX from "xlsx";
 
 const BdcDetail = () => {
   const { bdcId } = useParams<{ bdcId: string }>();
   const [selectedFilingId, setSelectedFilingId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [isResetting, setIsResetting] = useState<string | null>(null);
+  const [isClearing, setIsClearing] = useState(false);
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
 
   // Fetch BDC info
   const { data: bdc, isLoading: bdcLoading } = useQuery({
@@ -213,6 +229,67 @@ const BdcDetail = () => {
     XLSX.writeFile(workbook, fileName);
   };
 
+  const handleResetFiling = async (filingId: string) => {
+    setIsResetting(filingId);
+    try {
+      const { data, error } = await supabase.functions.invoke("manage-data", {
+        body: { action: "reset_filing", filingId },
+      });
+
+      if (error) throw error;
+      if (!data.success) throw new Error(data.error);
+
+      toast({
+        title: "Filing Reset",
+        description: data.message,
+      });
+
+      // Invalidate queries to refresh the UI
+      queryClient.invalidateQueries({ queryKey: ["filings", bdcId] });
+      queryClient.invalidateQueries({ queryKey: ["holdings", filingId] });
+    } catch (error) {
+      console.error("Error resetting filing:", error);
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "Failed to reset filing",
+        variant: "destructive",
+      });
+    } finally {
+      setIsResetting(null);
+    }
+  };
+
+  const handleClearBDC = async () => {
+    setIsClearing(true);
+    try {
+      const { data, error } = await supabase.functions.invoke("manage-data", {
+        body: { action: "clear_bdc", bdcId },
+      });
+
+      if (error) throw error;
+      if (!data.success) throw new Error(data.error);
+
+      toast({
+        title: "BDC Data Cleared",
+        description: data.message,
+      });
+
+      // Invalidate all related queries
+      queryClient.invalidateQueries({ queryKey: ["filings", bdcId] });
+      queryClient.invalidateQueries({ queryKey: ["holdings"] });
+      setSelectedFilingId(null);
+    } catch (error) {
+      console.error("Error clearing BDC data:", error);
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "Failed to clear BDC data",
+        variant: "destructive",
+      });
+    } finally {
+      setIsClearing(false);
+    }
+  };
+
   if (bdcLoading) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
@@ -287,22 +364,63 @@ const BdcDetail = () => {
           <>
             <div className="mb-6">
               <label className="text-sm font-medium mb-2 block">Select Filing Period</label>
-              <Select
-                value={selectedFilingId || undefined}
-                onValueChange={setSelectedFilingId}
-              >
-                <SelectTrigger className="w-full md:w-96 bg-card">
-                  <SelectValue placeholder="Select a filing period" />
-                </SelectTrigger>
-                <SelectContent className="bg-card">
-                  {filings.map((filing) => (
-                    <SelectItem key={filing.id} value={filing.id}>
-                      {formatDate(filing.period_end)} – {filing.filing_type}
-                      {filing.parsed_successfully ? " ✓" : " (Pending)"}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <div className="flex items-center gap-2">
+                <Select
+                  value={selectedFilingId || undefined}
+                  onValueChange={setSelectedFilingId}
+                >
+                  <SelectTrigger className="w-full md:w-96 bg-card">
+                    <SelectValue placeholder="Select a filing period" />
+                  </SelectTrigger>
+                  <SelectContent className="bg-card">
+                    {filings.map((filing) => (
+                      <SelectItem key={filing.id} value={filing.id}>
+                        {formatDate(filing.period_end)} – {filing.filing_type}
+                        {filing.parsed_successfully ? " ✓" : " (Pending)"}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                
+                {selectedFilingId && (
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <Button 
+                        variant="outline" 
+                        size="sm" 
+                        className="text-destructive border-destructive hover:bg-destructive hover:text-destructive-foreground"
+                        disabled={isResetting === selectedFilingId}
+                      >
+                        <RotateCcw className="mr-1 h-4 w-4" />
+                        {isResetting === selectedFilingId ? "Resetting..." : "Reset Filing"}
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle className="flex items-center gap-2">
+                          <AlertTriangle className="h-5 w-5 text-destructive" />
+                          Reset Filing Data
+                        </AlertDialogTitle>
+                        <AlertDialogDescription>
+                          This will permanently delete all holdings for this filing and reset its parsing status. 
+                          You will need to re-parse the filing to recover the data.
+                          <br /><br />
+                          <strong>This action cannot be undone.</strong>
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction 
+                          onClick={() => handleResetFiling(selectedFilingId)}
+                          className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                        >
+                          Reset Filing
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                )}
+              </div>
             </div>
 
             {holdingsLoading ? (
@@ -496,6 +614,65 @@ const BdcDetail = () => {
             )}
           </>
         )}
+
+        {/* Danger Zone */}
+        <Card className="mt-8 border-destructive/50">
+          <CardHeader>
+            <CardTitle className="text-destructive flex items-center gap-2">
+              <AlertTriangle className="h-5 w-5" />
+              Danger Zone
+            </CardTitle>
+            <CardDescription>
+              These actions are destructive and cannot be undone.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center justify-between p-4 border border-destructive/30 rounded-lg bg-destructive/5">
+              <div>
+                <p className="font-medium">Clear All Data for {bdc.ticker || bdc.bdc_name}</p>
+                <p className="text-sm text-muted-foreground">
+                  Delete all holdings and reset all filings for this BDC. You will need to re-parse all filings.
+                </p>
+              </div>
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button 
+                    variant="destructive" 
+                    disabled={isClearing}
+                  >
+                    <Trash2 className="mr-2 h-4 w-4" />
+                    {isClearing ? "Clearing..." : `Clear All ${bdc.ticker || "BDC"} Data`}
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle className="flex items-center gap-2">
+                      <AlertTriangle className="h-5 w-5 text-destructive" />
+                      Clear All BDC Data
+                    </AlertDialogTitle>
+                    <AlertDialogDescription>
+                      This will permanently delete <strong>all holdings</strong> for <strong>{bdc.bdc_name}</strong> across 
+                      all filing periods, and reset the parsing status of all filings.
+                      <br /><br />
+                      You will need to re-run the entire parsing history to recover this data.
+                      <br /><br />
+                      <strong className="text-destructive">This action cannot be undone.</strong>
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                    <AlertDialogAction 
+                      onClick={handleClearBDC}
+                      className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                    >
+                      Yes, Clear All Data
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </div>
+          </CardContent>
+        </Card>
       </div>
     </div>
   );
