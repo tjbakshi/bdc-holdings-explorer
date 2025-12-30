@@ -830,6 +830,10 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     // Track expected cell count for structure-based industry header detection
     let expectedCellCount = headerCells.length;
     
+    // Debug: Log first few rows to understand structure
+    let debugRowsLogged = 0;
+    const maxDebugRows = 15;
+    
     for (let i = headerRowIndex + 1; i < rowsToProcess; i++) {
       const row = rows[i] as Element;
       // Check for both td and th cells (industry headers may use th)
@@ -842,6 +846,14 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       
       // Get the first cell text (could be in first td or th)
       const firstCellText = cells[0]?.textContent?.trim() || "";
+      
+      // Debug logging for first few rows
+      if (debugRowsLogged < maxDebugRows && firstCellText) {
+        const cellTexts = cells.slice(0, 3).map(c => (c.textContent?.trim() || "").substring(0, 40));
+        const isExactMatch = isExactIndustryCategory(firstCellText);
+        console.log(`Row ${i - headerRowIndex}: cells=${cells.length}, exact_industry=${isExactMatch}, first="${firstCellText.substring(0, 50)}"`);
+        debugRowsLogged++;
+      }
       
       // Check if this is an industry section header FIRST (before company parsing)
       // Industry headers often have: only one cell, or first cell with colspan, or matching industry names
