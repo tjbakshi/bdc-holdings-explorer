@@ -1838,14 +1838,21 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
         colIndices.cost = position;
         console.log(`   Found 'cost' at row ${i}, col ${position}`);
       }
-      // Fair Value
-      else if ((text.includes('fair value') || text === 'fair') && colIndices.fairValue === -1) {
+      // Fair Value - check for common variations
+      else if ((text.includes('fair value') || text.includes('fairvalue') || 
+               (text.includes('fair') && !text.includes('unfair'))) && colIndices.fairValue === -1) {
         colIndices.fairValue = position;
-        console.log(`   Found 'fairValue' at row ${i}, col ${position}`);
+        console.log(`   Found 'fairValue' at row ${i}, col ${position}: "${text.slice(0, 30)}"`);
       }
       
       position += colspan;
     }
+  }
+  
+  // GBDC FALLBACK: If fair value not found but cost is, assume fair value is one column after cost
+  if (colIndices.fairValue === -1 && colIndices.cost >= 0) {
+    colIndices.fairValue = colIndices.cost + 1;
+    console.log(`   ⚠️ Fair value column not found, assuming col ${colIndices.fairValue} (after cost)`);
   }
   
   console.log(`   Column indices: company=${colIndices.company}, type=${colIndices.investmentType}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
