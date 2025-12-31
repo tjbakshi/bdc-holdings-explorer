@@ -327,7 +327,27 @@ serve(async (req) => {
     const indexUrl = `https://www.sec.gov/Archives/edgar/data/${cik.replace(/^0+/, "")}/${accNo}/index.json`;
     const indexRes = await fetch(indexUrl, { headers: { "User-Agent": SEC_USER_AGENT } });
     const indexJson = await indexRes.json();
-    const targetDoc = indexJson.directory.item.find((d: any) => d.name.endsWith(".htm"));
+    
+    // Find the main filing document - prefer ticker-based name, then largest .htm file
+    const htmDocs = indexJson.directory.item.filter((d: any) => 
+      d.name.endsWith(".htm") && !d.name.includes("-index")
+    );
+    
+    // Try to find doc with ticker in name (e.g. "obdc-20250930.htm")
+    const tickerLower = (ticker || "").toLowerCase();
+    let targetDoc = htmDocs.find((d: any) => d.name.toLowerCase().includes(tickerLower) && d.name.includes("-"));
+    
+    // Fallback to largest .htm file
+    if (!targetDoc) {
+      targetDoc = htmDocs.reduce((largest: any, doc: any) => {
+        const size = parseInt(doc.size) || 0;
+        const largestSize = parseInt(largest?.size) || 0;
+        return size > largestSize ? doc : largest;
+      }, htmDocs[0]);
+    }
+    
+    if (!targetDoc) throw new Error("No suitable HTM document found");
+    
     const docUrl = `https://www.sec.gov/Archives/edgar/data/${cik.replace(/^0+/, "")}/${accNo}/${targetDoc.name}`;
 
     console.log(`Stream-Reading: ${docUrl} [${ticker}]`);
@@ -376,6 +396,7 @@ serve(async (req) => {
     });
 
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: corsHeaders });
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return new Response(JSON.stringify({ error: errorMessage }), { status: 500, headers: corsHeaders });
   }
 });
