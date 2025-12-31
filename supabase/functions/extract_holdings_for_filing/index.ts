@@ -2289,33 +2289,35 @@ async function parseBXSLTableAndInsert(params: {
   }
   console.log(`   ✅ Found SOI at position ${soiStart} (match: "${soiMatch?.[0]}")`);
 
-  // BXSL: Extract and normalize the period date from the SOI section.
-  // Sanitize HTML and collapse whitespace to become "blind" to messy SEC markup.
+  // BXSL: Extract and normalize a DEFAULT period date from the SOI header.
+  // NOTE: This is only a fallback. The real period_date is detected per-table (see loop below).
   const soiHeaderSection = html.slice(soiStart, Math.min(soiStart + 3000, html.length));
-  const cleanText = soiHeaderSection
-    .replace(/<[^>]*>?/gm, " ")
-    .replace(/&nbsp;|&#160;|&#xA0;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const sanitizeToText = (rawText: string) =>
+    rawText
+      .replace(/<[^>]*>?/gm, " ")
+      .replace(/&nbsp;|&#160;|&#xA0;/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-  // Flexible date search for CURRENT YEAR (2025). Use first match only.
-  const bxslDateRe = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\s*,?\s+2025/i;
-  const dateMatch = bxslDateRe.exec(cleanText);
-  const targetPeriodDateText = dateMatch?.[0]?.trim() || null;
+  const extractPeriodDateISO = (rawText: string): string | null => {
+    const cleanText = sanitizeToText(rawText);
 
-  const normalizePeriodDateToISO = (input: string): string | null => {
-    // Accept variants like: "September 30, 2025" or "September 30 2025"
-    const m = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*,?\s+(\d{4})$/i.exec(
-      input.trim().replace(/\s+/g, " ")
+    // Month DD, YYYY (any year)
+    const dateRe = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\s*,\s*\d{4}/gi;
+    const matches = Array.from(cleanText.matchAll(dateRe));
+    if (matches.length === 0) return null;
+
+    // Use the LAST match in the snippet as it's usually closest to the table/header context.
+    const dateText = matches[matches.length - 1][0];
+
+    const m = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*,\s*(\d{4})$/i.exec(
+      dateText
     );
     if (!m) return null;
 
     const monthName = m[1].toLowerCase();
     const day = Number(m[2]);
     const year = Number(m[3]);
-
-    // BXSL requirement: strictly 2025
-    if (year !== 2025) return null;
 
     const monthMap: Record<string, number> = {
       january: 1,
@@ -2333,30 +2335,19 @@ async function parseBXSLTableAndInsert(params: {
     };
 
     const month = monthMap[monthName];
-    if (!month || !Number.isFinite(day)) return null;
+    if (!month || !Number.isFinite(day) || !Number.isFinite(year)) return null;
 
     const mm = String(month).padStart(2, "0");
     const dd = String(day).padStart(2, "0");
     return `${year}-${mm}-${dd}`;
   };
 
-  let periodDateISO: string | null = null;
-  if (targetPeriodDateText) {
-    periodDateISO = normalizePeriodDateToISO(targetPeriodDateText);
-  }
-
-  if (periodDateISO) {
-    console.log(`🔧 BXSL: Final Period Date set to ${periodDateISO}`);
+  const defaultPeriodDateISO = extractPeriodDateISO(soiHeaderSection);
+  if (defaultPeriodDateISO) {
+    console.log(`🔧 BXSL: Default Period Date (SOI header) = ${defaultPeriodDateISO}`);
   } else {
-    console.log(`❌ BXSL: Failed to find or format period date (2025).`);
+    console.log(`⚠️ BXSL: Could not detect default period date from SOI header.`);
   }
-
-  // Define prior period dates to skip (comparative tables)
-  const priorPeriodPatterns = [
-    /december\s+31,?\s+2024/i,
-    /as\s+of\s+december\s+31,?\s+2024/i,
-    /12\/31\/2024/i,
-  ];
 
   console.log(`🔍 STEP 3: Extracting post-SOI section...`);
   const MAX_SEARCH = 10_000_000; // 10MB to capture full BXSL SOI
@@ -2423,7 +2414,7 @@ async function parseBXSLTableAndInsert(params: {
       fair_value: toMillions(h.fair_value, scaleResult.scale),
       row_number: insertedCount + idx + 1,
       source_pos: h.source_pos ?? null,
-      period_date: h.period_date ?? periodDateISO,
+      period_date: h.period_date ?? defaultPeriodDateISO,
     }));
 
     const { error: insertError } = await supabaseClient.from("holdings").insert(rows as any);
@@ -2463,15 +2454,14 @@ async function parseBXSLTableAndInsert(params: {
 
     if (tableHtml.length < 15_000) continue;
 
-    // BXSL: Skip prior period comparative tables (December 31, 2024)
-    // Check the table and surrounding context for prior period dates
-    const tableContext = afterSoi.slice(Math.max(0, tableStartIdx - 500), tableStartIdx + 2000);
-    const isPriorPeriodTable = priorPeriodPatterns.some(pattern => pattern.test(tableContext));
-    
-    if (isPriorPeriodTable) {
-      console.log(`   ⏭️ Skipping prior period table (December 31, 2024) at index ${tableCount}`);
-      continue;
-    }
+    // BXSL: Determine a period date for THIS table.
+    // Look at the 2,000 characters immediately before the <table> tag.
+    const localHeaderRaw = afterSoi.slice(Math.max(0, tableStartIdx - 2000), tableStartIdx);
+    const tablePeriodDateISO = extractPeriodDateISO(localHeaderRaw) ?? defaultPeriodDateISO;
+
+    console.log(
+      `🔧 BXSL: Extraction started for table with header date: ${tablePeriodDateISO ?? "unknown"}`
+    );
 
     // Skip financial summary tables
     if (
@@ -2705,7 +2695,7 @@ async function parseBXSLTableAndInsert(params: {
         cost,
         fair_value: fairValue,
         source_pos: soiStart + tableStartIdx + i,
-        period_date: periodDateISO,
+        period_date: tablePeriodDateISO,
       });
       totalProcessedRows++;
 
@@ -2726,9 +2716,8 @@ async function parseBXSLTableAndInsert(params: {
 
   console.log(`\n🟣 BXSL STREAMING: Completed - inserted ${insertedCount} holdings from ${holdingsTableCount} tables (${totalProcessedRows} processed, ${totalRowsSkipped} skipped)`);
 
-  // Fallback warning if no current period data was found
-  if (insertedCount === 0 && targetPeriodDateText) {
-    console.log(`⚠️ BXSL: Current period table not found; check for date formatting variations.`);
+  if (insertedCount === 0) {
+    console.log(`⚠️ BXSL: No holdings inserted; check table detection/date extraction logs above.`);
   }
 
   if (insertedCount > 100) {
