@@ -279,47 +279,49 @@ const BdcDetail = () => {
     addLog(`Starting extraction for filing: ${filingLabel}`, "info");
 
     try {
-      const { data: extractData, error: extractError } = await supabase.functions.invoke(
-        "extract_holdings_for_filing",
-        {
-          body: { filingId },
-        }
-      );
+      let totalHoldings = 0;
+      let chunkCount = 0;
+      let status = "partial";
 
-      if (extractError) {
-        // For large filings the browser request can time out even if the backend keeps working.
-        addLog(`⚠ Extraction request timed out: ${extractError.message}`, "warning");
-        toast({
-          title: "Extraction Running",
-          description: "This filing is large; extraction may still be processing. Checking for results...",
-        });
+      // Keep calling until complete (chunked processing for large files)
+      while (status === "partial") {
+        chunkCount++;
+        addLog(`Processing chunk ${chunkCount}...`, "info");
 
-        const count = await waitForHoldings(filingId);
-        queryClient.invalidateQueries({ queryKey: ["holdings", filingId] });
+        const { data: extractData, error: extractError } = await supabase.functions.invoke(
+          "extract_holdings_for_filing",
+          { body: { filingId } }
+        );
 
-        if (count > 0) {
-          addLog(`✓ Extraction complete: ${count} holdings found`, "success");
-          toast({
-            title: "Extraction Complete",
-            description: `Loaded ${count} holdings.`,
-          });
-        } else {
-          addLog("✗ No holdings found yet. Try again in a moment.", "error");
-          toast({
-            title: "No holdings yet",
-            description: "Extraction may have failed or is still running. Try 'Run Parser' again.",
-            variant: "destructive",
-          });
+        if (extractError) {
+          addLog(`⚠ Extraction error: ${extractError.message}`, "warning");
+          // Wait and check if holdings exist anyway
+          await sleep(2000);
+          break;
         }
 
-        return;
+        totalHoldings += extractData?.count || 0;
+        status = extractData?.status || "complete";
+        const progress = extractData?.progress || 100;
+
+        addLog(`Chunk ${chunkCount}: ${extractData?.count || 0} holdings (${progress}% complete)`, "info");
+
+        // If still partial, brief pause before next chunk
+        if (status === "partial") {
+          await sleep(500);
+        }
       }
 
-      const holdingsInserted = extractData?.holdingsInserted ?? extractData?.holdingsCount;
-      addLog(`✓ Extraction complete${holdingsInserted != null ? `: ${holdingsInserted} holdings` : ''}`, "success");
+      // Final count check
+      const { count: finalCount } = await supabase
+        .from("holdings")
+        .select("id", { count: "exact", head: true })
+        .eq("filing_id", filingId);
+
+      addLog(`✓ Extraction complete: ${finalCount || totalHoldings} holdings found`, "success");
       toast({
         title: "Extraction Complete",
-        description: "Holdings have been extracted successfully.",
+        description: `Loaded ${finalCount || totalHoldings} holdings.`,
       });
 
       queryClient.invalidateQueries({ queryKey: ["filings", bdcId] });
@@ -362,54 +364,54 @@ const BdcDetail = () => {
         description: "Holdings deleted. Now re-extracting data...",
       });
 
-      // Step 2: Re-extract holdings for the filing
+      // Step 2: Re-extract holdings (chunked for large files)
       setResetProgress('extracting');
       addLog(`Step 2: Extracting holdings for ${bdc?.ticker || 'BDC'}...`, "info");
 
-      const { data: extractData, error: extractError } = await supabase.functions.invoke(
-        "extract_holdings_for_filing",
-        {
-          body: { filingId },
+      let totalHoldings = 0;
+      let chunkCount = 0;
+      let status = "partial";
+
+      while (status === "partial") {
+        chunkCount++;
+        addLog(`Processing chunk ${chunkCount}...`, "info");
+
+        const { data: extractData, error: extractError } = await supabase.functions.invoke(
+          "extract_holdings_for_filing",
+          { body: { filingId } }
+        );
+
+        if (extractError) {
+          addLog(`⚠ Extraction error: ${extractError.message}`, "warning");
+          await sleep(2000);
+          break;
         }
-      );
 
-      if (extractError) {
-        // For large filings the browser request can time out even if the backend keeps working.
-        console.error("Extract error:", extractError);
-        addLog(`⚠ Extraction request timed out: ${extractError.message}`, "warning");
-        toast({
-          title: "Extraction Running",
-          description: "This filing is large; extraction may still be processing. Checking for results...",
-        });
+        totalHoldings += extractData?.count || 0;
+        status = extractData?.status || "complete";
+        const progress = extractData?.progress || 100;
 
-        const count = await waitForHoldings(filingId);
+        addLog(`Chunk ${chunkCount}: ${extractData?.count || 0} holdings (${progress}% complete)`, "info");
 
-        if (count > 0) {
-          setResetProgress('done');
-          addLog(`✓ Extraction complete: ${count} holdings found`, "success");
-          toast({
-            title: "Filing Re-Parsed",
-            description: `Loaded ${count} holdings.`,
-          });
-        } else {
-          addLog("✗ No holdings found yet. Try 'Run Parser' again.", "error");
-          toast({
-            title: "No holdings yet",
-            description: "Extraction may have failed or is still running. Try 'Run Parser' again.",
-            variant: "destructive",
-          });
+        if (status === "partial") {
+          await sleep(500);
         }
-      } else {
-        setResetProgress('done');
-        const holdingsInserted = extractData?.holdingsInserted ?? extractData?.holdingsCount;
-        addLog(`✓ Extraction complete${holdingsInserted != null ? `: ${holdingsInserted} holdings` : ''}`, "success");
-        toast({
-          title: "Filing Re-Parsed",
-          description: "Holdings have been re-extracted successfully.",
-        });
       }
 
-      // Invalidate queries to refresh the UI
+      setResetProgress('done');
+
+      // Final count
+      const { count: finalCount } = await supabase
+        .from("holdings")
+        .select("id", { count: "exact", head: true })
+        .eq("filing_id", filingId);
+
+      addLog(`✓ Extraction complete: ${finalCount || totalHoldings} holdings found`, "success");
+      toast({
+        title: "Filing Re-Parsed",
+        description: `Loaded ${finalCount || totalHoldings} holdings.`,
+      });
+
       queryClient.invalidateQueries({ queryKey: ["filings", bdcId] });
       queryClient.invalidateQueries({ queryKey: ["holdings", filingId] });
       addLog("UI refreshed with new data", "info");

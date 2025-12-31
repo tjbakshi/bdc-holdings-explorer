@@ -8,8 +8,11 @@ const corsHeaders = {
 
 const SEC_USER_AGENT = "BDCTrackerApp/1.0 (contact@bdctracker.com)";
 
+// Max bytes to process before returning (edge functions have ~2s CPU limit)
+const MAX_BYTES_PER_RUN = 800_000; // ~800KB per run to stay under limits
+
 // ======================================================================
-// 1. HELPERS
+// HELPERS
 // ======================================================================
 
 function cleanNumeric(value: string | null | undefined): number | null {
@@ -69,10 +72,10 @@ function extractCellsWithColspan(rowHtml: string): string[] {
 }
 
 // ======================================================================
-// 2. PARSING LOGIC - STREAMLINED FOR MEMORY EFFICIENCY
+// PARSING LOGIC
 // ======================================================================
 
-function parseSingleRow_Generic(rowHtml: string, state: any): any | null {
+function parseSingleRow(rowHtml: string, state: any): any | null {
   const cells = extractCellsWithColspan(rowHtml);
   if (cells.length < 3) return null;
 
@@ -101,60 +104,8 @@ function parseSingleRow_Generic(rowHtml: string, state: any): any | null {
   };
 }
 
-// Unified line processor - handles all BDC types
-function processLine(line: string, state: any): any | null {
-  const lower = line.toLowerCase();
-
-  // 1. Detect Scale (check early)
-  if (!state.scaleDetected) {
-    if (lower.includes("(in millions)") || lower.includes("amounts in millions")) {
-      state.scale = 1;
-      state.scaleDetected = true;
-    } else if (lower.includes("in thousands") || lower.includes("amounts in thousands")) {
-      state.scale = 0.001;
-      state.scaleDetected = true;
-    }
-  }
-
-  // 2. Start Detection - Enter SOI section
-  if (!state.inSOI) {
-    if (lower.includes("schedule of investments")) {
-      state.inSOI = true;
-      console.log("✅ Entered Schedule of Investments");
-    }
-    return null;
-  }
-
-  // 3. Stop Detection - Exit SOI section (CRITICAL for memory)
-  if (lower.includes("notes to consolidated") || 
-      lower.includes("notes to financial") ||
-      lower.includes("the accompanying notes are an integral part")) {
-    state.done = true;
-    console.log("✅ Exiting Schedule of Investments - stopping parse");
-    return null;
-  }
-
-  // 4. Row Capture (minimal memory usage)
-  if (line.includes("<tr")) {
-    state.inRow = true;
-    state.currentRow = "";
-  }
-
-  if (state.inRow) {
-    state.currentRow += line;
-    if (line.includes("</tr>")) {
-      state.inRow = false;
-      const row = state.currentRow;
-      state.currentRow = ""; // Clear immediately
-      return parseSingleRow_Generic(row, state);
-    }
-  }
-  
-  return null;
-}
-
 // ======================================================================
-// 3. MAIN HANDLER - OPTIMIZED FOR MEMORY
+// MAIN HANDLER - CHUNKED PROCESSING
 // ======================================================================
 
 serve(async (req) => {
@@ -170,9 +121,13 @@ serve(async (req) => {
     );
 
     const { data: filing } = await supabaseClient.from("filings").select("*, bdcs(*)").eq("id", filingId).single();
+    if (!filing) throw new Error("Filing not found");
+
     const { cik, ticker } = filing.bdcs;
     const accNo = filing.sec_accession_no.replace(/-/g, "");
+    const startOffset = filing.current_byte_offset || 0;
     
+    // Get file info
     const indexUrl = `https://www.sec.gov/Archives/edgar/data/${cik.replace(/^0+/, "")}/${accNo}/index.json`;
     const indexRes = await fetch(indexUrl, { headers: { "User-Agent": SEC_USER_AGENT } });
     const indexJson = await indexRes.json();
@@ -194,90 +149,112 @@ serve(async (req) => {
     
     if (!targetDoc) throw new Error("No suitable HTM document found");
     
+    const totalSize = parseInt(targetDoc.size) || 0;
     const docUrl = `https://www.sec.gov/Archives/edgar/data/${cik.replace(/^0+/, "")}/${accNo}/${targetDoc.name}`;
 
-    console.log(`Stream-Reading: ${docUrl} [${ticker}]`);
-    const response = await fetch(docUrl, { headers: { "User-Agent": SEC_USER_AGENT } });
+    console.log(`Chunk-Reading: ${docUrl} [${ticker}] from offset ${startOffset}`);
+    
+    // Use Range header to fetch only a chunk
+    const endOffset = Math.min(startOffset + MAX_BYTES_PER_RUN, totalSize);
+    const response = await fetch(docUrl, { 
+      headers: { 
+        "User-Agent": SEC_USER_AGENT,
+        "Range": `bytes=${startOffset}-${endOffset}`
+      } 
+    });
 
     if (!response.body) throw new Error("No body");
-
-    // MEMORY-EFFICIENT: Process line-by-line without buffering entire file
-    const decoder = new TextDecoder();
-    const reader = response.body.getReader();
     
+    const chunk = await response.text();
+    console.log(`Fetched ${chunk.length} bytes`);
+    
+    // Restore state from filing record
+    const currentIndustryState = filing.current_industry_state;
     const state = { 
-      inSOI: false, 
+      inSOI: startOffset > 0, // If resuming, assume we're in SOI
       done: false, 
       scale: 0.001, 
       scaleDetected: false, 
       inRow: false, 
       currentRow: "", 
-      rowCount: 0 
+      rowCount: 0,
+      currentIndustry: currentIndustryState || null
     };
     
-    let batch: any[] = [];
-    let totalInserted = 0;
-    let buffer = "";
-    let linesProcessed = 0;
-
-    while (!state.done) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      
-      // Process complete lines only
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || ""; // Keep incomplete last line in buffer
-      
-      for (const line of lines) {
-        linesProcessed++;
-        
-        // Quick skip for lines that can't contain data
-        if (line.length < 5) continue;
-        
-        const result = processLine(line, state);
-        
-        if (result) {
-          batch.push({ ...result, filing_id: filingId });
-        }
-
-        // Flush batch periodically
-        if (batch.length >= 50) {
-          await supabaseClient.from("holdings").insert(batch);
-          totalInserted += batch.length;
-          console.log(`Inserted ${totalInserted} holdings...`);
-          batch = [];
-        }
-
-        // Break early if done
-        if (state.done) break;
-      }
+    // Detect scale
+    const lowerChunk = chunk.toLowerCase();
+    if (lowerChunk.includes("(in millions)") || lowerChunk.includes("amounts in millions")) {
+      state.scale = 1;
+      state.scaleDetected = true;
+    } else if (lowerChunk.includes("in thousands") || lowerChunk.includes("amounts in thousands")) {
+      state.scale = 0.001;
+      state.scaleDetected = true;
     }
-
-    // Process any remaining buffer
-    if (buffer.length > 0 && !state.done) {
-      const result = processLine(buffer, state);
+    
+    // Check for SOI start
+    if (!state.inSOI && lowerChunk.includes("schedule of investments")) {
+      state.inSOI = true;
+      console.log("✅ Found Schedule of Investments");
+    }
+    
+    // Check for SOI end
+    if (lowerChunk.includes("notes to consolidated") || 
+        lowerChunk.includes("notes to financial") ||
+        lowerChunk.includes("the accompanying notes are an integral part")) {
+      state.done = true;
+      console.log("✅ Found end of Schedule of Investments");
+    }
+    
+    // Parse rows from chunk
+    const batch: any[] = [];
+    const rowMatches = chunk.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi);
+    
+    for (const match of rowMatches) {
+      if (!state.inSOI) continue;
+      
+      const rowHtml = match[0];
+      const result = parseSingleRow(rowHtml, state);
+      
       if (result) {
         batch.push({ ...result, filing_id: filingId });
       }
     }
-
-    // Final batch insert
+    
+    // Insert holdings
+    let totalInserted = 0;
     if (batch.length > 0) {
-      await supabaseClient.from("holdings").insert(batch);
-      totalInserted += batch.length;
+      const { error } = await supabaseClient.from("holdings").insert(batch);
+      if (error) {
+        console.error("Insert error:", error.message);
+      } else {
+        totalInserted = batch.length;
+        console.log(`Inserted ${totalInserted} holdings`);
+      }
     }
-
-    // Update filing status
+    
+    // Determine if we're done or need another chunk
+    const isComplete = state.done || endOffset >= totalSize;
+    const nextOffset = isComplete ? 0 : endOffset;
+    
+    // Update filing with progress
     await supabaseClient.from("filings").update({ 
-      parsed_successfully: totalInserted > 0,
+      current_byte_offset: nextOffset,
+      total_file_size: totalSize,
+      current_industry_state: state.currentIndustry,
+      parsed_successfully: isComplete && totalInserted > 0,
       data_source: 'edge-parser'
     }).eq("id", filingId);
+    
+    const status = isComplete ? "complete" : "partial";
+    console.log(`✅ ${status}: ${totalInserted} holdings, offset ${startOffset}->${nextOffset}/${totalSize}`);
 
-    console.log(`✅ Complete: ${totalInserted} holdings from ${linesProcessed} lines`);
-
-    return new Response(JSON.stringify({ success: true, count: totalInserted }), {
+    return new Response(JSON.stringify({ 
+      success: true, 
+      status,
+      count: totalInserted,
+      nextOffset: isComplete ? null : nextOffset,
+      progress: Math.round((endOffset / totalSize) * 100)
+    }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" }
     });
 
