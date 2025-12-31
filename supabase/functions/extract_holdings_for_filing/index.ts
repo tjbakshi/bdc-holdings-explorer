@@ -1936,11 +1936,10 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
         console.log(`   DEBUG T${tableIdx}R${i}: [${cellsPreview.join(' | ')}]`);
       }
       // GBDC Industry Detection Strategy:
-      // 1. Check the FIRST physical cell (column 0) - this is where GBDC puts industry names
-      // 2. Industry names match GICS industry classification
-      // 3. Industry header rows have the industry name ONLY in column 0, other cells are empty or contain just the industry name
-      
-      const firstPhysicalCellText = cells[0]?.textContent?.trim() || '';
+      // GBDC tables have cell[0] empty, and text content starts in cell[1]
+      // Check cell[1] for industry names (not cell[0])
+      const firstContentCellText = (cells[1]?.textContent?.trim() || cells[0]?.textContent?.trim() || '');
+      const firstPhysicalCellText = firstContentCellText;
       
       // GICS Industry names that appear in GBDC SOIs (comprehensive list)
       const gicsIndustries = new Set([
