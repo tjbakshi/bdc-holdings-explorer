@@ -1755,6 +1755,20 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
   let totalProcessedRows = 0;
   let totalRowsSkipped = 0;
   
+  // CRITICAL: Persist column indices from first table (continuation tables may not have headers)
+  let savedColIndices = {
+    company: 0,
+    investmentType: -1,
+    industry: -1,
+    interestRate: -1,
+    spread: -1,
+    maturity: -1,
+    par: -1,
+    cost: -1,
+    fairValue: -1,
+  };
+  let hasFoundFirstTable = false;
+  
   for (let tableIdx = 0; tableIdx < holdingsTables.length; tableIdx++) {
     const holdingsTableHtml = holdingsTables[tableIdx];
     console.log(`\n🔍 STEP 5.${tableIdx + 1}: Parsing holdings table ${tableIdx + 1}/${holdingsTables.length} (${(holdingsTableHtml.length / 1024).toFixed(0)} KB)...`);
@@ -1781,75 +1795,72 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
     const rows = Array.from(table.querySelectorAll('tr')) as Element[];
     console.log(`   Found ${rows.length} rows in table ${tableIdx + 1}`);
     
-    // MULTI-ROW HEADER DETECTION - Scan first 5 rows for column headers
-    let colIndices = {
-      company: 0,        // Default to column 0 if not found
-      investmentType: -1,
-      industry: -1,
-      interestRate: -1,
-      spread: -1,
-      maturity: -1,
-      par: -1,
-      cost: -1,
-      fairValue: -1,
-    };
+    // For first table: detect column headers. For continuation tables: reuse saved indices.
+    let colIndices = { ...savedColIndices };
     
-    // Scan first 5 rows to find all column headers (GBDC uses multi-row headers)
-    for (let i = 0; i < Math.min(5, rows.length); i++) {
-      const cells = Array.from(rows[i].querySelectorAll('th, td')) as Element[];
-      let position = 0;
-      
-      for (const cell of cells) {
-        const text = (cell.textContent?.toLowerCase() || '').replace(/\s+/g, ' ').trim();
-        const colspan = parseInt(cell.getAttribute('colspan') || '1', 10);
+    // Only scan for headers in first table or if we haven't found good indices yet
+    if (!hasFoundFirstTable) {
+      // Scan first 5 rows to find all column headers (GBDC uses multi-row headers)
+      for (let i = 0; i < Math.min(5, rows.length); i++) {
+        const cells = Array.from(rows[i].querySelectorAll('th, td')) as Element[];
+        let position = 0;
         
-        // Company/Portfolio column
-        if ((text.includes('portfolio company') || text.includes('borrower') || text.includes('investment')) 
-            && !text.includes('type') && colIndices.company === 0) {
-          colIndices.company = position;
+        for (const cell of cells) {
+          const text = (cell.textContent?.toLowerCase() || '').replace(/\s+/g, ' ').trim();
+          const colspan = parseInt(cell.getAttribute('colspan') || '1', 10);
+          
+          // Company/Portfolio column
+          if ((text.includes('portfolio company') || text.includes('borrower') || text.includes('investment')) 
+              && !text.includes('type') && colIndices.company === 0) {
+            colIndices.company = position;
+          }
+          // Investment Type
+          else if ((text.includes('investment type') || text.includes('type of investment')) && colIndices.investmentType === -1) {
+            colIndices.investmentType = position;
+          }
+          // Industry
+          else if ((text.includes('industry') || text.includes('sector')) && colIndices.industry === -1) {
+            colIndices.industry = position;
+          }
+          // Interest Rate
+          else if ((text.includes('interest rate') || text.includes('coupon') || 
+                   (text.includes('rate') && !text.includes('spread'))) && colIndices.interestRate === -1) {
+            colIndices.interestRate = position;
+          }
+          // Spread
+          else if (text.includes('spread') && colIndices.spread === -1) {
+            colIndices.spread = position;
+          }
+          // Maturity
+          else if (text.includes('maturity') && colIndices.maturity === -1) {
+            colIndices.maturity = position;
+          }
+          // Par/Principal
+          else if ((text.includes('principal') || text.includes('par')) && colIndices.par === -1) {
+            colIndices.par = position;
+          }
+          // Cost
+          else if ((text.includes('cost') || text.includes('amortized')) && colIndices.cost === -1) {
+            colIndices.cost = position;
+          }
+          // Fair Value
+          else if ((text.includes('fair value') || text.includes('fairvalue') || 
+                   (text.includes('fair') && !text.includes('unfair'))) && colIndices.fairValue === -1) {
+            colIndices.fairValue = position;
+          }
+          
+          position += colspan;
         }
-        // Investment Type
-        else if ((text.includes('investment type') || text.includes('type of investment')) && colIndices.investmentType === -1) {
-          colIndices.investmentType = position;
-        }
-        // Industry
-        else if ((text.includes('industry') || text.includes('sector')) && colIndices.industry === -1) {
-          colIndices.industry = position;
-        }
-        // Interest Rate
-        else if ((text.includes('interest rate') || text.includes('coupon') || 
-                 (text.includes('rate') && !text.includes('spread'))) && colIndices.interestRate === -1) {
-          colIndices.interestRate = position;
-        }
-        // Spread
-        else if (text.includes('spread') && colIndices.spread === -1) {
-          colIndices.spread = position;
-        }
-        // Maturity
-        else if (text.includes('maturity') && colIndices.maturity === -1) {
-          colIndices.maturity = position;
-        }
-        // Par/Principal
-        else if ((text.includes('principal') || text.includes('par')) && colIndices.par === -1) {
-          colIndices.par = position;
-        }
-        // Cost
-        else if ((text.includes('cost') || text.includes('amortized')) && colIndices.cost === -1) {
-          colIndices.cost = position;
-        }
-        // Fair Value
-        else if ((text.includes('fair value') || text.includes('fairvalue') || 
-                 (text.includes('fair') && !text.includes('unfair'))) && colIndices.fairValue === -1) {
-          colIndices.fairValue = position;
-        }
-        
-        position += colspan;
       }
-    }
-    
-    // GBDC FALLBACK: If fair value not found but cost is, assume fair value is one column after cost
-    if (colIndices.fairValue === -1 && colIndices.cost >= 0) {
-      colIndices.fairValue = colIndices.cost + 1;
+      
+      // GBDC FALLBACK: If fair value not found but cost is, assume fair value is one column after cost
+      if (colIndices.fairValue === -1 && colIndices.cost >= 0) {
+        colIndices.fairValue = colIndices.cost + 1;
+      }
+      
+      // Save column indices for continuation tables
+      savedColIndices = { ...colIndices };
+      hasFoundFirstTable = true;
     }
     
     // Log column indices for debugging
