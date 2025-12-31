@@ -1798,6 +1798,7 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       if (colIndices.fairValue === -1 && colIndices.cost >= 0) colIndices.fairValue = colIndices.cost + 1;
       savedColIndices = { ...colIndices };
       hasFoundFirstTable = true;
+      console.log(`   📋 Column indices: company=${colIndices.company}, investmentType=${colIndices.investmentType}, interestRate=${colIndices.interestRate}, spread=${colIndices.spread}, maturity=${colIndices.maturity}, par=${colIndices.par}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
     }
     colIndices.industry = -1;
     
