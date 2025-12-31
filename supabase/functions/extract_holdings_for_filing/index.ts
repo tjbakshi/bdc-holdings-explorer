@@ -3020,7 +3020,7 @@ async function parseOBDCTableAndInsert(params: {
   const tableEndRe = /<\/table\s*>/ig;
 
   const MAX_TABLES = 150;
-  const MAX_HOLDINGS = 2500;
+  const MAX_HOLDINGS = 5000;  // OBDC can have many holdings
   const INSERT_BATCH = 250;
 
   // Always start clean for this filing
@@ -3121,7 +3121,8 @@ async function parseOBDCTableAndInsert(params: {
       console.log(`   Table ${tableCount}: ${tableSizeKB.toFixed(0)} KB`);
     }
 
-    if (tableHtml.length < 10_000) continue;
+    // OBDC tables can be smaller than other BDCs
+    if (tableHtml.length < 5_000) continue;
 
     // Determine period date for this table
     const localHeaderRaw = afterSoi.slice(Math.max(0, tableStartIdx - 2000), tableStartIdx);
@@ -3175,43 +3176,55 @@ async function parseOBDCTableAndInsert(params: {
           const text = (cell.textContent?.toLowerCase() || "").replace(/\s+/g, " ").trim();
           const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
 
-          // OBDC-specific: 'Company' for company column
-          if ((text.includes("company") && !text.includes("type")) && colIndices.company === 0) {
+          // OBDC-specific: 'Company' for company column (first column)
+          if (text.includes("company") && !text.includes("type") && !text.includes("portfolio") && colIndices.company === 0) {
             colIndices.company = position;
+            console.log(`   🔍 OBDC: Found Company column at position ${position}`);
           }
-          // Industry column
+          // Industry column (not typically in OBDC main table)
           else if ((text.includes("industry") || text.includes("sector")) && colIndices.industry === -1) {
             colIndices.industry = position;
           }
-          // Investment type
-          else if ((text.includes("investment") && !text.includes("schedule")) && colIndices.investmentType === -1) {
+          // Investment type column (second column in OBDC)
+          else if (text.includes("investment") && !text.includes("schedule") && !text.includes("interest") && colIndices.investmentType === -1) {
             colIndices.investmentType = position;
+            console.log(`   🔍 OBDC: Found Investment Type column at position ${position}`);
           }
           // OBDC: Interest rate has 3 parts: Ref. Rate, Cash, PIK
-          else if ((text.includes("ref") && text.includes("rate")) && colIndices.refRate === -1) {
+          // "Ref. Rate" or "Reference Rate"
+          else if ((text.includes("ref") || text.includes("reference")) && text.includes("rate") && colIndices.refRate === -1) {
             colIndices.refRate = position;
+            console.log(`   🔍 OBDC: Found Ref. Rate column at position ${position}`);
           }
-          else if (text === "cash" && colIndices.cashRate === -1) {
+          // "Cash" column
+          else if ((text === "cash" || text.includes("cash rate")) && colIndices.cashRate === -1) {
             colIndices.cashRate = position;
+            console.log(`   🔍 OBDC: Found Cash column at position ${position}`);
           }
-          else if (text === "pik" && colIndices.pikRate === -1) {
+          // "PIK" column
+          else if ((text === "pik" || text.includes("pik rate")) && colIndices.pikRate === -1) {
             colIndices.pikRate = position;
+            console.log(`   🔍 OBDC: Found PIK column at position ${position}`);
           }
-          // Maturity
-          else if (text.includes("maturity") && colIndices.maturity === -1) {
+          // Maturity Date
+          else if ((text.includes("maturity") && text.includes("date")) && colIndices.maturity === -1) {
             colIndices.maturity = position;
+            console.log(`   🔍 OBDC: Found Maturity Date column at position ${position}`);
           }
           // Par/Units
-          else if ((text.includes("par") || text.includes("units")) && colIndices.par === -1) {
+          else if ((text.includes("par") || text.includes("units")) && !text.includes("fair") && colIndices.par === -1) {
             colIndices.par = position;
+            console.log(`   🔍 OBDC: Found Par/Units column at position ${position}`);
           }
-          // Cost
-          else if ((text.includes("cost") || text.includes("amortized")) && colIndices.cost === -1) {
+          // Amortized Cost
+          else if ((text.includes("cost") || text.includes("amortized")) && !text.includes("fair") && colIndices.cost === -1) {
             colIndices.cost = position;
+            console.log(`   🔍 OBDC: Found Cost column at position ${position}`);
           }
           // Fair Value
-          else if ((text.includes("fair value") || (text.includes("fair") && !text.includes("unfair"))) && colIndices.fairValue === -1) {
+          else if ((text.includes("fair value") || text.includes("fair")) && !text.includes("unfair") && colIndices.fairValue === -1) {
             colIndices.fairValue = position;
+            console.log(`   🔍 OBDC: Found Fair Value column at position ${position}`);
           }
           position += colspan;
         }
@@ -3270,18 +3283,30 @@ async function parseOBDCTableAndInsert(params: {
         continue;
       }
 
-      // Check for industry header row (OBDC has industry groupings like "Chemicals")
+      // Check for industry header row (OBDC has industry groupings like "Chemicals", "Consumer products")
+      // Industry headers typically have no fair value or cost data
+      const isLikelyIndustryHeader = cells.length <= 3 &&
+                                     cleanedName.length > 3 &&
+                                     !/(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd\.|Co\.)/i.test(cleanedName) &&
+                                     !rowText.match(/\d{1,2}\/\d{4}|\d{4}/); // No dates
+
+      if (isLikelyIndustryHeader) {
+        // Check if this row has any numeric values (if it does, it's probably not just an industry header)
+        const hasNumbers = /\d{1,3}[,\d]*/.test(rowText);
+        if (!hasNumbers) {
+          currentIndustry = cleanedName;
+          console.log(`   🏷️ OBDC: Industry header detected: "${currentIndustry}"`);
+          continue;
+        }
+      }
+
+      // Also check dedicated industry column if available
       if (colIndices.industry >= 0) {
         const industryCell = getCellAtPos(colIndices.industry);
         const industryText = industryCell?.textContent?.trim();
-        if (industryText && industryText.length > 3 && industryText.length < 100) {
+        if (industryText && industryText.length > 3 && industryText.length < 100 && !/(LLC|Inc\.|Corp\.)/i.test(industryText)) {
           currentIndustry = industryText;
         }
-      }
-      // Also check if this is an industry header row (single bold text row)
-      if (cells.length <= 2 && cleanedName.length > 3 && !/(LLC|Inc\.|Corp\.)/i.test(cleanedName)) {
-        currentIndustry = cleanedName;
-        continue;
       }
 
       const fairValueCell = colIndices.fairValue >= 0 ? getCellAtPos(colIndices.fairValue) : null;
@@ -3379,9 +3404,14 @@ async function parseOBDCTableAndInsert(params: {
   await flush();
 
   console.log(`\n🦉 OBDC STREAMING: Completed - inserted ${insertedCount} holdings from ${holdingsTableCount} tables (${totalProcessedRows} processed, ${totalRowsSkipped} skipped)`);
+  console.log(`   📊 OBDC Stats: Processed ${totalProcessedRows} rows, Skipped ${totalRowsSkipped} rows, Inserted ${insertedCount} unique holdings`);
 
   if (insertedCount === 0) {
     console.log(`⚠️ OBDC: No holdings inserted; check table detection/column mapping logs above.`);
+  }
+
+  if (totalRowsSkipped > totalProcessedRows * 2) {
+    console.log(`⚠️ OBDC: High skip rate (${totalRowsSkipped} skipped vs ${totalProcessedRows} processed) - check column indices and parsing logic`);
   }
 
   if (insertedCount > 100) {
