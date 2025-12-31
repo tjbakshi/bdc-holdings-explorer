@@ -35,6 +35,8 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { useToast } from "@/hooks/use-toast";
+import { useLogs } from "@/contexts/LogContext";
+import { LogViewer } from "@/components/LogViewer";
 import * as XLSX from "xlsx";
 
 const BdcDetail = () => {
@@ -46,6 +48,7 @@ const BdcDetail = () => {
   const [isClearing, setIsClearing] = useState(false);
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const { addLog } = useLogs();
 
   // Fetch BDC info
   const { data: bdc, isLoading: bdcLoading } = useQuery({
@@ -234,8 +237,15 @@ const BdcDetail = () => {
   const handleResetFiling = async (filingId: string) => {
     setIsResetting(filingId);
     setResetProgress('resetting');
+    
+    const selectedFiling = filings?.find(f => f.id === filingId);
+    const filingLabel = selectedFiling ? formatDate(selectedFiling.period_end) : filingId;
+    
+    addLog(`Starting reset for filing: ${filingLabel}`, "info");
+    
     try {
       // Step 1: Reset the filing (delete holdings and reset status)
+      addLog("Step 1: Deleting existing holdings...", "info");
       const { data, error } = await supabase.functions.invoke("manage-data", {
         body: { action: "reset_filing", filingId },
       });
@@ -243,6 +253,7 @@ const BdcDetail = () => {
       if (error) throw error;
       if (!data.success) throw new Error(data.error);
 
+      addLog("✓ Holdings deleted successfully", "success");
       toast({
         title: "Filing Reset",
         description: "Holdings deleted. Now re-extracting data...",
@@ -250,18 +261,32 @@ const BdcDetail = () => {
 
       // Step 2: Re-extract holdings for the filing
       setResetProgress('extracting');
+      addLog(`Step 2: Extracting holdings for ${bdc?.ticker || 'BDC'}...`, "info");
+      addLog("Fetching SEC filing document...", "info");
+      
       const { data: extractData, error: extractError } = await supabase.functions.invoke("extract_holdings_for_filing", {
         body: { filingId },
       });
 
       if (extractError) {
         console.error("Extract error:", extractError);
+        addLog(`⚠ Extraction may be processing in background: ${extractError.message}`, "warning");
         toast({
           title: "Extraction Started",
           description: "Reset complete. Extraction may still be processing in the background.",
         });
       } else {
         setResetProgress('done');
+        const holdingsCount = extractData?.holdingsCount || 0;
+        addLog(`✓ Extraction complete: ${holdingsCount} holdings found`, "success");
+        
+        // Log additional details if available
+        if (extractData?.logs && Array.isArray(extractData.logs)) {
+          extractData.logs.forEach((log: string) => {
+            addLog(log, "info");
+          });
+        }
+        
         toast({
           title: "Filing Re-Parsed",
           description: extractData?.message || "Holdings have been re-extracted successfully.",
@@ -271,11 +296,14 @@ const BdcDetail = () => {
       // Invalidate queries to refresh the UI
       queryClient.invalidateQueries({ queryKey: ["filings", bdcId] });
       queryClient.invalidateQueries({ queryKey: ["holdings", filingId] });
+      addLog("UI refreshed with new data", "info");
     } catch (error) {
       console.error("Error resetting filing:", error);
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      addLog(`✗ Error: ${errorMsg}`, "error");
       toast({
         title: "Error",
-        description: error instanceof Error ? error.message : "Failed to reset filing",
+        description: errorMsg,
         variant: "destructive",
       });
     } finally {
@@ -286,7 +314,10 @@ const BdcDetail = () => {
 
   const handleClearBDC = async () => {
     setIsClearing(true);
+    addLog(`Starting full data clear for ${bdc?.ticker || bdc?.bdc_name}...`, "warning");
+    
     try {
+      addLog("Deleting all holdings and resetting filings...", "info");
       const { data, error } = await supabase.functions.invoke("manage-data", {
         body: { action: "clear_bdc", bdcId },
       });
@@ -294,6 +325,7 @@ const BdcDetail = () => {
       if (error) throw error;
       if (!data.success) throw new Error(data.error);
 
+      addLog(`✓ All data cleared: ${data.message}`, "success");
       toast({
         title: "BDC Data Cleared",
         description: data.message,
@@ -305,9 +337,11 @@ const BdcDetail = () => {
       setSelectedFilingId(null);
     } catch (error) {
       console.error("Error clearing BDC data:", error);
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      addLog(`✗ Error clearing data: ${errorMsg}`, "error");
       toast({
         title: "Error",
-        description: error instanceof Error ? error.message : "Failed to clear BDC data",
+        description: errorMsg,
         variant: "destructive",
       });
     } finally {
@@ -672,7 +706,11 @@ const BdcDetail = () => {
               These actions are destructive and cannot be undone.
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-6">
+            {/* Log Viewer */}
+            <LogViewer />
+            
+            {/* Clear Data Action */}
             <div className="flex items-center justify-between p-4 border border-destructive/30 rounded-lg bg-destructive/5">
               <div>
                 <p className="font-medium">Clear All Data for {bdc.ticker || bdc.bdc_name}</p>
