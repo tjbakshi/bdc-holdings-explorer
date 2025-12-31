@@ -2450,10 +2450,11 @@ async function parseBXSLTableAndInsert(params: {
           else if ((text.includes("investment type") || text.includes("type of investment")) && colIndices.investmentType === -1) {
             colIndices.investmentType = position;
           }
-          else if ((text.includes("interest rate") || text.includes("coupon") || text.includes("rate")) && !text.includes("spread") && colIndices.interestRate === -1) {
+          else if ((text.includes("interest rate") || text.includes("coupon")) && !text.includes("spread") && !text.includes("reference") && colIndices.interestRate === -1) {
             colIndices.interestRate = position;
           }
-          else if ((text.includes("spread") || text.includes("floor")) && colIndices.spread === -1) {
+          // BXSL: "Reference Rate and Spread" column - captures the full spread info
+          else if ((text.includes("reference rate") || text.includes("spread")) && colIndices.spread === -1) {
             colIndices.spread = position;
           }
           else if (text.includes("maturity") && colIndices.maturity === -1) {
@@ -2559,13 +2560,35 @@ async function parseBXSLTableAndInsert(params: {
         if (rateText && rateText.length > 0 && rateText.length < 50) interestRate = rateText;
       }
 
-      // Extract spread (reference_rate)
+      // Extract spread (reference_rate) - BXSL has "Reference Rate and Spread" column
+      // The cell may have "SOFR +" and "5.98%" in separate spans, so concatenate all text
       let referenceRate: string | null = null;
       if (colIndices.spread >= 0) {
         const spreadCell = getCellAtPos(colIndices.spread);
-        const spreadText = spreadCell?.textContent?.trim();
-        if (spreadText && spreadText.length > 0 && spreadText.length < 50 && !/^[-—\s]*$/.test(spreadText)) {
-          referenceRate = spreadText;
+        if (spreadCell) {
+          // Concatenate all text from child elements to capture full "SOFR + 5.98%"
+          const allText: string[] = [];
+          const walker = (node: any) => {
+            if (node.nodeType === 3) { // Text node
+              const text = node.textContent?.trim();
+              if (text) allText.push(text);
+            } else if (node.childNodes) {
+              for (const child of Array.from(node.childNodes) as any[]) {
+                walker(child);
+              }
+            }
+          };
+          walker(spreadCell);
+          
+          // Join with spaces and clean up
+          let spreadText = allText.join(' ')
+            .replace(/\s+/g, ' ')
+            .replace(/\(\d+\)/g, '') // Remove footnote numbers like (2)
+            .trim();
+          
+          if (spreadText && spreadText.length > 0 && spreadText.length < 80 && !/^[-—\s]*$/.test(spreadText)) {
+            referenceRate = spreadText;
+          }
         }
       }
 
