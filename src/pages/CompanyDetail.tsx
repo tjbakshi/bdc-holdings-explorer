@@ -58,7 +58,11 @@ const CompanyDetail = () => {
 
   const formatDate = (dateStr: string | null) => {
     if (!dateStr) return "—";
-    return new Date(dateStr).toLocaleDateString();
+    // Avoid timezone shifting for YYYY-MM-DD (treated as UTC by Date constructor)
+    const d = /^\d{4}-\d{2}-\d{2}$/.test(dateStr)
+      ? new Date(`${dateStr}T00:00:00`)
+      : new Date(dateStr);
+    return d.toLocaleDateString();
   };
 
   const calculateFmvPar = (fairValue: number | null, parAmount: number | null) => {
@@ -167,7 +171,10 @@ const CompanyDetail = () => {
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis 
                     dataKey="period" 
-                    tickFormatter={(value) => new Date(value).toLocaleDateString(undefined, { month: 'short', year: '2-digit' })}
+                    tickFormatter={(value) => {
+                      const d = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00`) : new Date(value);
+                      return d.toLocaleDateString(undefined, { month: "short", year: "2-digit" });
+                    }}
                   />
                   <YAxis 
                     tickFormatter={(value) => `$${(value / 1000000).toFixed(1)}M`}
@@ -206,7 +213,10 @@ const CompanyDetail = () => {
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis 
                       dataKey="period" 
-                      tickFormatter={(value) => new Date(value).toLocaleDateString(undefined, { month: 'short', year: '2-digit' })}
+                      tickFormatter={(value) => {
+                        const d = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00`) : new Date(value);
+                        return d.toLocaleDateString(undefined, { month: "short", year: "2-digit" });
+                      }}
                     />
                     <YAxis 
                       tickFormatter={(value) => `${value}%`}

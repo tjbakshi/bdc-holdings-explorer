@@ -158,7 +158,11 @@ const BdcDetail = () => {
 
   const formatDate = (dateStr: string | null) => {
     if (!dateStr) return "—";
-    return new Date(dateStr).toLocaleDateString();
+    // Avoid timezone shifting for YYYY-MM-DD (treated as UTC by Date constructor)
+    const d = /^\d{4}-\d{2}-\d{2}$/.test(dateStr)
+      ? new Date(`${dateStr}T00:00:00`)
+      : new Date(dateStr);
+    return d.toLocaleDateString();
   };
 
   // Calculate portfolio summary totals (use cost as fallback for par if blank)
