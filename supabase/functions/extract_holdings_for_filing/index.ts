@@ -1942,9 +1942,11 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       const firstCellText = firstNonEmptyCell?.textContent?.trim() || '';
       
       // Detect industry header row
-      if (nonEmptyCells.length <= 4 && firstCellText.length > 2 && firstCellText.length < 80) {
+      // GBDC industry headers can have varying numbers of cells (some tables have more columns)
+      // Key indicator: first cell has industry text without company patterns
+      if (firstCellText.length > 2 && firstCellText.length < 80) {
         // Comprehensive company suffix detection - includes common BDC portfolio company patterns
-        const hasCompanySuffix = /(LLC|Inc\.?|Corp\.?|Corporation|L\.P\.?|LP|Ltd\.?|Limited|S\.A\.?|SAS|GmbH|Bidco|Holdco|Midco|Topco|Buyer|Acquisition|Holdings|Partners|Group|Groupe)\b/i.test(firstCellText);
+        const hasCompanySuffix = /(LLC|Inc\.?|Corp\.?|Corporation|L\.P\.?|LP|Ltd\.?|Limited|S\.A\.?|SAS|GmbH|Bidco|Holdco|Midco|Topco|Buyer|Acquisition|Holdings|Partners|Group|Groupe|Systems|Networks|Technologies)\b/i.test(firstCellText);
         
         // GBDC uses + for continuation/footnote markers - these are companies, not industries
         const hasContinuationMarker = /[+*]/.test(firstCellText);
@@ -1957,8 +1959,20 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
         const isNumeric = /^[\$\(\)\-\d,.\s%]+$/.test(firstCellText);
         const startsWithDigit = /^\d/.test(firstCellText);
         
-        // Only treat as industry if it doesn't look like a company in any way
-        if (!hasCompanySuffix && !hasContinuationMarker && !hasFootnotes && 
+        // Additional check: known industries list
+        const knownIndustries = [
+          'software', 'healthcare', 'technology', 'financial', 'consumer', 
+          'industrial', 'insurance', 'retail', 'services', 'pharmaceuticals',
+          'media', 'energy', 'utilities', 'chemicals', 'automobiles', 'aerospace',
+          'biotechnology', 'leisure', 'hotels', 'restaurants', 'machinery'
+        ];
+        const looksLikeKnownIndustry = knownIndustries.some(ind => 
+          firstCellText.toLowerCase().includes(ind)
+        );
+        
+        // Only treat as industry if it has few cells and doesn't look like a company
+        if ((nonEmptyCells.length <= 4 || looksLikeKnownIndustry) && 
+            !hasCompanySuffix && !hasContinuationMarker && !hasFootnotes && 
             !isTotal && !isHeader && !isNumeric && !startsWithDigit) {
           // This looks like an industry header row
           console.log(`   📌 Industry: "${firstCellText}" (cells: ${nonEmptyCells.length})`);
