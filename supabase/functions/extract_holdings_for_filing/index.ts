@@ -409,36 +409,47 @@ function extractCandidateTableHtml(html: string): string[] {
 // Helper to find header row in a table
 function findHeaderRow(table: Element, debugMode = false): Element | null {
   const rows = (table as Element).querySelectorAll("tr");
-  
+
   // Scan first ~10 rows to find the header (some tables have multi-row headers)
   const maxHeaderScan = Math.min(10, rows.length);
-  
+
   for (let i = 0; i < maxHeaderScan; i++) {
     const row = rows[i] as Element;
     const rowText = row.textContent?.toLowerCase() || "";
-    
+
     // Header must contain fair value/market value (relaxed: cost is optional)
-    const hasFairValue = rowText.includes("fair value") || 
+    const hasFairValue = rowText.includes("fair value") ||
                         rowText.includes("market value") ||
                         rowText.includes("fair");
     const hasCost = rowText.includes("cost") || rowText.includes("amortized");
-    const hasCompany = rowText.includes("company") || 
-                       rowText.includes("portfolio") || 
+    const hasCompany = rowText.includes("company") ||
+                       rowText.includes("portfolio") ||
                        rowText.includes("name") ||
                        rowText.includes("issuer") ||
                        rowText.includes("investment") ||
                        rowText.includes("borrower");
-    
+
     // Accept header if it has fair value + company, cost is optional
     if (hasFairValue && hasCompany) {
       if (debugMode) {
         const headerCells = Array.from(row.querySelectorAll("th, td"));
         const headers = headerCells.map(h => (h as Element).textContent?.trim() || "");
         console.log("✓ Found candidate header row:", headers);
+
+        // Check if there's a sub-header row (for OBDC-style multi-row headers)
+        if (i + 1 < rows.length) {
+          const nextRow = rows[i + 1] as Element;
+          const nextRowCells = Array.from(nextRow.querySelectorAll("th, td"));
+          const nextHeaders = nextRowCells.map(h => (h as Element).textContent?.trim() || "");
+          // If next row has header cells and looks like sub-headers, note it
+          if (nextRowCells.length > 0 && nextRowCells[0].tagName === 'TH') {
+            console.log("  Found sub-header row:", nextHeaders);
+          }
+        }
       }
       return row;
     }
-    
+
     // Fallback: accept if it has fair value alone (company might be in a different label)
     if (hasFairValue && hasCost) {
       if (debugMode) {
@@ -449,7 +460,7 @@ function findHeaderRow(table: Element, debugMode = false): Element | null {
       return row;
     }
   }
-  
+
   return null;
 }
 
@@ -834,7 +845,15 @@ function parseTables(
     
     // Find column indices - handle colspan by tracking actual cell positions
     const headerCells = Array.from(headerRow.querySelectorAll("th, td"));
-    
+
+    // Check for multi-row headers (OBDC-style)
+    // If the next row also contains TH cells, it's likely a sub-header row
+    const allRows = Array.from((table as Element).querySelectorAll("tr"));
+    const headerRowIndex = allRows.indexOf(headerRow as any);
+    const hasSubHeaders = headerRowIndex >= 0 &&
+                          headerRowIndex + 1 < allRows.length &&
+                          (allRows[headerRowIndex + 1] as Element).querySelectorAll("th").length > 0;
+
     // Build a position-aware header map that accounts for colspan
     interface HeaderInfo {
       text: string;
@@ -842,21 +861,71 @@ function parseTables(
     }
     const headerMap: HeaderInfo[] = [];
     let position = 0;
-    for (const cell of headerCells) {
-      const el = cell as Element;
-      const text = el.textContent?.toLowerCase().trim() || "";
-      const colspan = parseInt(el.getAttribute("colspan") || "1", 10);
-      
-      // Only add non-empty headers
-      if (text) {
-        headerMap.push({ text, position });
+
+    if (hasSubHeaders) {
+      // OBDC-style: Use sub-headers for more specific column names
+      const subHeaderRow = allRows[headerRowIndex + 1] as Element;
+      const subHeaderCells = Array.from(subHeaderRow.querySelectorAll("th, td"));
+
+      if (debugMode) {
+        console.log(`\n=== Table ${tableIndex} Multi-Row Headers (OBDC-style) ===`);
+        console.log("Main headers:", headerCells.map(h => (h as Element).textContent?.trim()));
+        console.log("Sub-headers:", subHeaderCells.map(h => (h as Element).textContent?.trim()));
       }
-      
-      position += colspan;
+
+      // Build combined header map using sub-headers where available
+      let mainPos = 0;
+      let subPos = 0;
+      let subIndex = 0;
+
+      for (const mainCell of headerCells) {
+        const el = mainCell as Element;
+        const mainText = el.textContent?.toLowerCase().trim() || "";
+        const colspan = parseInt(el.getAttribute("colspan") || "1", 10);
+
+        if (colspan > 1) {
+          // This main header spans multiple columns - use sub-headers
+          for (let i = 0; i < colspan && subIndex < subHeaderCells.length; i++) {
+            const subCell = subHeaderCells[subIndex] as Element;
+            const subText = subCell.textContent?.toLowerCase().trim() || "";
+            const subColspan = parseInt(subCell.getAttribute("colspan") || "1", 10);
+
+            if (subText) {
+              headerMap.push({ text: subText, position: subPos });
+            }
+
+            subPos += subColspan;
+            subIndex++;
+          }
+        } else {
+          // Single column - use main header text
+          if (mainText) {
+            headerMap.push({ text: mainText, position: mainPos });
+          }
+          subPos++;
+          if (subIndex < subHeaderCells.length) subIndex++;
+        }
+
+        mainPos += colspan;
+      }
+    } else {
+      // Standard single-row headers
+      for (const cell of headerCells) {
+        const el = cell as Element;
+        const text = el.textContent?.toLowerCase().trim() || "";
+        const colspan = parseInt(el.getAttribute("colspan") || "1", 10);
+
+        // Only add non-empty headers
+        if (text) {
+          headerMap.push({ text, position });
+        }
+
+        position += colspan;
+      }
     }
-    
+
     if (debugMode) {
-      console.log(`\n=== Table ${tableIndex} Headers ===`);
+      console.log(`\n=== Table ${tableIndex} Final Header Map ===`);
       console.log("Header map:", headerMap.map(h => `${h.text}@${h.position}`));
     }
     
@@ -904,16 +973,20 @@ function parseTables(
     
     // Parse data rows with multi-line investment tracking
     const rows = (table as Element).querySelectorAll("tr");
-    
+
     // Find the index of the header row
-    let headerRowIndex = 0;
+    let dataStartRowIndex = 0;
     for (let idx = 0; idx < rows.length; idx++) {
       if (rows[idx] === headerRow) {
-        headerRowIndex = idx;
+        dataStartRowIndex = idx + 1; // Start after header row
+        // If we have sub-headers, skip that row too
+        if (hasSubHeaders) {
+          dataStartRowIndex = idx + 2; // Skip both header and sub-header rows
+        }
         break;
       }
     }
-    
+
     // State for tracking current company across multi-line investments
     let currentCompany: string | null = null;
     let currentIndustry: string | null = persistentIndustry;
@@ -1007,7 +1080,7 @@ function parseTables(
     };
     
     // Cap the number of rows we process per table to prevent blowup
-    const rowsToProcess = Math.min(rows.length, headerRowIndex + maxRowsPerTable + 1);
+    const rowsToProcess = Math.min(rows.length, dataStartRowIndex + maxRowsPerTable);
     
     // Track expected cell count for structure-based industry header detection
     let expectedCellCount = headerCells.length;
@@ -1015,8 +1088,8 @@ function parseTables(
     // Debug: Log first few rows to understand structure
     let debugRowsLogged = 0;
     const maxDebugRows = 15;
-    
-    for (let i = headerRowIndex + 1; i < rowsToProcess; i++) {
+
+    for (let i = dataStartRowIndex; i < rowsToProcess; i++) {
       const row = rows[i] as Element;
       // Check for both td and th cells (industry headers may use th)
       const tdCells = Array.from(row.querySelectorAll("td"));
