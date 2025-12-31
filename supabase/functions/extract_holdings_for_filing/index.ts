@@ -1456,6 +1456,497 @@ function parseLargeFilingSegment(htmlSegment: string): Holding[] {
   return holdings;
 }
 
+// ======================================================================
+// MULTI-BDC PARSER ARCHITECTURE
+// ======================================================================
+// Switchboard pattern: route to specialized parsers based on BDC ticker
+
+type ParserType = 'ARCC' | 'GBDC' | 'GENERIC';
+
+interface ParseResult {
+  holdings: Holding[];
+  scaleResult: ScaleDetectionResult;
+  method: string;
+}
+
+/**
+ * Determine which parser to use based on BDC ticker
+ */
+function determineParserType(ticker: string | null, bdcName: string): ParserType {
+  const tickerUpper = ticker?.toUpperCase() || '';
+  const nameUpper = bdcName?.toUpperCase() || '';
+  
+  if (tickerUpper === 'ARCC' || nameUpper.includes('ARES CAPITAL')) {
+    return 'ARCC';
+  }
+  
+  if (tickerUpper === 'GBDC' || nameUpper.includes('GOLUB CAPITAL')) {
+    return 'GBDC';
+  }
+  
+  // Default to generic parser for unknown BDCs
+  return 'GENERIC';
+}
+
+/**
+ * Pre-process HTML to reduce size and avoid CPU timeouts
+ * Strips style, script tags and excessive whitespace
+ */
+function preprocessHtml(html: string): string {
+  let processed = html;
+  
+  // Strip <style> tags and their content
+  processed = processed.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+  
+  // Strip <script> tags and their content
+  processed = processed.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+  
+  // Strip HTML comments
+  processed = processed.replace(/<!--[\s\S]*?-->/g, '');
+  
+  // Reduce excessive whitespace (but preserve single spaces for readability)
+  processed = processed.replace(/\s{2,}/g, ' ');
+  
+  return processed;
+}
+
+/**
+ * GBDC Column Mapping - maps GBDC's specific column names to standard fields
+ */
+interface GBDCColumnIndices {
+  investment: number;      // -> company_name
+  industry: number;        // -> industry
+  interestRate: number;    // -> interest_rate / reference_rate
+  spread: number;          // -> reference_rate
+  maturity: number;
+  par: number;
+  cost: number;
+  fairValue: number;
+}
+
+/**
+ * Find GBDC column indices from header row
+ */
+function findGBDCColumnIndices(headerRow: Element): GBDCColumnIndices {
+  const cells = Array.from(headerRow.querySelectorAll("th, td"));
+  const indices: GBDCColumnIndices = {
+    investment: -1,
+    industry: -1,
+    interestRate: -1,
+    spread: -1,
+    maturity: -1,
+    par: -1,
+    cost: -1,
+    fairValue: -1,
+  };
+  
+  let position = 0;
+  for (const cell of cells) {
+    const text = (cell as Element).textContent?.toLowerCase().trim() || '';
+    const colspan = parseInt((cell as Element).getAttribute("colspan") || "1", 10);
+    
+    // GBDC-specific column mappings
+    if (text.includes('investment') || text.includes('portfolio company') || text.includes('borrower')) {
+      indices.investment = position;
+    } else if (text.includes('industry') || text.includes('sector')) {
+      indices.industry = position;
+    } else if (text.includes('interest rate') || text.includes('coupon') || text.includes('rate')) {
+      indices.interestRate = position;
+    } else if (text.includes('spread') || text.includes('floor')) {
+      indices.spread = position;
+    } else if (text.includes('maturity') || text.includes('due') || text.includes('expiration')) {
+      indices.maturity = position;
+    } else if (text.includes('par') || text.includes('principal') || text.includes('face')) {
+      indices.par = position;
+    } else if (text.includes('cost') || text.includes('amortized')) {
+      indices.cost = position;
+    } else if (text.includes('fair value') || text.includes('fair') || text.includes('market')) {
+      indices.fairValue = position;
+    }
+    
+    position += colspan;
+  }
+  
+  return indices;
+}
+
+/**
+ * Parse GBDC-specific Schedule of Investments
+ * Specialized for Golub Capital BDC's unique table format
+ */
+function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[]; scaleResult: ScaleDetectionResult } {
+  const holdings: Holding[] = [];
+  const BATCH_SIZE = 50; // Process rows in batches of 50 for memory management
+  
+  // Step 1: Pre-process HTML to reduce size
+  console.log(`🔧 GBDC Parser: Pre-processing HTML (original size: ${(html.length / 1024).toFixed(0)} KB)`);
+  let processedHtml = preprocessHtml(html);
+  console.log(`🔧 GBDC Parser: After pre-processing: ${(processedHtml.length / 1024).toFixed(0)} KB`);
+  
+  // Step 2: Detect scale
+  const scaleResult = detectScale(processedHtml);
+  console.log(`🔧 GBDC Parser: Scale detected: ${scaleResult.detected}`);
+  
+  // Step 3: Find "Consolidated Schedule of Investments" section
+  const lower = processedHtml.toLowerCase();
+  const soiKeywords = [
+    'consolidated schedule of investments',
+    'schedule of investments',
+  ];
+  
+  let soiStart = -1;
+  for (const keyword of soiKeywords) {
+    const idx = lower.indexOf(keyword);
+    if (idx !== -1) {
+      soiStart = idx;
+      console.log(`🔧 GBDC Parser: Found SOI at position ${idx} with keyword "${keyword}"`);
+      break;
+    }
+  }
+  
+  if (soiStart === -1) {
+    console.log(`🔧 GBDC Parser: No SOI section found`);
+    return { holdings: [], scaleResult };
+  }
+  
+  // Step 4: Extract the table immediately after the SOI header
+  // Look for the first <table> tag after the SOI header
+  const afterSoi = processedHtml.slice(soiStart);
+  const tableStart = afterSoi.toLowerCase().indexOf('<table');
+  
+  if (tableStart === -1) {
+    console.log(`🔧 GBDC Parser: No table found after SOI header`);
+    return { holdings: [], scaleResult };
+  }
+  
+  // Find the end of this table (limit to reasonable size)
+  const maxTableSize = 2_000_000; // 2MB max
+  const tableSection = afterSoi.slice(tableStart, tableStart + maxTableSize);
+  const tableEnd = tableSection.toLowerCase().indexOf('</table>');
+  const tableHtml = tableEnd !== -1 ? tableSection.slice(0, tableEnd + 8) : tableSection.slice(0, 500_000);
+  
+  console.log(`🔧 GBDC Parser: Extracted table section: ${(tableHtml.length / 1024).toFixed(0)} KB`);
+  
+  // Step 5: Parse the table using DOM parser with chunked processing
+  try {
+    const doc = new DOMParser().parseFromString(`<html><body>${tableHtml}</body></html>`, "text/html");
+    if (!doc) {
+      console.log(`🔧 GBDC Parser: Failed to parse table HTML`);
+      return { holdings: [], scaleResult };
+    }
+    
+    const tables = Array.from(doc.querySelectorAll("table")) as Element[];
+    if (tables.length === 0) {
+      console.log(`🔧 GBDC Parser: No tables found in parsed HTML`);
+      return { holdings: [], scaleResult };
+    }
+    
+    console.log(`🔧 GBDC Parser: Found ${tables.length} tables to process`);
+    
+    let currentIndustry: string | null = null;
+    let currentCompany: string | null = null;
+    let processedRows = 0;
+    let batchCount = 0;
+    
+    for (const table of tables) {
+      const rows = Array.from(table.querySelectorAll("tr")) as Element[];
+      if (rows.length === 0) continue;
+      
+      // Find header row with GBDC-specific column mapping
+      let headerRow: Element | null = null;
+      let headerRowIndex = 0;
+      
+      for (let i = 0; i < Math.min(15, rows.length); i++) {
+        const rowText = rows[i].textContent?.toLowerCase() || '';
+        // GBDC headers typically have: Investment, Industry, Interest Rate/Spread, Maturity, Par, Cost, Fair Value
+        if ((rowText.includes('investment') || rowText.includes('portfolio')) && 
+            (rowText.includes('fair value') || rowText.includes('fair'))) {
+          headerRow = rows[i];
+          headerRowIndex = i;
+          break;
+        }
+      }
+      
+      if (!headerRow) {
+        if (debugMode) console.log(`🔧 GBDC Parser: No header row found in table`);
+        continue;
+      }
+      
+      // Get GBDC-specific column indices
+      const colIndices = findGBDCColumnIndices(headerRow);
+      if (debugMode) {
+        console.log(`🔧 GBDC Parser: Column indices:`, colIndices);
+      }
+      
+      if (colIndices.investment === -1 || colIndices.fairValue === -1) {
+        if (debugMode) console.log(`🔧 GBDC Parser: Missing required columns (investment or fairValue)`);
+        continue;
+      }
+      
+      // Process data rows in batches
+      for (let i = headerRowIndex + 1; i < rows.length; i++) {
+        const row = rows[i];
+        const cells = Array.from(row.querySelectorAll("td, th")) as Element[];
+        
+        if (cells.length < 3) continue;
+        
+        // Get cell at position helper
+        const getCellAtPos = (pos: number): Element | null => {
+          let currentPos = 0;
+          for (const cell of cells) {
+            const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+            if (currentPos <= pos && pos < currentPos + colspan) {
+              return cell;
+            }
+            currentPos += colspan;
+          }
+          return null;
+        };
+        
+        // Get company name from Investment column
+        const investmentCell = getCellAtPos(colIndices.investment);
+        const rawCompanyName = investmentCell?.textContent?.trim() || '';
+        
+        // Check if this is an industry header (text in first cell, mostly empty elsewhere)
+        const nonEmptyCells = cells.filter(c => {
+          const text = c.textContent?.trim() || '';
+          return text.length > 1 && !/^[-—\s]*$/.test(text);
+        });
+        
+        if (nonEmptyCells.length === 1 && rawCompanyName.length > 3 && rawCompanyName.length < 100) {
+          // Check if it looks like an industry, not a company
+          const looksLikeCompany = /(LLC|Inc\.|Inc|Corp\.|Corp|L\.P\.|LP|Ltd\.|Ltd|Limited|Holdings|Company|Partners|Group)\b/i.test(rawCompanyName);
+          const looksLikeTotal = /^(Total|Subtotal|Sub-total|Net\s)/i.test(rawCompanyName);
+          
+          if (!looksLikeCompany && !looksLikeTotal) {
+            currentIndustry = rawCompanyName;
+            if (debugMode) console.log(`🔧 GBDC Parser: Industry header: "${currentIndustry}"`);
+            continue;
+          }
+        }
+        
+        // Skip summary/total rows
+        if (/^(Total|Subtotal|Sub-total|Net\s|Balance|See accompanying|Notes to)/i.test(rawCompanyName)) {
+          continue;
+        }
+        
+        // Clean company name
+        const cleanedCompanyName = cleanCompanyName(rawCompanyName);
+        
+        // Determine effective company name
+        let effectiveCompanyName = cleanedCompanyName;
+        if (cleanedCompanyName && hasCompanySuffix(cleanedCompanyName)) {
+          currentCompany = cleanedCompanyName;
+          effectiveCompanyName = cleanedCompanyName;
+        } else if (currentCompany && (!cleanedCompanyName || cleanedCompanyName.length < 5)) {
+          // Continuation row
+          effectiveCompanyName = currentCompany;
+        } else if (!cleanedCompanyName || cleanedCompanyName.length < 5) {
+          continue;
+        }
+        
+        // Get industry from Industry column if available
+        let industry = currentIndustry;
+        if (colIndices.industry >= 0) {
+          const industryCell = getCellAtPos(colIndices.industry);
+          const industryText = industryCell?.textContent?.trim();
+          if (industryText && industryText.length > 2 && industryText.length < 100) {
+            industry = industryText;
+          }
+        }
+        
+        // Get fair value
+        const fairValueCell = getCellAtPos(colIndices.fairValue);
+        const fairValue = parseNumeric(fairValueCell?.textContent?.trim());
+        
+        if (fairValue === null || fairValue === 0) continue;
+        
+        // Get cost
+        const costCell = colIndices.cost >= 0 ? getCellAtPos(colIndices.cost) : null;
+        const cost = parseNumeric(costCell?.textContent?.trim());
+        
+        // Get par amount
+        const parCell = colIndices.par >= 0 ? getCellAtPos(colIndices.par) : null;
+        const parAmount = parseNumeric(parCell?.textContent?.trim());
+        
+        // Get interest rate and reference rate
+        let interestRate: string | null = null;
+        let referenceRate: string | null = null;
+        
+        if (colIndices.interestRate >= 0) {
+          const rateCell = getCellAtPos(colIndices.interestRate);
+          const rateText = rateCell?.textContent?.trim() || '';
+          const rateInfo = extractInterestRate(rateText);
+          interestRate = rateInfo.rate;
+          referenceRate = rateInfo.reference;
+        }
+        
+        // Check spread column for reference rate
+        if (colIndices.spread >= 0 && !referenceRate) {
+          const spreadCell = getCellAtPos(colIndices.spread);
+          const spreadText = spreadCell?.textContent?.trim() || '';
+          if (spreadText && /(SOFR|LIBOR|Prime)/i.test(spreadText)) {
+            referenceRate = spreadText.match(/(SOFR|LIBOR|Prime)/i)?.[1]?.toUpperCase() || null;
+          }
+        }
+        
+        // Get maturity date
+        const maturityCell = colIndices.maturity >= 0 ? getCellAtPos(colIndices.maturity) : null;
+        const maturityDate = parseDate(maturityCell?.textContent?.trim());
+        
+        // Try to extract investment type from the row
+        // GBDC often has investment type in a separate cell or within the investment description
+        let investmentType: string | null = null;
+        const investmentText = rawCompanyName.toLowerCase();
+        if (/(first lien|second lien|senior secured|subordinated|mezzanine|unitranche)/i.test(investmentText)) {
+          const match = investmentText.match(/(first lien|second lien|senior secured|subordinated|mezzanine|unitranche)[^,]*/i);
+          investmentType = match ? match[0].trim() : null;
+        } else {
+          // Look for investment type in cells after company name
+          for (let j = 1; j < Math.min(cells.length, 5); j++) {
+            const cellText = cells[j]?.textContent?.trim() || '';
+            if (/(first lien|second lien|senior|subordinated|mezzanine|equity|preferred|common|warrant|unitranche|loan|note|bond)/i.test(cellText)) {
+              investmentType = cellText.slice(0, 100);
+              break;
+            }
+          }
+        }
+        
+        // Validate as a real holding
+        const validation = isRealHolding(effectiveCompanyName, fairValue, cost);
+        if (!validation.valid) {
+          continue;
+        }
+        
+        holdings.push({
+          company_name: effectiveCompanyName,
+          investment_type: investmentType,
+          industry: industry,
+          description: null,
+          interest_rate: interestRate,
+          reference_rate: referenceRate,
+          maturity_date: maturityDate,
+          par_amount: parAmount,
+          cost: cost,
+          fair_value: fairValue,
+        });
+        
+        processedRows++;
+        
+        // Batch logging
+        if (processedRows % BATCH_SIZE === 0) {
+          batchCount++;
+          if (debugMode) {
+            console.log(`🔧 GBDC Parser: Processed batch ${batchCount} (${processedRows} rows, ${holdings.length} holdings)`);
+          }
+        }
+        
+        // Safety cap
+        if (holdings.length >= 2000) {
+          console.log(`🔧 GBDC Parser: Reached max holdings cap (2000)`);
+          break;
+        }
+      }
+    }
+    
+    console.log(`🔧 GBDC Parser: Completed - ${holdings.length} holdings from ${processedRows} rows`);
+    
+    // Deduplicate
+    if (holdings.length > 0) {
+      const seen = new Set<string>();
+      const deduplicated: Holding[] = [];
+      
+      for (const h of holdings) {
+        const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          deduplicated.push(h);
+        }
+      }
+      
+      if (deduplicated.length < holdings.length) {
+        console.log(`🔧 GBDC Parser: Deduplicated ${holdings.length} -> ${deduplicated.length} holdings`);
+      }
+      
+      return { holdings: deduplicated, scaleResult };
+    }
+    
+  } catch (error) {
+    console.error(`🔧 GBDC Parser: Error parsing table:`, error);
+  }
+  
+  return { holdings, scaleResult };
+}
+
+/**
+ * Generic parser for unknown BDCs - uses conservative settings
+ * Falls back to the standard ARCC logic but with more lenient column matching
+ */
+function parseGenericBDC(html: string, debugMode = false): { holdings: Holding[]; scaleResult: ScaleDetectionResult } {
+  console.log(`🔧 Generic Parser: Processing HTML (${(html.length / 1024).toFixed(0)} KB)`);
+  
+  // Pre-process to reduce size
+  const processedHtml = preprocessHtml(html);
+  console.log(`🔧 Generic Parser: After pre-processing: ${(processedHtml.length / 1024).toFixed(0)} KB`);
+  
+  // Use the standard ARCC parsing logic which is well-tested
+  const result = parseHtmlScheduleOfInvestments(processedHtml, debugMode);
+  
+  console.log(`🔧 Generic Parser: Found ${result.holdings.length} holdings`);
+  
+  return { 
+    holdings: result.holdings, 
+    scaleResult: result.scaleResult 
+  };
+}
+
+/**
+ * SWITCHBOARD: Main parser dispatcher
+ * Routes to the appropriate specialized parser based on BDC ticker
+ */
+function parseWithBDCRouter(
+  html: string, 
+  ticker: string | null, 
+  bdcName: string, 
+  debugMode = false
+): ParseResult {
+  const parserType = determineParserType(ticker, bdcName);
+  console.log(`\n🔀 SWITCHBOARD: Routing to ${parserType} parser for ${ticker || bdcName}`);
+  
+  switch (parserType) {
+    case 'ARCC':
+      // Use existing ARCC logic (unchanged)
+      console.log(`📘 Using ARCC parser (existing logic)`);
+      const arccResult = parseHtmlScheduleOfInvestments(html, debugMode);
+      return {
+        holdings: arccResult.holdings,
+        scaleResult: arccResult.scaleResult,
+        method: 'arcc-standard',
+      };
+      
+    case 'GBDC':
+      // Use GBDC specialist parser
+      console.log(`📗 Using GBDC specialist parser`);
+      const gbdcResult = parseGBDCTable(html, debugMode);
+      return {
+        holdings: gbdcResult.holdings,
+        scaleResult: gbdcResult.scaleResult,
+        method: 'gbdc-specialist',
+      };
+      
+    case 'GENERIC':
+    default:
+      // Use generic fallback parser
+      console.log(`📙 Using GENERIC fallback parser`);
+      const genericResult = parseGenericBDC(html, debugMode);
+      return {
+        holdings: genericResult.holdings,
+        scaleResult: genericResult.scaleResult,
+        method: 'generic-fallback',
+      };
+  }
+}
+
 // Main serve function
 serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -1474,12 +1965,12 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
-    // Fetch filing details
+    // Fetch filing details including BDC ticker for parser routing
     const { data: filing, error: filingError } = await supabaseClient
       .from("filings")
       .select(`
         *,
-        bdcs (cik, bdc_name)
+        bdcs (cik, bdc_name, ticker)
       `)
       .eq("id", filingId)
       .single();
@@ -1491,9 +1982,13 @@ serve(async (req) => {
     const cik = filing.bdcs.cik;
     const accessionNo = filing.sec_accession_no;
     const bdcName = filing.bdcs.bdc_name;
+    const ticker = filing.bdcs.ticker;
 
-    console.log(`Extracting holdings for filing ${accessionNo} (CIK: ${cik}, BDC: ${bdcName})`);
-    console.log(`Using local parser`);
+    console.log(`Extracting holdings for filing ${accessionNo} (CIK: ${cik}, BDC: ${bdcName}, Ticker: ${ticker || 'N/A'})`);
+    
+    // Determine which parser to use based on BDC ticker
+    const parserType = determineParserType(ticker, bdcName);
+    console.log(`🔀 Parser routing: ${parserType}`);
 
     // Build filing document URL
     const accessionNoNoDashes = accessionNo.replace(/-/g, "");
@@ -1945,16 +2440,19 @@ serve(async (req) => {
           }
           
           // Standard processing path (for smaller SOI sections or non-SOI documents)
+          // Uses the SWITCHBOARD router to select the appropriate parser
           if (textToParse && holdings.length === 0) {
             const useDebug = debugMode || (docIdx >= 2 && holdings.length === 0);
-            const result = parseHtmlScheduleOfInvestments(textToParse, useDebug);
-            holdings = result.holdings;
-            scaleResult = result.scaleResult;
             
-            console.log(`   Result: ${holdings.length} holdings found`);
+            // Use the switchboard router instead of direct call
+            const routerResult = parseWithBDCRouter(textToParse, ticker, bdcName, useDebug);
+            holdings = routerResult.holdings;
+            scaleResult = routerResult.scaleResult;
+            
+            console.log(`   Result: ${holdings.length} holdings found (method: ${routerResult.method})`);
             
             if (holdings.length > 0) {
-              console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name}`);
+              console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name} using ${routerResult.method}`);
               break;
             }
           }
