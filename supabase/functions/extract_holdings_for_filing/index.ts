@@ -1680,10 +1680,10 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
     return { holdings: [], scaleResult };
   }
   
-  // STEP 3: Extract section after SOI (limit to 4MB)
+  // STEP 3: Extract section after SOI (GBDC SOIs can be very large - up to 20MB)
   console.log(`🔍 STEP 3: Extracting post-SOI section...`);
-  const MAX_SEARCH = 4_000_000;
-  const afterSoi = html.slice(soiStart, soiStart + MAX_SEARCH);
+  const MAX_SEARCH = 20_000_000; // 20MB to capture full GBDC SOI (pages 8-51)
+  const afterSoi = html.slice(soiStart, Math.min(soiStart + MAX_SEARCH, html.length));
   const afterSoiLower = afterSoi.toLowerCase();
   console.log(`   Extracted ${(afterSoi.length / 1024).toFixed(0)} KB after SOI header`);
   
