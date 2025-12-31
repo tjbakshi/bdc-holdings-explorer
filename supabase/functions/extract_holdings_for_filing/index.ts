@@ -1899,6 +1899,12 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       const row = rows[i];
       const cells = Array.from(row.querySelectorAll('td, th')) as Element[];
       
+      // Debug: Log cell structure every 200 rows
+      if (holdings.length > 0 && holdings.length % 200 === 0) {
+        const cellTexts = cells.slice(0, 5).map(c => (c.textContent?.trim() || '').slice(0, 20));
+        console.log(`   DEBUG row ${i}: cells[0-4]=[${cellTexts.join(' | ')}]`);
+      }
+      
       // ROW VALIDATION: Only skip if completely empty
       const rowText = row.textContent?.trim() || '';
       if (!rowText || /^[-—\s]*$/.test(rowText)) {
