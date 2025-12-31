@@ -13,571 +13,453 @@ interface Holding {
   company_name: string;
   investment_type?: string | null;
   industry?: string | null;
-  description?: string | null;
   interest_rate?: string | null;
   reference_rate?: string | null;
   maturity_date?: string | null;
   par_amount?: number | null;
   cost?: number | null;
   fair_value?: number | null;
-  source_pos?: number;
-  period_date?: string | null;
   row_number?: number;
+  period_date?: string | null;
 }
 
 interface ScaleDetectionResult {
   scale: number;
   detected: 'thousands' | 'millions' | 'unknown';
-  confidence: 'high' | 'medium' | 'low';
 }
 
 // ======================================================================
 // HELPER FUNCTIONS
 // ======================================================================
 
-function sanitizeHtmlToText(rawHtml: string): string {
-  return rawHtml
-    .replace(/<[^>]*>?/gm, " ")
-    .replace(/&nbsp;|&#160;|&#xA0;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/**
- * Robust Regex-based helper to strip tags and decode basic entities
- * Used by the memory-safe parsers to avoid DOM overhead
- */
 function stripTags(html: string): string {
   if (!html) return "";
-  return html
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-    .replace(/<[^>]+>/g, " ") // Replace tags with space to prevent words merging
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#160;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function extractPeriodDateFromText(text: string): string | null {
-  const cleanText = sanitizeHtmlToText(text);
-  const dateRe = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\s*,\s*\d{4}/gi;
-  const matches = Array.from(cleanText.matchAll(dateRe));
-  if (matches.length === 0) return null;
-  const dateText = matches[matches.length - 1][0];
-  const m = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*,\s*(\d{4})$/i.exec(dateText);
-  if (!m) return null;
-  
-  const monthMap: Record<string, number> = {
-    january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
-    july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
-  };
-  const month = monthMap[m[1].toLowerCase()];
-  if (!month) return null;
-  return `${m[3]}-${String(month).padStart(2, "0")}-${String(m[2]).padStart(2, "0")}`;
+  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function detectScale(html: string): ScaleDetectionResult {
-  const lowerHtml = html.toLowerCase();
-  if (/\(in thousands\)/i.test(lowerHtml) || /amounts?\s+in\s+thousands/i.test(lowerHtml)) {
-    return { scale: 0.001, detected: 'thousands', confidence: 'high' };
+  // Check first 50KB only
+  const headerText = html.slice(0, 50000).toLowerCase();
+  if (/\(in thousands\)/.test(headerText) || /amounts?\s+in\s+thousands/.test(headerText)) {
+    return { scale: 0.001, detected: 'thousands' };
   }
-  if (/\(in millions\)/i.test(lowerHtml) || /amounts?\s+in\s+millions/i.test(lowerHtml)) {
-    return { scale: 1, detected: 'millions', confidence: 'high' };
+  if (/\(in millions\)/.test(headerText) || /amounts?\s+in\s+millions/.test(headerText)) {
+    return { scale: 1, detected: 'millions' };
   }
-  return { scale: 0.001, detected: 'thousands', confidence: 'low' };
+  return { scale: 0.001, detected: 'thousands' };
 }
 
-function validateScale(holdings: Holding[], scale: ScaleDetectionResult): { valid: boolean; warning?: string } {
-  if (holdings.length === 0) return { valid: true };
-  const validValues = holdings.filter(h => h.fair_value !== null).map(h => (h.fair_value as number) * scale.scale);
-  if (validValues.length === 0) return { valid: true };
-  const avgValue = validValues.reduce((sum, v) => sum + v, 0) / validValues.length;
-  
-  if (avgValue > 1000) return { valid: false, warning: `Average holding value ($${avgValue.toFixed(1)}M) too large` };
-  if (avgValue < 0.01) return { valid: false, warning: `Average holding value ($${(avgValue * 1000).toFixed(1)}K) too small` };
-  return { valid: true };
-}
-
-async function fetchSecFile(url: string, retries = 2): Promise<string> {
-  for (let i = 0; i <= retries; i++) {
-    try {
-      console.log(`Fetching: ${url}`);
-      const response = await fetch(url, { headers: { "User-Agent": SEC_USER_AGENT } });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return await response.text();
-    } catch (error) {
-      if (i === retries) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 1000 * (i + 1)));
-    }
-  }
-  throw new Error("Failed to fetch");
-}
-
-function cleanCompanyName(name: string | null | undefined): string {
-  if (!name) return "";
-  return name.replace(/(\s*\(\d+(?:,\s*\d+)*\))+\s*$/g, '').replace(/<[^>]+>/g, '').trim();
-}
-
-function parseNumeric(value: string | null | undefined): number | null {
-  if (!value) return null;
-  const cleaned = value.replace(/[$,\s]/g, "").trim();
-  if (!cleaned || cleaned === "-" || cleaned === "—") return null;
-  const isNegative = cleaned.startsWith("(") && cleaned.endsWith(")");
-  const numStr = isNegative ? cleaned.slice(1, -1) : cleaned;
-  const parsed = parseFloat(numStr);
-  return isNaN(parsed) ? null : (isNegative ? -parsed : parsed);
-}
-
-// Specialized numeric cleaner for GBDC/BXSL that handles strict formatting
-function cleanStrictNumeric(value: string | null | undefined): number | null {
+function cleanNumeric(value: string | null | undefined): number | null {
   if (!value) return null;
   let cleaned = value.replace(/[$,\s]/g, '').trim();
   if (!cleaned || cleaned === '-' || cleaned === '—' || cleaned === '') return null;
-  // Handle (123) as negative
+  
   const isNegative = cleaned.startsWith('(') && cleaned.endsWith(')');
   if (isNegative) cleaned = cleaned.slice(1, -1);
+  
   const parsed = parseFloat(cleaned);
   return isNaN(parsed) ? null : (isNegative ? -parsed : parsed);
 }
 
 function toMillions(value: number | null | undefined, scale: number): number | null {
   if (value === null || value === undefined) return null;
-  return Math.round(value * scale * 10) / 10;
+  return Math.round(value * scale * 100) / 100;
 }
 
 function parseDate(value: string | null | undefined): string | null {
   if (!value) return null;
   const cleaned = value.trim();
-  if (!cleaned || cleaned === "-" || cleaned === "—" || cleaned.toLowerCase() === "n/a") return null;
-  const mmyyyy = cleaned.match(/^(\d{1,2})\/(\d{4})$/);
+  const mmddyyyy = cleaned.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (mmddyyyy) return `${mmddyyyy[3]}-${mmddyyyy[1].padStart(2, '0')}-${mmddyyyy[2].padStart(2, '0')}`;
+  const mmyyyy = cleaned.match(/(\d{1,2})\/(\d{4})/);
   if (mmyyyy) {
     const lastDay = new Date(parseInt(mmyyyy[2]), parseInt(mmyyyy[1]), 0).getDate();
     return `${mmyyyy[2]}-${mmyyyy[1].padStart(2, '0')}-${lastDay}`;
   }
-  const mmddyyyy = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (mmddyyyy) return `${mmddyyyy[3]}-${mmddyyyy[1].padStart(2, '0')}-${mmddyyyy[2].padStart(2, '0')}`;
-  
-  const date = new Date(cleaned);
-  return !isNaN(date.getTime()) ? date.toISOString().split("T")[0] : null;
+  return null;
 }
 
-function extractInterestRate(text: string): { rate: string | null; reference: string | null } {
-  if (!text) return { rate: null, reference: null };
-  const lowerText = text.toLowerCase();
-  const refs = ["sofr", "libor", "prime", "euribor"];
-  let reference = refs.find(r => lowerText.includes(r))?.toUpperCase() || null;
-  return { rate: text.trim(), reference };
+function cleanCompanyName(name: string): string {
+  if (!name) return "";
+  return name.replace(/(\(\d+\))+\s*$/g, "").trim();
 }
 
 function hasCompanySuffix(name: string): boolean {
-  const suffixes = ["inc", "llc", "lp", "corp", "company", "ltd", "limited"];
-  const lower = name.toLowerCase();
-  return suffixes.some(s => new RegExp(`\\b${s}\\b|\\s${s}\\.?$`, 'i').test(lower));
+  return /(llc|inc|corp|l\.p\.|limited|co\.|holdings|group)/i.test(name);
 }
 
 // ======================================================================
-// STREAMING PARSERS (REGEX-BASED FOR MEMORY SAFETY)
+// HYBRID PARSER: GBDC
 // ======================================================================
+async function parseGBDC(html: string, filingId: string, supabaseClient: any, scale: number) {
+  console.log("📘 Running GBDC Hybrid Parser...");
 
-/**
- * GBDC STREAMING PARSER - REGEX MODE
- * Replaces DOMParser with Regex to avoid WORKER_LIMIT OOM crashes
- */
-async function parseGBDCTableAndInsert(params: {
-  html: string;
-  filingId: string;
-  supabaseClient: any;
-  debugMode?: boolean;
-}): Promise<{ insertedCount: number; scaleResult: ScaleDetectionResult }> {
-  const { html, filingId, supabaseClient } = params;
-  console.log(`\n🟢 GBDC STREAMING PARSER (REGEX): Starting (input size: ${(html.length / 1024 / 1024).toFixed(2)} MB)`);
-
-  const scaleResult = detectScale(html);
+  const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(html);
+  if (!soiMatch) return 0;
   
-  // Clean newlines to make regex matching robust across lines
-  const cleanHtml = html.replace(/\r\n|\r|\n/g, ' ');
-
-  // Find SOI section
-  const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(cleanHtml);
-  const soiStart = soiMatch?.index ?? -1;
-
-  if (soiStart === -1) {
-    console.log(`   ❌ No SOI section found`);
-    return { insertedCount: 0, scaleResult };
-  }
-
-  // Extract a 15MB chunk after SOI (enough for GBDC tables but limits memory)
-  const MAX_SEARCH = 15_000_000;
-  const afterSoi = cleanHtml.slice(soiStart, Math.min(soiStart + MAX_SEARCH, cleanHtml.length));
-
-  console.log(`🔍 Scanning tables using Regex...`);
-
-  const tableRegex = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
-  const rowRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
-  // Regex to match cells and capture potential colspan
-  const cellRegex = /<t[dh]\b([^>]*)>([\s\S]*?)<\/t[dh]>/gi;
-
-  const MAX_TABLES = 150;
-  const MAX_HOLDINGS = 2500;
-  const INSERT_BATCH = 250;
-
-  // Clear existing data for this filing
+  // Slice 15MB max to keep string in memory
+  const content = html.slice(soiMatch.index, Math.min(soiMatch.index + 15_000_000, html.length));
+  
+  // 1. Regex finds the table STRINGS (cheap)
+  const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
+  
   await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
 
-  let tableCount = 0;
   let insertedCount = 0;
-  const seen = new Set<string>();
-  const pending: any[] = [];
+  let tableMatch;
+  const pendingRows: any[] = [];
+  const seenKeys = new Set<string>();
 
-  const flush = async () => {
-    if (pending.length === 0) return;
-    const rows = pending.splice(0, pending.length);
-    const { error } = await supabaseClient.from("holdings").insert(rows);
-    if (error) console.error("Insert Error:", error.message);
-    else insertedCount += rows.length;
-    if (insertedCount % 500 === 0) console.log(`   Progress: inserted ${insertedCount}...`);
-  };
+  while ((tableMatch = tableRe.exec(content)) !== null) {
+    const tableHtml = tableMatch[0]; // The full <table>...</table> string
+    
+    // Quick check to skip irrelevant tables
+    if (!/(llc|inc\.|corp\.|l\.p\.)/i.test(tableHtml)) continue;
 
-  let match;
-  // Iterate over tables
-  while ((match = tableRegex.exec(afterSoi)) !== null && tableCount < MAX_TABLES && insertedCount < MAX_HOLDINGS) {
-    const tableContent = match[1];
-    
-    // Quick filter: Must contain company suffixes to be a holdings table
-    if (!/(llc|inc\.|corp\.|l\.p\.|limited)/i.test(tableContent)) continue;
-    
-    tableCount++;
-    const rows: string[] = [];
-    let rMatch;
-    // Extract all rows
-    while ((rMatch = rowRegex.exec(tableContent)) !== null) {
-      rows.push(rMatch[1]);
-    }
+    // 2. DOM Parser processes ONLY this table (safe memory usage)
+    const doc = new DOMParser().parseFromString(tableHtml, "text/html");
+    if (!doc) continue;
+
+    const rows = Array.from(doc.querySelectorAll("tr"));
     if (rows.length < 5) continue;
 
-    // --- Column Detection ---
-    let colIndices = { company: -1, investmentType: -1, industry: -1, interestRate: -1, maturity: -1, par: -1, cost: -1, fairValue: -1 };
-    let headerFound = false;
-    let dataStartRow = 0;
+    // Identify Columns
+    let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
+    let dataStart = 0;
 
-    // Scan first 5 rows for headers
     for (let i = 0; i < Math.min(5, rows.length); i++) {
-      const rowHtml = rows[i];
-      const textOnly = stripTags(rowHtml).toLowerCase();
-      
-      if (textOnly.includes('portfolio company') || textOnly.includes('fair value') || textOnly.includes('investment')) {
-        headerFound = true;
+      const cells = Array.from(rows[i].querySelectorAll("td, th"));
+      // Simple index mapping based on text
+      let cIdx = 0;
+      for (const cell of cells) {
+        const txt = cell.textContent.toLowerCase();
+        const span = parseInt(cell.getAttribute("colspan") || "1");
         
-        // Parse cells with colspan support
-        const cells: string[] = [];
-        let cMatch;
-        while ((cMatch = cellRegex.exec(rowHtml)) !== null) {
-          const attrs = cMatch[1];
-          const content = stripTags(cMatch[2]);
-          const colspanMatch = attrs.match(/colspan=["']?(\d+)["']?/i);
-          const colspan = colspanMatch ? parseInt(colspanMatch[1]) : 1;
-          
-          cells.push(content);
-          // Push placeholders for colspan to keep index alignment
-          for (let k = 1; k < colspan; k++) cells.push(""); 
-        }
-
-        cells.forEach((text, idx) => {
-          const t = text.toLowerCase();
-          if ((t.includes('company') || t.includes('investment')) && !t.includes('type') && colIndices.company === -1) colIndices.company = idx;
-          if ((t.includes('type') || t.includes('investment')) && colIndices.investmentType === -1) colIndices.investmentType = idx;
-          if (t.includes('industry') && colIndices.industry === -1) colIndices.industry = idx;
-          if (t.includes('interest') && colIndices.interestRate === -1) colIndices.interestRate = idx;
-          if (t.includes('maturity') && colIndices.maturity === -1) colIndices.maturity = idx;
-          if ((t.includes('principal') || t.includes('par')) && colIndices.par === -1) colIndices.par = idx;
-          if (t.includes('cost') && colIndices.cost === -1) colIndices.cost = idx;
-          if ((t.includes('fair') && !t.includes('unfair')) && colIndices.fairValue === -1) colIndices.fairValue = idx;
-        });
+        if (txt.includes('company') && !txt.includes('type') && col.company === -1) col.company = cIdx;
+        if (txt.includes('type') && col.type === -1) col.type = cIdx;
+        if (txt.includes('industry') && col.industry === -1) col.industry = cIdx;
+        if (txt.includes('interest') && col.interest === -1) col.interest = cIdx;
+        if (txt.includes('maturity') && col.maturity === -1) col.maturity = cIdx;
+        if ((txt.includes('principal') || txt.includes('par')) && col.par === -1) col.par = cIdx;
+        if (txt.includes('cost') && col.cost === -1) col.cost = cIdx;
+        if (txt.includes('fair') && !txt.includes('un') && col.fair === -1) col.fair = cIdx;
         
-        dataStartRow = i + 1;
-        break;
+        cIdx += span;
+      }
+      if (col.company > -1 || col.fair > -1) {
+          dataStart = i + 1;
+          // If we found headers, stop scanning
+          if (col.fair > -1) break;
       }
     }
-
-    // GBDC Fallback if headers are weird
-    if (colIndices.company === -1) colIndices.company = 0; 
     
-    // --- Data Extraction ---
+    if (col.company === -1) col.company = 0;
+
     let currentCompany = null;
     let currentIndustry = null;
 
-    for (let i = dataStartRow; i < rows.length; i++) {
-      const rowHtml = rows[i];
-      // Reset cellRegex lastIndex for new row
-      cellRegex.lastIndex = 0;
-      
-      const cells: string[] = [];
-      let cMatch;
-      while ((cMatch = cellRegex.exec(rowHtml)) !== null) {
-        const attrs = cMatch[1];
-        const content = stripTags(cMatch[2]);
-        const colspanMatch = attrs.match(/colspan=["']?(\d+)["']?/i);
-        const colspan = colspanMatch ? parseInt(colspanMatch[1]) : 1;
-        cells.push(content);
-        for (let k = 1; k < colspan; k++) cells.push("");
-      }
-
-      if (cells.length < 3) continue;
-
-      let compName = cells[colIndices.company] || cells[0];
-      compName = cleanCompanyName(compName);
-      
-      if (/(total|subtotal|balance|liabilities)/i.test(compName)) continue;
-
-      let effectiveCompany = compName;
-      if (hasCompanySuffix(compName)) currentCompany = compName;
-      else if (currentCompany && (!compName || compName.length < 5)) effectiveCompany = currentCompany;
-      else if (!compName) continue;
-
-      // Extract Values
-      // Use detected indices, or fallback to end of row logic common in filings
-      const fvStr = colIndices.fairValue > -1 ? cells[colIndices.fairValue] : cells[cells.length - 1];
-      const costStr = colIndices.cost > -1 ? cells[colIndices.cost] : cells[cells.length - 2];
-      
-      const fairValue = cleanStrictNumeric(fvStr);
-      const cost = cleanStrictNumeric(costStr);
-
-      if (fairValue === null && cost === null) continue;
-
-      const key = `${effectiveCompany}|${fairValue}|${cost}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      pending.push({
-        filing_id: filingId,
-        company_name: effectiveCompany,
-        investment_type: colIndices.investmentType > -1 ? cells[colIndices.investmentType] : null,
-        industry: colIndices.industry > -1 ? cells[colIndices.industry] : currentIndustry,
-        interest_rate: colIndices.interestRate > -1 ? cells[colIndices.interestRate] : null,
-        maturity_date: colIndices.maturity > -1 ? parseDate(cells[colIndices.maturity]) : null,
-        par_amount: colIndices.par > -1 ? toMillions(cleanStrictNumeric(cells[colIndices.par]), scaleResult.scale) : null,
-        cost: toMillions(cost, scaleResult.scale),
-        fair_value: toMillions(fairValue, scaleResult.scale),
-        row_number: insertedCount + pending.length + 1,
-        source_pos: soiStart + match.index + i,
+    // Process Rows
+    for (let i = dataStart; i < rows.length; i++) {
+      const cells = Array.from(rows[i].querySelectorAll("td, th"));
+      // Flatten colspans into a straight array
+      const flatCells: string[] = [];
+      cells.forEach(c => {
+          const txt = c.textContent.trim();
+          const span = parseInt(c.getAttribute("colspan") || "1");
+          flatCells.push(txt);
+          for(let k=1; k<span; k++) flatCells.push("");
       });
 
-      if (pending.length >= INSERT_BATCH) await flush();
+      if (flatCells.length < 3) continue;
+
+      let comp = flatCells[col.company] || flatCells[0];
+      comp = cleanCompanyName(comp);
+      if (/(total|subtotal|balance)/i.test(comp)) continue;
+
+      let effectiveComp = comp;
+      if (hasCompanySuffix(comp)) currentCompany = comp;
+      else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
+      else if (!comp) continue;
+
+      const fairVal = col.fair > -1 ? cleanNumeric(flatCells[col.fair]) : cleanNumeric(flatCells[flatCells.length - 1]);
+      const costVal = col.cost > -1 ? cleanNumeric(flatCells[col.cost]) : cleanNumeric(flatCells[flatCells.length - 2]);
+
+      if (fairVal === null && costVal === null) continue;
+
+      const key = `${effectiveComp}-${fairVal}-${costVal}`;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+
+      pendingRows.push({
+        filing_id: filingId,
+        company_name: effectiveComp,
+        investment_type: col.type > -1 ? flatCells[col.type] : null,
+        industry: col.industry > -1 ? flatCells[col.industry] : currentIndustry,
+        interest_rate: col.interest > -1 ? flatCells[col.interest] : null,
+        maturity_date: col.maturity > -1 ? parseDate(flatCells[col.maturity]) : null,
+        par_amount: col.par > -1 ? toMillions(cleanNumeric(flatCells[col.par]), scale) : null,
+        cost: toMillions(costVal, scale),
+        fair_value: toMillions(fairVal, scale),
+        row_number: insertedCount + pendingRows.length + 1
+      });
     }
-  }
 
-  await flush();
-  
-  if (insertedCount > 0) {
-    await supabaseClient.from("filings").update({ parsed_successfully: true, value_scale: scaleResult.detected }).eq("id", filingId);
-  }
+    // Flush batch to DB
+    if (pendingRows.length >= 200) {
+      await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
+      insertedCount += 200;
+    }
+  } // End Table Loop
 
-  return { insertedCount, scaleResult };
+  if (pendingRows.length > 0) {
+    await supabaseClient.from("holdings").insert(pendingRows);
+    insertedCount += pendingRows.length;
+  }
+  return insertedCount;
 }
 
-/**
- * BXSL STREAMING PARSER - REGEX MODE
- * Replaces DOMParser with Regex to avoid WORKER_LIMIT OOM crashes
- */
-async function parseBXSLTableAndInsert(params: {
-  html: string;
-  filingId: string;
-  supabaseClient: any;
-  debugMode?: boolean;
-}): Promise<{ insertedCount: number; scaleResult: ScaleDetectionResult }> {
-  const { html, filingId, supabaseClient } = params;
-  console.log(`\n🟣 BXSL STREAMING PARSER (REGEX): Starting (input size: ${(html.length / 1024 / 1024).toFixed(2)} MB)`);
+// ======================================================================
+// HYBRID PARSER: BXSL
+// ======================================================================
+async function parseBXSL(html: string, filingId: string, supabaseClient: any, scale: number) {
+  console.log("🟣 Running BXSL Hybrid Parser...");
 
-  const scaleResult = detectScale(html);
-  const cleanHtml = html.replace(/\r\n|\r|\n/g, ' ');
-
-  // Look for SOI
-  const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(cleanHtml);
-  const soiStart = soiMatch?.index ?? -1;
-
-  if (soiStart === -1) return { insertedCount: 0, scaleResult };
-
-  // Limit search space
-  const MAX_SEARCH = 15_000_000;
-  const afterSoi = cleanHtml.slice(soiStart, Math.min(soiStart + MAX_SEARCH, cleanHtml.length));
-
-  // Try to find default period date
-  const defaultPeriodDateISO = extractPeriodDateFromText(afterSoi.slice(0, 3000));
-
-  console.log(`🔍 Scanning BXSL tables using Regex...`);
-
-  const tableRegex = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
-  const rowRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
-  const cellRegex = /<t[dh]\b([^>]*)>([\s\S]*?)<\/t[dh]>/gi;
-
-  const MAX_TABLES = 150;
-  const MAX_HOLDINGS = 2500;
-  const INSERT_BATCH = 250;
+  const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(html);
+  if (!soiMatch) return 0;
+  
+  const content = html.slice(soiMatch.index, Math.min(soiMatch.index + 15_000_000, html.length));
+  const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
 
   await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
 
   let insertedCount = 0;
-  let tableCount = 0;
-  const seen = new Set<string>();
-  const pending: any[] = [];
+  let tableMatch;
+  const pendingRows: any[] = [];
+  const seenKeys = new Set<string>();
 
-  const flush = async () => {
-    if (pending.length === 0) return;
-    const rows = pending.splice(0, pending.length);
-    const { error } = await supabaseClient.from("holdings").insert(rows);
-    if (error) console.error("Insert Error:", error.message);
-    else insertedCount += rows.length;
-    if (insertedCount % 500 === 0) console.log(`   Progress: inserted ${insertedCount}...`);
-  };
+  while ((tableMatch = tableRe.exec(content)) !== null) {
+    const tableHtml = tableMatch[0];
+    if (!/(llc|inc\.|corp\.|limited)/i.test(tableHtml)) continue;
 
-  let match;
-  while ((match = tableRegex.exec(afterSoi)) !== null && tableCount < MAX_TABLES && insertedCount < MAX_HOLDINGS) {
-    const tableContent = match[1];
+    // DOM Parse single table
+    const doc = new DOMParser().parseFromString(tableHtml, "text/html");
+    if (!doc) continue;
     
-    // Quick filter
-    if (!/(llc|inc\.|corp\.|l\.p\.|limited)/i.test(tableContent)) continue;
+    const rows = Array.from(doc.querySelectorAll("tr"));
     
-    tableCount++;
-    const rows: string[] = [];
-    let rMatch;
-    while ((rMatch = rowRegex.exec(tableContent)) !== null) {
-      rows.push(rMatch[1]);
-    }
-    if (rows.length < 5) continue;
-
-    // --- Column Detection ---
-    let colIndices = { company: -1, investmentType: -1, industry: -1, interestRate: -1, spread: -1, maturity: -1, par: -1, cost: -1, fairValue: -1 };
-    let headerFound = false;
-    let dataStartRow = 0;
+    let col = { company: -1, industry: -1, type: -1, interest: -1, spread: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
+    let dataStart = 0;
 
     for (let i = 0; i < Math.min(5, rows.length); i++) {
-      const rowHtml = rows[i];
-      const textOnly = stripTags(rowHtml).toLowerCase();
-      
-      if (textOnly.includes('portfolio company') || textOnly.includes('investments')) {
-        headerFound = true;
-        const cells: string[] = [];
-        let cMatch;
-        while ((cMatch = cellRegex.exec(rowHtml)) !== null) {
-          const attrs = cMatch[1];
-          const content = stripTags(cMatch[2]);
-          const colspanMatch = attrs.match(/colspan=["']?(\d+)["']?/i);
-          const colspan = colspanMatch ? parseInt(colspanMatch[1]) : 1;
-          cells.push(content);
-          for (let k = 1; k < colspan; k++) cells.push(""); 
-        }
+      const cells = Array.from(rows[i].querySelectorAll("td, th"));
+      let cIdx = 0;
+      for (const cell of cells) {
+        const txt = cell.textContent.toLowerCase();
+        const span = parseInt(cell.getAttribute("colspan") || "1");
 
-        cells.forEach((text, idx) => {
-          const t = text.toLowerCase();
-          if ((t.includes('company') || t.includes('investments')) && !t.includes('type') && colIndices.company === -1) colIndices.company = idx;
-          if ((t.includes('industry') || t.includes('sector')) && colIndices.industry === -1) colIndices.industry = idx;
-          if ((t.includes('type') || t.includes('investment')) && colIndices.investmentType === -1) colIndices.investmentType = idx;
-          if (t.includes('interest') && !t.includes('spread') && colIndices.interestRate === -1) colIndices.interestRate = idx;
-          if ((t.includes('spread') || t.includes('reference')) && colIndices.spread === -1) colIndices.spread = idx;
-          if (t.includes('maturity') && colIndices.maturity === -1) colIndices.maturity = idx;
-          if ((t.includes('principal') || t.includes('par')) && colIndices.par === -1) colIndices.par = idx;
-          if (t.includes('cost') && colIndices.cost === -1) colIndices.cost = idx;
-          if ((t.includes('fair') && !t.includes('unfair')) && colIndices.fairValue === -1) colIndices.fairValue = idx;
-        });
-        
-        dataStartRow = i + 1;
-        break;
+        if ((txt.includes('company') || txt.includes('investments')) && !txt.includes('type') && col.company === -1) col.company = cIdx;
+        if ((txt.includes('industry') || txt.includes('sector')) && col.industry === -1) col.industry = cIdx;
+        if (txt.includes('type') && col.type === -1) col.type = cIdx;
+        if (txt.includes('interest') && !txt.includes('spread') && col.interest === -1) col.interest = cIdx;
+        if ((txt.includes('spread') || txt.includes('reference')) && col.spread === -1) col.spread = cIdx;
+        if (txt.includes('maturity') && col.maturity === -1) col.maturity = cIdx;
+        if ((txt.includes('principal') || txt.includes('par')) && col.par === -1) col.par = cIdx;
+        if (txt.includes('cost') && col.cost === -1) col.cost = cIdx;
+        if (txt.includes('fair') && col.fair === -1) col.fair = cIdx;
+        cIdx += span;
       }
+      if (col.company > -1) { dataStart = i + 1; break; }
     }
-
-    if (colIndices.company === -1) colIndices.company = 0;
-
-    // --- Data Extraction ---
+    
+    if (col.company === -1) col.company = 0;
     let currentCompany = null;
     let currentIndustry = null;
 
-    for (let i = dataStartRow; i < rows.length; i++) {
-      const rowHtml = rows[i];
-      cellRegex.lastIndex = 0;
-      
-      const cells: string[] = [];
-      let cMatch;
-      while ((cMatch = cellRegex.exec(rowHtml)) !== null) {
-        const attrs = cMatch[1];
-        const content = stripTags(cMatch[2]);
-        const colspanMatch = attrs.match(/colspan=["']?(\d+)["']?/i);
-        const colspan = colspanMatch ? parseInt(colspanMatch[1]) : 1;
-        cells.push(content);
-        for (let k = 1; k < colspan; k++) cells.push("");
+    for (let i = dataStart; i < rows.length; i++) {
+      const cells = Array.from(rows[i].querySelectorAll("td, th"));
+      const flatCells: string[] = [];
+      cells.forEach(c => {
+          const txt = c.textContent.trim();
+          const span = parseInt(c.getAttribute("colspan") || "1");
+          flatCells.push(txt);
+          for(let k=1; k<span; k++) flatCells.push("");
+      });
+
+      if (flatCells.length < 3) continue;
+
+      let comp = flatCells[col.company] || flatCells[0];
+      comp = cleanCompanyName(comp);
+      if (/(total|subtotal)/i.test(comp)) continue;
+
+      let effectiveComp = comp;
+      if (hasCompanySuffix(comp)) currentCompany = comp;
+      else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
+      else if (!comp) continue;
+
+      if (col.industry > -1 && flatCells[col.industry] && flatCells[col.industry].length > 3) {
+          currentIndustry = flatCells[col.industry];
       }
 
-      if (cells.length < 3) continue;
+      const fairVal = col.fair > -1 ? cleanNumeric(flatCells[col.fair]) : cleanNumeric(flatCells[flatCells.length - 1]);
+      const costVal = col.cost > -1 ? cleanNumeric(flatCells[col.cost]) : cleanNumeric(flatCells[flatCells.length - 2]);
 
-      let compName = cells[colIndices.company] || cells[0];
-      compName = cleanCompanyName(compName);
-      
-      if (/(total|subtotal|balance|liabilities)/i.test(compName)) continue;
+      if (fairVal === null && costVal === null) continue;
 
-      let effectiveCompany = compName;
-      if (hasCompanySuffix(compName)) currentCompany = compName;
-      else if (currentCompany && (!compName || compName.length < 5)) effectiveCompany = currentCompany;
-      else if (!compName) continue;
+      const key = `${effectiveComp}-${fairVal}-${costVal}`;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
 
-      // Check Industry
-      if (colIndices.industry > -1 && cells[colIndices.industry] && cells[colIndices.industry].length > 3) {
-        currentIndustry = cells[colIndices.industry];
-      }
-
-      // Values
-      const fvStr = colIndices.fairValue > -1 ? cells[colIndices.fairValue] : cells[cells.length - 1];
-      const costStr = colIndices.cost > -1 ? cells[colIndices.cost] : cells[cells.length - 2];
-      
-      const fairValue = cleanStrictNumeric(fvStr);
-      const cost = cleanStrictNumeric(costStr);
-
-      if (fairValue === null && cost === null) continue;
-
-      const key = `${effectiveCompany}|${fairValue}|${cost}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      // BXSL Spread+Ref logic (often spans 2 cols in Regex parse if not merged, but simple concatenation is safer)
       let refRate = null;
-      if (colIndices.spread > -1) {
-        const spreadVal = cells[colIndices.spread];
-        const nextVal = cells[colIndices.spread + 1] || "";
-        refRate = `${spreadVal} ${nextVal}`.trim();
-      }
+      if (col.spread > -1 && flatCells[col.spread]) refRate = flatCells[col.spread];
 
-      pending.push({
+      pendingRows.push({
         filing_id: filingId,
-        company_name: effectiveCompany,
-        investment_type: colIndices.investmentType > -1 ? cells[colIndices.investmentType] : null,
+        company_name: effectiveComp,
+        investment_type: col.type > -1 ? flatCells[col.type] : null,
         industry: currentIndustry,
-        interest_rate: colIndices.interestRate > -1 ? cells[colIndices.interestRate] : null,
+        interest_rate: col.interest > -1 ? flatCells[col.interest] : null,
         reference_rate: refRate,
-        maturity_date: colIndices.maturity > -1 ? parseDate(cells[colIndices.maturity]) : null,
-        par_amount: colIndices.par > -1 ? toMillions(cleanStrictNumeric(cells[colIndices.par]), scaleResult.scale) : null,
-        cost: toMillions(cost, scaleResult.scale),
-        fair_value: toMillions(fairValue, scaleResult.scale),
-        row_number: insertedCount + pending.length + 1,
-        period_date: defaultPeriodDateISO,
+        maturity_date: col.maturity > -1 ? parseDate(flatCells[col.maturity]) : null,
+        par_amount: col.par > -1 ? toMillions(cleanNumeric(flatCells[col.par]), scale) : null,
+        cost: toMillions(costVal, scale),
+        fair_value: toMillions(fairVal, scale),
+        row_number: insertedCount + pendingRows.length + 1
       });
+    }
 
-      if (pending.length >= INSERT_BATCH) await flush();
+    if (pendingRows.length >= 200) {
+      await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
+      insertedCount += 200;
     }
   }
 
-  await flush();
-  
-  if (insertedCount > 0) {
-    await supabaseClient.from("filings").update({ parsed_successfully: true, value_scale: scaleResult.detected }).eq("id", filingId);
+  if (pendingRows.length > 0) {
+    await supabaseClient.from("holdings").insert(pendingRows);
+    insertedCount += pendingRows.length;
   }
-
-  return { insertedCount, scaleResult };
+  return insertedCount;
 }
 
 // ======================================================================
-// MAIN LOGIC
+// HYBRID PARSER: ARCC / GENERIC
+// ======================================================================
+async function parseARCC(html: string, filingId: string, supabaseClient: any, scale: number) {
+  console.log("📘 Running ARCC Hybrid Parser...");
+  
+  const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(html);
+  if (!soiMatch) return 0;
+  const content = html.slice(soiMatch.index, Math.min(soiMatch.index + 15_000_000, html.length));
+  const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
+
+  await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
+
+  let insertedCount = 0;
+  let tableMatch;
+  const pendingRows: any[] = [];
+  const seenKeys = new Set<string>();
+
+  while ((tableMatch = tableRe.exec(content)) !== null) {
+    const tableHtml = tableMatch[0];
+    if (!/(llc|inc|corp|l\.p\.|limited)/i.test(tableHtml)) continue;
+
+    const doc = new DOMParser().parseFromString(tableHtml, "text/html");
+    if (!doc) continue;
+    const rows = Array.from(doc.querySelectorAll("tr"));
+
+    let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
+    let dataStart = 0;
+
+    for (let i = 0; i < Math.min(8, rows.length); i++) {
+      const cells = Array.from(rows[i].querySelectorAll("td, th"));
+      let cIdx = 0;
+      for (const cell of cells) {
+        const txt = cell.textContent.toLowerCase();
+        const span = parseInt(cell.getAttribute("colspan") || "1");
+        
+        if ((txt.includes('company') || txt.includes('issuer')) && !txt.includes('type') && col.company === -1) col.company = cIdx;
+        if (txt.includes('industry') && col.industry === -1) col.industry = cIdx;
+        if (txt.includes('type') && col.type === -1) col.type = cIdx;
+        if (txt.includes('interest') && col.interest === -1) col.interest = cIdx;
+        if (txt.includes('maturity') && col.maturity === -1) col.maturity = cIdx;
+        if ((txt.includes('principal') || txt.includes('par')) && col.par === -1) col.par = cIdx;
+        if (txt.includes('cost') && col.cost === -1) col.cost = cIdx;
+        if (txt.includes('fair') && col.fair === -1) col.fair = cIdx;
+        cIdx += span;
+      }
+      if (col.company > -1) { dataStart = i + 1; break; }
+    }
+    
+    if (col.company === -1) col.company = 0;
+    let currentCompany = null;
+    let currentIndustry = null;
+
+    for (let i = dataStart; i < rows.length; i++) {
+      const cells = Array.from(rows[i].querySelectorAll("td, th"));
+      const flatCells: string[] = [];
+      cells.forEach(c => {
+          const txt = c.textContent.trim();
+          const span = parseInt(c.getAttribute("colspan") || "1");
+          flatCells.push(txt);
+          for(let k=1; k<span; k++) flatCells.push("");
+      });
+
+      if (flatCells.length < 3) continue;
+
+      // ARCC Industry Header Detection (Row has 1 cell with text, rest empty)
+      if (cells.length === 1 || (flatCells[0] && flatCells.slice(1).every(x => !x))) {
+          const header = flatCells[0];
+          if (header.length > 3 && !hasCompanySuffix(header) && !/(total|subtotal)/i.test(header)) {
+              currentIndustry = header;
+              continue;
+          }
+      }
+
+      let comp = flatCells[col.company] || flatCells[0];
+      comp = cleanCompanyName(comp);
+      if (/(total|subtotal|balance)/i.test(comp)) continue;
+
+      let effectiveComp = comp;
+      if (hasCompanySuffix(comp)) currentCompany = comp;
+      else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
+      else if (!comp) continue;
+
+      const fairVal = col.fair > -1 ? cleanNumeric(flatCells[col.fair]) : cleanNumeric(flatCells[flatCells.length - 1]);
+      const costVal = col.cost > -1 ? cleanNumeric(flatCells[col.cost]) : cleanNumeric(flatCells[flatCells.length - 2]);
+
+      if (fairVal === null && costVal === null) continue;
+
+      const key = `${effectiveComp}-${fairVal}-${costVal}`;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+
+      pendingRows.push({
+        filing_id: filingId,
+        company_name: effectiveComp,
+        investment_type: col.type > -1 ? flatCells[col.type] : null,
+        industry: col.industry > -1 ? flatCells[col.industry] : currentIndustry,
+        interest_rate: col.interest > -1 ? flatCells[col.interest] : null,
+        maturity_date: col.maturity > -1 ? parseDate(flatCells[col.maturity]) : null,
+        par_amount: col.par > -1 ? toMillions(cleanNumeric(flatCells[col.par]), scale) : null,
+        cost: toMillions(costVal, scale),
+        fair_value: toMillions(fairVal, scale),
+        row_number: insertedCount + pendingRows.length + 1
+      });
+    }
+
+    if (pendingRows.length >= 200) {
+      await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
+      insertedCount += 200;
+    }
+  }
+  if (pendingRows.length > 0) {
+    await supabaseClient.from("holdings").insert(pendingRows);
+    insertedCount += pendingRows.length;
+  }
+  return insertedCount;
+}
+
+// ======================================================================
+// MAIN SWITCHBOARD
 // ======================================================================
 
 function determineParserType(ticker: string | null, bdcName: string): 'ARCC' | 'GBDC' | 'BXSL' | 'GENERIC' {
@@ -601,66 +483,67 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
-    const { data: filing } = await supabaseClient.from("filings").select(`*, bdcs (cik, bdc_name, ticker)`).eq("id", filingId).single();
-    if (!filing) throw new Error("Filing not found");
+    const { data: filing, error: fError } = await supabaseClient
+      .from("filings")
+      .select(`*, bdcs (cik, bdc_name, ticker)`)
+      .eq("id", filingId)
+      .single();
+
+    if (fError || !filing) throw new Error("Filing not found");
 
     const { cik, bdc_name, ticker } = filing.bdcs;
     const accessionNo = filing.sec_accession_no;
-    const parserType = determineParserType(ticker, bdc_name);
     
-    console.log(`Processing ${accessionNo} (${parserType})`);
+    const parserType = determineParserType(ticker, bdc_name);
+    console.log(`Processing ${accessionNo} using ${parserType} parser`);
 
     const paddedCik = cik.replace(/^0+/, "");
     const accNoClean = accessionNo.replace(/-/g, "");
+    
+    // Fetch Index
     const indexUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accNoClean}/index.json`;
+    const indexRes = await fetch(indexUrl, { headers: { "User-Agent": SEC_USER_AGENT } });
+    if (!indexRes.ok) throw new Error("Failed to fetch index.json");
     
-    const indexJson = await fetchSecFile(indexUrl);
-    const index = JSON.parse(indexJson);
-    const docs = index.directory?.item || [];
-    
-    // Find HTML files
+    const indexJson = await indexRes.json();
+    const docs = indexJson.directory?.item || [];
     const htmDocs = docs.filter((d: any) => d.name.endsWith(".htm") || d.name.endsWith(".html"));
-    const prioritizedDocs = htmDocs.sort((a: any, b: any) => {
-      // Prioritize files with "schedule", "soi", "portfolio"
-      const scoreA = /schedule|soi|portfolio/i.test(a.name) ? 2 : (a.type === 'primary' ? 1 : 0);
-      const scoreB = /schedule|soi|portfolio/i.test(b.name) ? 2 : (b.type === 'primary' ? 1 : 0);
-      return scoreB - scoreA;
-    });
-
-    let processedCount = 0;
     
-    for (const doc of prioritizedDocs.slice(0, 10)) {
-      const docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accNoClean}/${doc.name}`;
-      console.log(`Checking ${doc.name}...`);
-      
-      const html = await fetchSecFile(docUrl);
-      
-      // Use Specialized Stream Parser for GBDC/BXSL if file is large (>1MB)
-      if (html.length > 1_000_000) {
-        if (parserType === 'GBDC') {
-          const { insertedCount } = await parseGBDCTableAndInsert({ html, filingId, supabaseClient });
-          if (insertedCount > 0) {
-            processedCount = insertedCount;
-            break;
-          }
-        }
-        else if (parserType === 'BXSL') {
-          const { insertedCount } = await parseBXSLTableAndInsert({ html, filingId, supabaseClient });
-          if (insertedCount > 0) {
-            processedCount = insertedCount;
-            break;
-          }
-        }
-      }
-      
-      // Fallback or Generic Parser Logic could be added here for ARCC/Others if needed
-      // (For brevity, assuming GBDC/BXSL were the ones crashing)
+    if (htmDocs.length === 0) throw new Error("No HTML found");
+
+    // Process largest file (most likely to contain schedule)
+    const targetDoc = htmDocs.sort((a: any, b: any) => parseInt(b.size) - parseInt(a.size))[0];
+    const docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accNoClean}/${targetDoc.name}`;
+    
+    const htmlRes = await fetch(docUrl, { headers: { "User-Agent": SEC_USER_AGENT } });
+    const html = await htmlRes.text();
+    const scaleRes = detectScale(html);
+    
+    let totalInserted = 0;
+
+    if (parserType === 'GBDC') {
+      totalInserted = await parseGBDC(html, filingId, supabaseClient, scaleRes.scale);
+    } else if (parserType === 'BXSL') {
+      totalInserted = await parseBXSL(html, filingId, supabaseClient, scaleRes.scale);
+    } else {
+      totalInserted = await parseARCC(html, filingId, supabaseClient, scaleRes.scale);
     }
 
-    return new Response(JSON.stringify({ success: true, count: processedCount }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    if (totalInserted > 0) {
+      await supabaseClient.from("filings")
+        .update({ parsed_successfully: true, value_scale: scaleRes.detected })
+        .eq("id", filingId);
+    }
+
+    return new Response(JSON.stringify({ success: true, count: totalInserted }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" }
+    });
 
   } catch (error) {
-    console.error(error);
-    return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Unknown Error" }), { status: 500, headers: corsHeaders });
+    console.error("Error:", error);
+    return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Unknown" }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" }
+    });
   }
 });
