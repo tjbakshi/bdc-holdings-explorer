@@ -1660,19 +1660,14 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
   const scaleResult = detectScale(html);
   console.log(`   Scale: ${scaleResult.detected} (confidence: ${scaleResult.confidence})`);
   
-  // STEP 2: Find SOI section using fast indexOf (NOT regex)
+  // STEP 2: Find SOI section (avoid large toLowerCase copy to reduce memory)
   console.log(`🔍 STEP 2: Searching for 'Schedule of Investments' section...`);
-  const lowerHtml = html.toLowerCase();
-  const soiKeywords = ['consolidated schedule of investments', 'schedule of investments'];
+  const soiRe = /(consolidated schedule of investments|schedule of investments)/i;
+  const soiMatch = soiRe.exec(html);
+  const soiStart = soiMatch?.index ?? -1;
   
-  let soiStart = -1;
-  for (const keyword of soiKeywords) {
-    const idx = lowerHtml.indexOf(keyword);
-    if (idx !== -1) {
-      soiStart = idx;
-      console.log(`   ✅ Found SOI at position ${idx} (keyword: "${keyword}")`);
-      break;
-    }
+  if (soiStart !== -1) {
+    console.log(`   ✅ Found SOI at position ${soiStart} (match: "${soiMatch?.[0]}")`);
   }
   
   if (soiStart === -1) {
@@ -1684,8 +1679,10 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
   console.log(`🔍 STEP 3: Extracting post-SOI section...`);
   const MAX_SEARCH = 10_000_000; // 10MB to capture full GBDC SOI
   const afterSoi = html.slice(soiStart, Math.min(soiStart + MAX_SEARCH, html.length));
-  const afterSoiLower = afterSoi.toLowerCase();
   console.log(`   Extracted ${(afterSoi.length / 1024).toFixed(0)} KB after SOI header`);
+  
+  const tableStartRe = /<table\b[^>]*>/ig;
+  const tableEndRe = /<\/table\s*>/ig;
   
   // STEP 4: Find and process holdings tables ONE AT A TIME to avoid memory issues
   // CRITICAL: Don't collect all table HTML - process each immediately
@@ -1711,17 +1708,23 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
   let hasFoundFirstTable = false;
   
   while (searchPos < afterSoi.length && tableCount < MAX_TABLES && holdings.length < MAX_HOLDINGS) {
-    const tableStartIdx = afterSoiLower.indexOf('<table', searchPos);
-    if (tableStartIdx === -1) break;
-    
-    const tableEndIdx = afterSoiLower.indexOf('</table>', tableStartIdx);
-    if (tableEndIdx === -1) break;
-    
+    tableStartRe.lastIndex = searchPos;
+    const startMatch = tableStartRe.exec(afterSoi);
+    if (!startMatch) break;
+    const tableStartIdx = startMatch.index;
+
+    tableEndRe.lastIndex = tableStartIdx;
+    const endMatch = tableEndRe.exec(afterSoi);
+    if (!endMatch) break;
+
+    const tableEndIdx = endMatch.index;
+    const tableEndLen = endMatch[0].length;
+
     tableCount++;
-    const tableHtml = afterSoi.slice(tableStartIdx, tableEndIdx + 8);
+    const tableHtml = afterSoi.slice(tableStartIdx, tableEndIdx + tableEndLen);
     const tableLower = tableHtml.toLowerCase();
     const tableSizeKB = tableHtml.length / 1024;
-    searchPos = tableEndIdx + 8;
+    searchPos = tableEndIdx + tableEndLen;
     
     if (tableCount <= 5 || tableCount % 20 === 0) {
       console.log(`   Table ${tableCount}: ${tableSizeKB.toFixed(0)} KB`);
