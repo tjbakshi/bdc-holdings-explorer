@@ -1688,7 +1688,7 @@ function parseLargeFilingSegment(htmlSegment: string): Holding[] {
 // ======================================================================
 // Switchboard pattern: route to specialized parsers based on BDC ticker
 
-type ParserType = 'ARCC' | 'GBDC' | 'BXSL' | 'GENERIC';
+type ParserType = 'ARCC' | 'GBDC' | 'BXSL' | 'OBDC' | 'GENERIC';
 
 interface ParseResult {
   holdings: Holding[];
@@ -1702,19 +1702,23 @@ interface ParseResult {
 function determineParserType(ticker: string | null, bdcName: string): ParserType {
   const tickerUpper = ticker?.toUpperCase() || '';
   const nameUpper = bdcName?.toUpperCase() || '';
-  
+
   if (tickerUpper === 'ARCC' || nameUpper.includes('ARES CAPITAL')) {
     return 'ARCC';
   }
-  
+
   if (tickerUpper === 'GBDC' || nameUpper.includes('GOLUB CAPITAL')) {
     return 'GBDC';
   }
-  
+
   if (tickerUpper.startsWith('BXSL') || nameUpper.includes('BLACKSTONE SECURED LENDING')) {
     return 'BXSL';
   }
-  
+
+  if (tickerUpper === 'OBDC' || nameUpper.includes('BLUE OWL CAPITAL')) {
+    return 'OBDC';
+  }
+
   // Default to generic parser for unknown BDCs
   return 'GENERIC';
 }
@@ -2957,6 +2961,470 @@ async function parseBXSLTableAndInsert(params: {
 }
 
 /**
+ * ============================================================================
+ * OBDC STREAMING PARSER - Optimized for Blue Owl Capital Corporation filings
+ * ============================================================================
+ *
+ * Based on BXSL/GBDC slicing method - processes tables one at a time and inserts
+ * holdings in batches to avoid memory limits.
+ *
+ * OBDC-specific adjustments:
+ * - Company column: 'Company' with footnote references like (3)(4)(9)
+ * - Interest rate split into 3 columns: Ref. Rate, Cash, PIK
+ * - Values in thousands
+ * - Industry groupings similar to other BDCs
+ */
+async function parseOBDCTableAndInsert(params: {
+  html: string;
+  filingId: string;
+  supabaseClient: any;
+  debugMode?: boolean;
+}): Promise<{ insertedCount: number; scaleResult: ScaleDetectionResult }> {
+  const { html, filingId, supabaseClient } = params;
+  const debugMode = params.debugMode ?? false;
+
+  console.log(`\n🦉 OBDC STREAMING PARSER: Starting (input size: ${(html.length / 1024 / 1024).toFixed(2)} MB)`);
+  console.log(`🔧 OBDC: Using Slicing Method for ${(html.length / 1024 / 1024).toFixed(0)}MB file.`);
+
+  console.log(`🔍 STEP 1: Detecting value scale...`);
+  const scaleResult = detectScale(html);
+  console.log(`   Scale: ${scaleResult.detected} (confidence: ${scaleResult.confidence})`);
+
+  console.log(`🔍 STEP 2: Searching for 'Schedule of Investments' section...`);
+  const soiRe = /(consolidated schedule of investments|schedule of investments)/i;
+  const soiMatch = soiRe.exec(html);
+  const soiStart = soiMatch?.index ?? -1;
+
+  if (soiStart === -1) {
+    console.log(`   ❌ No SOI section found`);
+    return { insertedCount: 0, scaleResult };
+  }
+  console.log(`   ✅ Found SOI at position ${soiStart} (match: "${soiMatch?.[0]}")`);
+
+  // Extract default period date from SOI header
+  const soiHeaderSection = html.slice(soiStart, Math.min(soiStart + 3000, html.length));
+  const defaultPeriodDateISO = extractPeriodDateFromText(soiHeaderSection);
+  if (defaultPeriodDateISO) {
+    console.log(`🔧 OBDC: Default Period Date (SOI header) = ${defaultPeriodDateISO}`);
+  } else {
+    console.log(`⚠️ OBDC: Could not detect default period date from SOI header.`);
+  }
+
+  console.log(`🔍 STEP 3: Extracting post-SOI section...`);
+  const MAX_SEARCH = 10_000_000; // 10MB to capture full OBDC SOI
+  const afterSoi = html.slice(soiStart, Math.min(soiStart + MAX_SEARCH, html.length));
+  console.log(`   Extracted ${(afterSoi.length / 1024).toFixed(0)} KB after SOI header`);
+
+  console.log(`🔍 STEP 4: Scanning and processing holdings tables (streaming inserts)...`);
+  const tableStartRe = /<table\b[^>]*>/ig;
+  const tableEndRe = /<\/table\s*>/ig;
+
+  const MAX_TABLES = 150;
+  const MAX_HOLDINGS = 5000;  // OBDC can have many holdings
+  const INSERT_BATCH = 250;
+
+  // Always start clean for this filing
+  const { error: deleteError } = await supabaseClient
+    .from("holdings")
+    .delete()
+    .eq("filing_id", filingId);
+  if (deleteError) {
+    console.error(`   ⚠️ Error clearing existing holdings:`, deleteError);
+  }
+
+  let searchPos = 0;
+  let tableCount = 0;
+  let holdingsTableCount = 0;
+  let insertedCount = 0;
+  let totalProcessedRows = 0;
+  let totalRowsSkipped = 0;
+
+  const seen = new Set<string>();
+  const pending: Holding[] = [];
+  let globalCurrentIndustry: string | null = null;
+
+  // OBDC column indices
+  let savedColIndices = {
+    company: 0,
+    investmentType: -1,
+    industry: -1,
+    refRate: -1,      // "Ref. Rate" column (e.g., "S+")
+    cashRate: -1,     // "Cash" column (e.g., "4.50%")
+    pikRate: -1,      // "PIK" column (e.g., "0.48%")
+    maturity: -1,
+    par: -1,
+    cost: -1,
+    fairValue: -1,
+  };
+  let hasFoundFirstTable = false;
+
+  const flush = async () => {
+    if (pending.length === 0) return;
+
+    const rows = pending.splice(0, pending.length).map((h, idx) => ({
+      filing_id: filingId,
+      company_name: h.company_name,
+      investment_type: h.investment_type,
+      industry: h.industry,
+      description: h.description,
+      interest_rate: h.interest_rate,
+      reference_rate: h.reference_rate,
+      maturity_date: h.maturity_date,
+      par_amount: toMillions(h.par_amount, scaleResult.scale),
+      cost: toMillions(h.cost, scaleResult.scale),
+      fair_value: toMillions(h.fair_value, scaleResult.scale),
+      row_number: insertedCount + idx + 1,
+      source_pos: h.source_pos ?? null,
+      period_date: h.period_date ?? defaultPeriodDateISO,
+    }));
+
+    const { error: insertError } = await supabaseClient.from("holdings").insert(rows as any);
+    if (insertError) {
+      console.error(`   ❌ Insert error (batch size ${rows.length}):`, insertError);
+      return;
+    }
+
+    insertedCount += rows.length;
+    if (insertedCount % 500 === 0) {
+      console.log(`   Progress: inserted ${insertedCount} holdings...`);
+    }
+  };
+
+  // Helper to clean company name - remove footnote references like (3)(4)(9)
+  const cleanOBDCCompanyName = (name: string): string => {
+    return name
+      .replace(/\(\d+\)/g, '') // Remove footnote markers like (3), (4), (9)
+      .replace(/\s+/g, ' ')    // Normalize whitespace
+      .trim();
+  };
+
+  while (searchPos < afterSoi.length && tableCount < MAX_TABLES && insertedCount < MAX_HOLDINGS) {
+    tableStartRe.lastIndex = searchPos;
+    const startMatch = tableStartRe.exec(afterSoi);
+    if (!startMatch) break;
+    const tableStartIdx = startMatch.index;
+
+    tableEndRe.lastIndex = tableStartIdx;
+    const endMatch = tableEndRe.exec(afterSoi);
+    if (!endMatch) break;
+
+    const tableEndIdx = endMatch.index;
+    const tableEndLen = endMatch[0].length;
+
+    tableCount++;
+    const tableHtml = afterSoi.slice(tableStartIdx, tableEndIdx + tableEndLen);
+    const tableLower = tableHtml.toLowerCase();
+    const tableSizeKB = tableHtml.length / 1024;
+    searchPos = tableEndIdx + tableEndLen;
+
+    if (tableCount <= 5 || tableCount % 20 === 0) {
+      console.log(`   Table ${tableCount}: ${tableSizeKB.toFixed(0)} KB`);
+    }
+
+    // OBDC tables can be smaller than other BDCs
+    if (tableHtml.length < 5_000) continue;
+
+    // Determine period date for this table
+    const localHeaderRaw = afterSoi.slice(Math.max(0, tableStartIdx - 2000), tableStartIdx);
+    const tablePeriodDateISO = extractPeriodDateFromText(localHeaderRaw) ?? defaultPeriodDateISO;
+
+    // Skip financial summary tables
+    if (
+      tableLower.includes("total liabilities") ||
+      tableLower.includes("total assets") ||
+      tableLower.includes("stockholders") ||
+      tableLower.includes("shareholders") ||
+      tableLower.includes("statements of operations") ||
+      tableLower.includes("statements of changes") ||
+      (tableLower.includes("liabilities") && tableLower.includes("assets") && !tableLower.includes("portfolio"))
+    ) {
+      continue;
+    }
+
+    // Count company suffixes to identify holdings tables
+    const companyMatches = tableLower.match(/(?:llc|inc\.|corp\.|l\.p\.|, lp|ltd\.)/gi) || [];
+    const companyCount = companyMatches.length;
+    const hasCompanies = companyCount >= 5;
+    const hasFairValue = tableLower.includes("fair value") || tableLower.includes("fair");
+    const hasCost = tableLower.includes("cost") || tableLower.includes("amortized");
+
+    if (!hasCompanies || (!hasFairValue && !hasCost)) continue;
+
+    holdingsTableCount++;
+    console.log(`   ✅ HOLDINGS TABLE ${holdingsTableCount} at index ${tableCount} (${tableSizeKB.toFixed(0)} KB, ${companyCount} companies)`);
+
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(`<html><body>${tableHtml}</body></html>`, "text/html");
+    } catch {
+      continue;
+    }
+    if (!doc) continue;
+
+    const table = doc.querySelector("table") as Element;
+    if (!table) continue;
+
+    const rows = Array.from(table.querySelectorAll("tr")) as Element[];
+
+    // OBDC-specific column detection
+    let colIndices = { ...savedColIndices };
+    if (!hasFoundFirstTable) {
+      for (let i = 0; i < Math.min(5, rows.length); i++) {
+        const cells = Array.from(rows[i].querySelectorAll("th, td")) as Element[];
+        let position = 0;
+        for (const cell of cells) {
+          const text = (cell.textContent?.toLowerCase() || "").replace(/\s+/g, " ").trim();
+          const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+
+          // OBDC-specific: 'Company' for company column (first column)
+          if (text.includes("company") && !text.includes("type") && !text.includes("portfolio") && colIndices.company === 0) {
+            colIndices.company = position;
+            console.log(`   🔍 OBDC: Found Company column at position ${position}`);
+          }
+          // Industry column (not typically in OBDC main table)
+          else if ((text.includes("industry") || text.includes("sector")) && colIndices.industry === -1) {
+            colIndices.industry = position;
+          }
+          // Investment type column (second column in OBDC)
+          else if (text.includes("investment") && !text.includes("schedule") && !text.includes("interest") && colIndices.investmentType === -1) {
+            colIndices.investmentType = position;
+            console.log(`   🔍 OBDC: Found Investment Type column at position ${position}`);
+          }
+          // OBDC: Interest rate has 3 parts: Ref. Rate, Cash, PIK
+          // "Ref. Rate" or "Reference Rate"
+          else if ((text.includes("ref") || text.includes("reference")) && text.includes("rate") && colIndices.refRate === -1) {
+            colIndices.refRate = position;
+            console.log(`   🔍 OBDC: Found Ref. Rate column at position ${position}`);
+          }
+          // "Cash" column
+          else if ((text === "cash" || text.includes("cash rate")) && colIndices.cashRate === -1) {
+            colIndices.cashRate = position;
+            console.log(`   🔍 OBDC: Found Cash column at position ${position}`);
+          }
+          // "PIK" column
+          else if ((text === "pik" || text.includes("pik rate")) && colIndices.pikRate === -1) {
+            colIndices.pikRate = position;
+            console.log(`   🔍 OBDC: Found PIK column at position ${position}`);
+          }
+          // Maturity Date
+          else if ((text.includes("maturity") && text.includes("date")) && colIndices.maturity === -1) {
+            colIndices.maturity = position;
+            console.log(`   🔍 OBDC: Found Maturity Date column at position ${position}`);
+          }
+          // Par/Units
+          else if ((text.includes("par") || text.includes("units")) && !text.includes("fair") && colIndices.par === -1) {
+            colIndices.par = position;
+            console.log(`   🔍 OBDC: Found Par/Units column at position ${position}`);
+          }
+          // Amortized Cost
+          else if ((text.includes("cost") || text.includes("amortized")) && !text.includes("fair") && colIndices.cost === -1) {
+            colIndices.cost = position;
+            console.log(`   🔍 OBDC: Found Cost column at position ${position}`);
+          }
+          // Fair Value
+          else if ((text.includes("fair value") || text.includes("fair")) && !text.includes("unfair") && colIndices.fairValue === -1) {
+            colIndices.fairValue = position;
+            console.log(`   🔍 OBDC: Found Fair Value column at position ${position}`);
+          }
+          position += colspan;
+        }
+      }
+      if (colIndices.fairValue === -1 && colIndices.cost >= 0) colIndices.fairValue = colIndices.cost + 1;
+      savedColIndices = { ...colIndices };
+      hasFoundFirstTable = true;
+      console.log(`   📋 OBDC Column indices: company=${colIndices.company}, investmentType=${colIndices.investmentType}, industry=${colIndices.industry}, refRate=${colIndices.refRate}, cashRate=${colIndices.cashRate}, pikRate=${colIndices.pikRate}, maturity=${colIndices.maturity}, par=${colIndices.par}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
+    }
+
+    // Find data start row using company suffixes
+    let dataStartRow = -1;
+    for (let i = 0; i < rows.length; i++) {
+      const rowText = rows[i].textContent || "";
+      if (/(LLC|Inc\.|Corp\.|Co\.|L\.P\.|LP|Ltd\.)/i.test(rowText)) {
+        dataStartRow = i;
+        break;
+      }
+    }
+    if (dataStartRow === -1) continue;
+
+    let currentIndustry: string | null = globalCurrentIndustry;
+    let currentCompany: string | null = null;
+
+    for (let i = dataStartRow; i < rows.length && insertedCount + pending.length < MAX_HOLDINGS; i++) {
+      const row = rows[i];
+      const cells = Array.from(row.querySelectorAll("td, th")) as Element[];
+
+      const rowText = row.textContent?.trim() || "";
+      if (!rowText || /^[-—\s]*$/.test(rowText)) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      const getCellAtPos = (pos: number): Element | null => {
+        if (pos < 0) return null;
+        let currentPos = 0;
+        for (const cell of cells) {
+          const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+          if (currentPos <= pos && pos < currentPos + colspan) return cell;
+          currentPos += colspan;
+        }
+        return cells[Math.min(pos, cells.length - 1)] || null;
+      };
+
+      const companyCell = getCellAtPos(colIndices.company);
+      const rawCompanyName = companyCell?.textContent?.trim() || "";
+      if (/^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(rawCompanyName)) continue;
+
+      const cleanedName = cleanOBDCCompanyName(rawCompanyName);
+      let effectiveCompany = cleanedName;
+      if (cleanedName && hasCompanySuffix(cleanedName)) currentCompany = cleanedName;
+      else if (currentCompany && (!cleanedName || cleanedName.length < 5)) effectiveCompany = currentCompany;
+      else if (!cleanedName || cleanedName.length < 3) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      // Check for industry header row (OBDC has industry groupings like "Chemicals", "Consumer products")
+      // Industry headers typically have no fair value or cost data
+      const isLikelyIndustryHeader = cells.length <= 3 &&
+                                     cleanedName.length > 3 &&
+                                     !/(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd\.|Co\.)/i.test(cleanedName) &&
+                                     !rowText.match(/\d{1,2}\/\d{4}|\d{4}/); // No dates
+
+      if (isLikelyIndustryHeader) {
+        // Check if this row has any numeric values (if it does, it's probably not just an industry header)
+        const hasNumbers = /\d{1,3}[,\d]*/.test(rowText);
+        if (!hasNumbers) {
+          currentIndustry = cleanedName;
+          console.log(`   🏷️ OBDC: Industry header detected: "${currentIndustry}"`);
+          continue;
+        }
+      }
+
+      // Also check dedicated industry column if available
+      if (colIndices.industry >= 0) {
+        const industryCell = getCellAtPos(colIndices.industry);
+        const industryText = industryCell?.textContent?.trim();
+        if (industryText && industryText.length > 3 && industryText.length < 100 && !/(LLC|Inc\.|Corp\.)/i.test(industryText)) {
+          currentIndustry = industryText;
+        }
+      }
+
+      const fairValueCell = colIndices.fairValue >= 0 ? getCellAtPos(colIndices.fairValue) : null;
+      const fairValue = cleanGBDCNumeric(fairValueCell?.textContent);
+      const costCell = colIndices.cost >= 0 ? getCellAtPos(colIndices.cost) : null;
+      const cost = cleanGBDCNumeric(costCell?.textContent);
+
+      if (fairValue === null && cost === null) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      let investmentType: string | null = null;
+      if (colIndices.investmentType >= 0) {
+        const typeCell = getCellAtPos(colIndices.investmentType);
+        const typeText = typeCell?.textContent?.trim();
+        if (typeText && typeText.length > 2 && typeText.length < 150) investmentType = typeText;
+      }
+
+      // OBDC: Combine 3-part interest rate (Ref. Rate + Cash + PIK)
+      let interestRate: string | null = null;
+      let referenceRate: string | null = null;
+
+      const refRateParts: string[] = [];
+
+      if (colIndices.refRate >= 0) {
+        const refCell = getCellAtPos(colIndices.refRate);
+        const refText = refCell?.textContent?.trim();
+        if (refText && refText.length > 0 && !/^[-—\s]*$/.test(refText) && refText !== 'N/A') {
+          refRateParts.push(refText);
+        }
+      }
+
+      if (colIndices.cashRate >= 0) {
+        const cashCell = getCellAtPos(colIndices.cashRate);
+        const cashText = cashCell?.textContent?.trim();
+        if (cashText && cashText.length > 0 && !/^[-—\s]*$/.test(cashText) && cashText !== 'N/A') {
+          refRateParts.push(cashText);
+        }
+      }
+
+      let pikText: string | null = null;
+      if (colIndices.pikRate >= 0) {
+        const pikCell = getCellAtPos(colIndices.pikRate);
+        pikText = pikCell?.textContent?.trim();
+        if (pikText && pikText.length > 0 && !/^[-—\s]*$/.test(pikText) && pikText !== 'N/A') {
+          refRateParts.push(`PIK: ${pikText}`);
+        }
+      }
+
+      if (refRateParts.length > 0) {
+        referenceRate = refRateParts.join(' ');
+        interestRate = referenceRate; // Also store in interest_rate for compatibility
+      }
+
+      const parCell = colIndices.par >= 0 ? getCellAtPos(colIndices.par) : null;
+      const parAmount = cleanGBDCNumeric(parCell?.textContent);
+
+      const maturityCell = colIndices.maturity >= 0 ? getCellAtPos(colIndices.maturity) : null;
+      const maturityDate = parseDate(maturityCell?.textContent?.trim());
+
+      const key = `${effectiveCompany}|${investmentType || ""}|${fairValue || ""}|${cost || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      pending.push({
+        company_name: effectiveCompany,
+        investment_type: investmentType,
+        industry: currentIndustry,
+        description: null,
+        interest_rate: interestRate,
+        reference_rate: referenceRate,
+        maturity_date: maturityDate,
+        par_amount: parAmount,
+        cost,
+        fair_value: fairValue,
+        source_pos: soiStart + tableStartIdx + i,
+        period_date: tablePeriodDateISO,
+      });
+      totalProcessedRows++;
+
+      if (pending.length >= INSERT_BATCH) {
+        await flush();
+      }
+    }
+
+    globalCurrentIndustry = currentIndustry;
+
+    if (debugMode && holdingsTableCount >= 2) {
+      console.log(`   (debug) stopping early after 2 holdings tables`);
+      break;
+    }
+  }
+
+  await flush();
+
+  console.log(`\n🦉 OBDC STREAMING: Completed - inserted ${insertedCount} holdings from ${holdingsTableCount} tables (${totalProcessedRows} processed, ${totalRowsSkipped} skipped)`);
+  console.log(`   📊 OBDC Stats: Processed ${totalProcessedRows} rows, Skipped ${totalRowsSkipped} rows, Inserted ${insertedCount} unique holdings`);
+
+  if (insertedCount === 0) {
+    console.log(`⚠️ OBDC: No holdings inserted; check table detection/column mapping logs above.`);
+  }
+
+  if (totalRowsSkipped > totalProcessedRows * 2) {
+    console.log(`⚠️ OBDC: High skip rate (${totalRowsSkipped} skipped vs ${totalProcessedRows} processed) - check column indices and parsing logic`);
+  }
+
+  if (insertedCount > 100) {
+    await supabaseClient
+      .from("filings")
+      .update({ parsed_successfully: true, value_scale: scaleResult.detected } as any)
+      .eq("id", filingId);
+  }
+
+  return { insertedCount, scaleResult };
+}
+
+/**
  * Generic parser for unknown BDCs - uses conservative settings
  * Falls back to the standard ARCC logic but with more lenient column matching
  */
@@ -3206,7 +3674,7 @@ serve(async (req) => {
               continue;
             }
 
-            // For ARCC and other BDCs, use the existing segmented-DOM approach
+            // For OBDC, ARCC and other BDCs, use the existing segmented-DOM approach
             console.log(`   🔀 Using ARCC-style segmented parsing for large file`);
 
             // Find the boundaries of the Schedule of Investments section
