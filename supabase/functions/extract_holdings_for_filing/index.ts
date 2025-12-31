@@ -1438,6 +1438,91 @@ function parseHtmlScheduleOfInvestments(
 }
 
 // ======================================================================
+// DIRECT SEGMENT PARSER FOR LARGE FILINGS (SEGMENTED DOM PARSING)
+// ======================================================================
+// This parser is used for segmented parsing of large files where we've already
+// determined the SOI boundaries. It skips the SOI keyword search and parses
+// the segment directly using DOM. This is critical for ARCC 10-K filings
+// which are 20MB+ and need to be parsed in 150KB segments.
+
+function parseSegmentDirect(
+  segment: string,
+  debugMode = false,
+  initialIndustry: string | null = null,
+  initialPeriodDate: string | null = null
+): { holdings: Holding[]; lastIndustry: string | null; lastPeriodDate: string | null } {
+  const maxRowsPerTable = 3000;
+  const maxHoldings = 500; // Per-segment limit
+  
+  // Track industry and period_date state
+  let carryIndustry: string | null = initialIndustry;
+  let carryPeriodDate: string | null = initialPeriodDate;
+  const allHoldings: Holding[] = [];
+  
+  try {
+    // ============ PER-TABLE PERIOD DATE EXTRACTION ============
+    // Find all table positions in this segment and extract period dates from pre-table text
+    const tablePeriodDates = new Map<number, string | null>();
+    const tableStartRe = /<table\b[^>]*>/gi;
+    let tableMatch;
+    let tableIndex = 0;
+    
+    while ((tableMatch = tableStartRe.exec(segment)) !== null) {
+      tableIndex++;
+      const tableStartIdx = tableMatch.index;
+      
+      // Look at the 2,000 characters immediately before this <table> tag
+      const localHeaderRaw = segment.slice(Math.max(0, tableStartIdx - 2000), tableStartIdx);
+      const tablePeriodDateISO = extractPeriodDateFromText(localHeaderRaw);
+      
+      // Store the found date (or null if not found)
+      tablePeriodDates.set(tableIndex, tablePeriodDateISO);
+      
+      if (tablePeriodDateISO && debugMode) {
+        console.log(`🔧 Segment: Table ${tableIndex} header date: ${tablePeriodDateISO}`);
+      }
+    }
+    
+    // Try to extract a default period date from the start of the segment if no carry
+    if (!carryPeriodDate) {
+      const segmentStart = segment.slice(0, 5000);
+      carryPeriodDate = extractPeriodDateFromText(segmentStart);
+      if (carryPeriodDate && debugMode) {
+        console.log(`🔧 Segment: Default Period Date = ${carryPeriodDate}`);
+      }
+    }
+    
+    // Parse the segment directly with DOM parser (no SOI keyword extraction)
+    const doc = new DOMParser().parseFromString(segment, "text/html");
+    if (!doc) {
+      return { holdings: [], lastIndustry: carryIndustry, lastPeriodDate: carryPeriodDate };
+    }
+    
+    const tables = Array.from(doc.querySelectorAll("table")) as Element[];
+    
+    // Parse tables directly
+    const parseResult = parseTables(
+      tables,
+      maxRowsPerTable,
+      maxHoldings,
+      debugMode,
+      carryIndustry,
+      tablePeriodDates,
+      carryPeriodDate
+    );
+    
+    allHoldings.push(...parseResult.holdings);
+    carryIndustry = parseResult.lastIndustry;
+    carryPeriodDate = parseResult.lastPeriodDate;
+    
+  } catch (error) {
+    console.error("Error in parseSegmentDirect:", error);
+  }
+  
+  return { holdings: allHoldings, lastIndustry: carryIndustry, lastPeriodDate: carryPeriodDate };
+}
+
+// ======================================================================
 // LIGHTWEIGHT REGEX-BASED PARSER FOR LARGE FILINGS
 // ======================================================================
 // This parser avoids DOM parsing entirely to minimize CPU usage.
@@ -3391,8 +3476,8 @@ serve(async (req) => {
                     continue;
                   }
                   
-                  // Parse with DOM parser (but with small segment size), passing carry-forward industry and period_date
-                  const segmentResult = parseHtmlScheduleOfInvestments(segment, false, carryIndustry, carryPeriodDate);
+                  // Parse segment DIRECTLY with DOM (skip SOI keyword search since we've already defined segment boundaries)
+                  const segmentResult = parseSegmentDirect(segment, false, carryIndustry, carryPeriodDate);
                   const segmentHoldings = segmentResult.holdings;
                   carryIndustry = segmentResult.lastIndustry; // Carry forward industry state to next segment
                   carryPeriodDate = segmentResult.lastPeriodDate; // Carry forward period_date state to next segment
