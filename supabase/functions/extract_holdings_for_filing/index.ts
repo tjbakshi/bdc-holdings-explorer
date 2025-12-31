@@ -1699,30 +1699,38 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       let headerRow: Element | null = null;
       let headerRowIndex = 0;
       
+      // Log first few rows to understand table structure
+      console.log(`🔧 GBDC Parser: Table has ${rows.length} rows, scanning for header...`);
+      
       for (let i = 0; i < Math.min(15, rows.length); i++) {
         const rowText = rows[i].textContent?.toLowerCase() || '';
+        const firstFewChars = rowText.slice(0, 100).replace(/\s+/g, ' ').trim();
+        
+        // Log first 5 rows to understand structure
+        if (i < 5) {
+          console.log(`🔧 GBDC Parser: Row ${i}: "${firstFewChars}..."`);
+        }
+        
         // GBDC headers typically have: Investment, Industry, Interest Rate/Spread, Maturity, Par, Cost, Fair Value
         if ((rowText.includes('investment') || rowText.includes('portfolio')) && 
             (rowText.includes('fair value') || rowText.includes('fair'))) {
           headerRow = rows[i];
           headerRowIndex = i;
+          console.log(`🔧 GBDC Parser: Found header at row ${i}`);
           break;
         }
       }
       
       if (!headerRow) {
-        if (debugMode) console.log(`🔧 GBDC Parser: No header row found in table`);
+        console.log(`🔧 GBDC Parser: No header row found in table (scanned ${Math.min(15, rows.length)} rows)`);
         continue;
       }
       
-      // Get GBDC-specific column indices
+      // Get GBDC-specific column indices - this logs the headers
       const colIndices = findGBDCColumnIndices(headerRow);
-      if (debugMode) {
-        console.log(`🔧 GBDC Parser: Column indices:`, colIndices);
-      }
       
       if (colIndices.investment === -1 || colIndices.fairValue === -1) {
-        if (debugMode) console.log(`🔧 GBDC Parser: Missing required columns (investment or fairValue)`);
+        console.log(`🔧 GBDC Parser: Missing required columns (investment=${colIndices.investment}, fairValue=${colIndices.fairValue})`);
         continue;
       }
       
