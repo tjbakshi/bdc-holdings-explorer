@@ -3194,8 +3194,8 @@ async function parseOBDCTableAndInsert(params: {
       console.log(`   Table ${tableCount}: ${tableSizeKB.toFixed(0)} KB`);
     }
 
-    // OBDC tables can be smaller than other BDCs
-    if (tableHtml.length < 5_000) continue;
+    // OBDC tables can be smaller than other BDCs - lower threshold to catch more tables
+    if (tableHtml.length < 2_000) continue;
 
     // Determine period date for this table
     const localHeaderRaw = afterSoi.slice(Math.max(0, tableStartIdx - 2000), tableStartIdx);
@@ -3214,10 +3214,10 @@ async function parseOBDCTableAndInsert(params: {
       continue;
     }
 
-    // Count company suffixes to identify holdings tables
-    const companyMatches = tableLower.match(/(?:llc|inc\.|corp\.|l\.p\.|, lp|ltd\.)/gi) || [];
+    // Count company suffixes to identify holdings tables - be more permissive for OBDC
+    const companyMatches = tableLower.match(/(?:llc|inc\.|corp\.|l\.p\.|, lp|ltd\.|holdings|group)/gi) || [];
     const companyCount = companyMatches.length;
-    const hasCompanies = companyCount >= 5;
+    const hasCompanies = companyCount >= 2; // Lowered from 5 to 2 to catch smaller tables
     const hasFairValue = tableLower.includes("fair value") || tableLower.includes("fair");
     const hasCost = tableLower.includes("cost") || tableLower.includes("amortized");
 
@@ -3358,8 +3358,10 @@ async function parseOBDCTableAndInsert(params: {
 
       // Check for industry header row (OBDC has industry groupings like "Chemicals", "Consumer products")
       // Industry headers typically have no fair value or cost data
-      const isLikelyIndustryHeader = cells.length <= 3 &&
+      // Be more conservative - only treat as industry header if cells.length is exactly 1 or row has no dollar values
+      const isLikelyIndustryHeader = cells.length === 1 &&
                                      cleanedName.length > 3 &&
+                                     cleanedName.length < 100 &&
                                      !/(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd\.|Co\.)/i.test(cleanedName) &&
                                      !rowText.match(/\d{1,2}\/\d{4}|\d{4}/); // No dates
 
@@ -3477,7 +3479,7 @@ async function parseOBDCTableAndInsert(params: {
   await flush();
 
   console.log(`\n🦉 OBDC STREAMING: Completed - inserted ${insertedCount} holdings from ${holdingsTableCount} tables (${totalProcessedRows} processed, ${totalRowsSkipped} skipped)`);
-  console.log(`   📊 OBDC Stats: Processed ${totalProcessedRows} rows, Skipped ${totalRowsSkipped} rows, Inserted ${insertedCount} unique holdings`);
+  console.log(`   📊 OBDC Stats: Total tables scanned: ${tableCount}, Holdings tables found: ${holdingsTableCount}, Rows processed: ${totalProcessedRows}, Rows skipped: ${totalRowsSkipped}, Holdings inserted: ${insertedCount}`);
 
   if (insertedCount === 0) {
     console.log(`⚠️ OBDC: No holdings inserted; check table detection/column mapping logs above.`);
