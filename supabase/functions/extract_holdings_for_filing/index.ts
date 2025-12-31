@@ -1930,13 +1930,26 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
         return t.length > 1 && !/^[-—$\s]*$/.test(t);
       });
       
-      if (nonEmptyCells.length === 1 && rawCompanyName.length > 3 && rawCompanyName.length < 80) {
-        const looksLikeCompany = /(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd)/i.test(rawCompanyName);
-        const looksLikeTotal = /^(Total|Subtotal|Net\s)/i.test(rawCompanyName);
+      // GBDC: Industry headers are rows where:
+      // 1. Few non-empty cells (typically 1-3)
+      // 2. Text doesn't look like a company name
+      // 3. Text is a known industry or reasonable length
+      if (nonEmptyCells.length <= 3) {
+        // Check the first non-empty cell for industry name
+        const firstCellText = nonEmptyCells[0]?.textContent?.trim() || '';
+        const looksLikeCompany = /(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd)/i.test(firstCellText);
+        const looksLikeTotal = /^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(firstCellText);
+        const looksLikeHeader = /^(Portfolio|Borrower|Investment|Industry|Company)/i.test(firstCellText);
+        const looksLikeNumeric = /^[\$\(\)\-\d,.\s%]+$/.test(firstCellText);
         
-        if (!looksLikeCompany && !looksLikeTotal) {
-          currentIndustry = rawCompanyName;
-          globalCurrentIndustry = rawCompanyName;
+        if (firstCellText.length > 2 && firstCellText.length < 80 && 
+            !looksLikeCompany && !looksLikeTotal && !looksLikeHeader && !looksLikeNumeric) {
+          // Log industry changes for debugging
+          if (holdings.length % 300 === 0 || firstCellText.toLowerCase().includes('software')) {
+            console.log(`   📌 Industry detected at row ${i}: "${firstCellText}" (nonEmptyCells: ${nonEmptyCells.length})`);
+          }
+          currentIndustry = firstCellText;
+          globalCurrentIndustry = firstCellText;
           continue;
         }
       }
