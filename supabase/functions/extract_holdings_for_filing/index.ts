@@ -1787,6 +1787,7 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
           if ((text.includes('portfolio company') || text.includes('borrower') || text.includes('investment')) && !text.includes('type') && colIndices.company === 0) colIndices.company = position;
           else if ((text.includes('investment type') || text.includes('type of investment')) && colIndices.investmentType === -1) colIndices.investmentType = position;
           else if ((text.includes('interest rate') || text.includes('coupon')) && colIndices.interestRate === -1) colIndices.interestRate = position;
+          else if ((text.includes('spread above index') || text.includes('spread') || text.includes('floor')) && colIndices.spread === -1) colIndices.spread = position;
           else if (text.includes('maturity') && colIndices.maturity === -1) colIndices.maturity = position;
           else if ((text.includes('principal') || text.includes('par')) && colIndices.par === -1) colIndices.par = position;
           else if ((text.includes('cost') || text.includes('amortized')) && colIndices.cost === -1) colIndices.cost = position;
@@ -1866,13 +1867,31 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
         if (typeText && typeText.length > 2 && typeText.length < 150) investmentType = typeText;
       }
       
+      // Extract interest rate
+      let interestRate: string | null = null;
+      if (colIndices.interestRate >= 0) {
+        const rateCell = getCellAtPos(colIndices.interestRate);
+        const rateText = rateCell?.textContent?.trim();
+        if (rateText && rateText.length > 0 && rateText.length < 50) interestRate = rateText;
+      }
+      
+      // Extract spread above index (reference_rate)
+      let referenceRate: string | null = null;
+      if (colIndices.spread >= 0) {
+        const spreadCell = getCellAtPos(colIndices.spread);
+        const spreadText = spreadCell?.textContent?.trim();
+        if (spreadText && spreadText.length > 0 && spreadText.length < 50 && !/^[-—\s]*$/.test(spreadText)) {
+          referenceRate = spreadText;
+        }
+      }
+      
       holdings.push({
         company_name: effectiveCompany,
         investment_type: investmentType,
         industry: currentIndustry,
         description: null,
-        interest_rate: null,
-        reference_rate: null,
+        interest_rate: interestRate,
+        reference_rate: referenceRate,
         maturity_date: maturityDate,
         par_amount: parAmount,
         cost: cost,
