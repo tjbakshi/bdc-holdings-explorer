@@ -599,7 +599,7 @@ const SKIP_PATTERNS = [
 const COMPANY_SUFFIXES = [
   "inc.", "inc", "llc", "l.l.c.", "lp", "l.p.", "corp.", "corp",
   "corporation", "company", "co.", "ltd.", "ltd", "limited",
-  "s.a.r.l.", "s.a.r.l", "sarl",
+  "s.a.r.l.", "s.a.r.l", "sarl", "s.à r.l.", "s.à r.l",
 ];
 
 // Check if text is an industry section header
