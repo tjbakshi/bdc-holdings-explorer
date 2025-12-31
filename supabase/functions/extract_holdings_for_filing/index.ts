@@ -1680,9 +1680,9 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
     return { holdings: [], scaleResult };
   }
   
-  // STEP 3: Extract section after SOI (GBDC SOIs can be very large - up to 20MB)
+  // STEP 3: Extract section after SOI (larger limit for GBDC's 40+ page SOIs)
   console.log(`🔍 STEP 3: Extracting post-SOI section...`);
-  const MAX_SEARCH = 20_000_000; // 20MB to capture full GBDC SOI (pages 8-51)
+  const MAX_SEARCH = 10_000_000; // 10MB to capture full GBDC SOI
   const afterSoi = html.slice(soiStart, Math.min(soiStart + MAX_SEARCH, html.length));
   const afterSoiLower = afterSoi.toLowerCase();
   console.log(`   Extracted ${(afterSoi.length / 1024).toFixed(0)} KB after SOI header`);
@@ -1863,12 +1863,11 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       hasFoundFirstTable = true;
     }
     
-    // GBDC: Industry is typically in column 0 when company is at column 3
-    if (colIndices.industry === -1 && colIndices.company >= 1) {
-      colIndices.industry = 0;
-      if (!hasFoundFirstTable) {
-        savedColIndices.industry = 0;
-      }
+    // GBDC: Don't assume industry is in column 0 - GBDC uses industry header rows
+    // Reset industry column detection since GBDC doesn't have a dedicated industry column
+    if (colIndices.industry >= 0 && colIndices.company >= 1) {
+      // Don't use column-based industry for GBDC - rely on header row detection instead
+      colIndices.industry = -1;
     }
     
     // Log column indices for debugging
