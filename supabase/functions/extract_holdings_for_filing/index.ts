@@ -9,7 +9,7 @@ const corsHeaders = {
 const SEC_USER_AGENT = "BDCTrackerApp/1.0 (contact@bdctracker.com)";
 
 // Max bytes to process before returning (edge functions have ~2s CPU limit)
-const MAX_BYTES_PER_RUN = 800_000; // ~800KB per run to stay under limits
+const MAX_BYTES_PER_RUN = 800_000; 
 
 // ======================================================================
 // HELPERS
@@ -33,10 +33,12 @@ function toMillions(value: number | null | undefined, scale: number): number | n
 function parseDate(value: string | null | undefined): string | null {
   if (!value) return null;
   const cleaned = value.trim();
+  // Match MM/YYYY or MM/DD/YYYY
   const dateMatch = cleaned.match(/(\d{1,2})\/?(\d{1,2})?\/(\d{4})/);
   if (dateMatch) {
     const month = dateMatch[1].padStart(2, '0');
     const year = dateMatch[3];
+    // If day is missing (MM/YYYY), default to 01
     const day = dateMatch[2] ? dateMatch[2].padStart(2, '0') : '01';
     return `${year}-${month}-${day}`;
   }
@@ -65,18 +67,62 @@ function extractCellsWithColspan(rowHtml: string): string[] {
     const spanMatch = attrs.match(/colspan=["']?(\d+)["']?/i);
     const span = spanMatch ? parseInt(spanMatch[1]) : 1;
     for (let i = 1; i < span; i++) {
-      cells.push("");
+      cells.push(""); // Ghost cells for alignment
     }
   }
   return cells;
 }
 
 // ======================================================================
-// PARSING LOGIC
+// PARSING LOGIC (The Switchboard)
 // ======================================================================
 
-function parseSingleRow(rowHtml: string, state: any): any | null {
-  const cells = extractCellsWithColspan(rowHtml);
+// 1. OBDC SPECIALIST PARSER (Blue Owl)
+// Based on image columns: [0]Company, [1]Inv, [2]RefRate, [3]Cash, [4]PIK, [5]Mat, [6]Par, [7]Cost, [8]FV
+function parseRow_OBDC(cells: string[], state: any): any | null {
+  // Need at least fair value column (index 8), allows for some variation
+  if (cells.length < 8) return null;
+
+  const company = cleanCompanyName(cells[0]);
+  if (!company || company.length < 3 || /(total|subtotal|balance)/i.test(company)) return null;
+
+  // Use fixed indices based on the specific OBDC table format
+  // Fallback to searching from end if length varies slightly
+  let fvIdx = 8;
+  let costIdx = 7;
+  let parIdx = 6;
+  
+  if (cells.length < 9) {
+    // If table structure is shifted, assume last numeric is FV
+    const nums = cells.map((c, i) => ({ val: cleanNumeric(c), idx: i })).filter(x => x.val !== null);
+    if (nums.length > 0) {
+      fvIdx = nums[nums.length - 1].idx;
+      costIdx = fvIdx - 1;
+      parIdx = fvIdx - 2;
+    }
+  }
+
+  const fairVal = cleanNumeric(cells[fvIdx]);
+  const costVal = cleanNumeric(cells[costIdx]);
+
+  if (fairVal === null || fairVal === 0) return null;
+
+  return {
+    company_name: company,
+    investment_type: cells[1] || null,
+    reference_rate: cells[2] || null, // Col 2 is "Ref. Rate" (S+)
+    interest_rate: cells[3] || null,  // Col 3 is "Cash" (e.g. 4.50%)
+    maturity_date: parseDate(cells[5]),
+    par_amount: toMillions(cleanNumeric(cells[parIdx]), state.scale),
+    cost: toMillions(costVal, state.scale),
+    fair_value: toMillions(fairVal, state.scale),
+    row_number: state.rowCount++
+  };
+}
+
+// 2. GENERIC / BXSL PARSER (Fallback)
+// Uses regex searching ("duck typing") for columns
+function parseRow_Generic(cells: string[], state: any): any | null {
   if (cells.length < 3) return null;
 
   const company = cleanCompanyName(cells[0]);
@@ -102,6 +148,19 @@ function parseSingleRow(rowHtml: string, state: any): any | null {
     fair_value: toMillions(fairValObj.val, state.scale),
     row_number: state.rowCount++
   };
+}
+
+// 3. DISPATCHER
+function parseRow(rowHtml: string, state: any): any | null {
+  const cells = extractCellsWithColspan(rowHtml);
+  const ticker = (state.ticker || "").toUpperCase();
+
+  if (ticker === "OBDC") {
+    return parseRow_OBDC(cells, state);
+  } 
+  
+  // Default / BXSL / GBDC / ARCC
+  return parseRow_Generic(cells, state);
 }
 
 // ======================================================================
@@ -171,14 +230,13 @@ serve(async (req) => {
     // Restore state from filing record
     const currentIndustryState = filing.current_industry_state;
     const state = { 
-      inSOI: startOffset > 0, // If resuming, assume we're in SOI
+      inSOI: startOffset > 0, // If resuming, assume we're in SOI or looking for end
       done: false, 
       scale: 0.001, 
       scaleDetected: false, 
-      inRow: false, 
-      currentRow: "", 
       rowCount: 0,
-      currentIndustry: currentIndustryState || null
+      currentIndustry: currentIndustryState || null,
+      ticker: ticker // Pass ticker to state for switching logic
     };
     
     // Detect scale
@@ -213,7 +271,8 @@ serve(async (req) => {
       if (!state.inSOI) continue;
       
       const rowHtml = match[0];
-      const result = parseSingleRow(rowHtml, state);
+      // DISPATCHER CALL: Uses state.ticker to pick the right parser
+      const result = parseRow(rowHtml, state);
       
       if (result) {
         batch.push({ ...result, filing_id: filingId });
