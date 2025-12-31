@@ -1943,13 +1943,23 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       
       // Detect industry header row
       if (nonEmptyCells.length <= 4 && firstCellText.length > 2 && firstCellText.length < 80) {
-        const hasCompanySuffix = /(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd\.?|Limited|S\.A\.|GmbH|Bidco|Holdco|Midco|Topco|Buyer|Acquisition)/i.test(firstCellText);
+        // Comprehensive company suffix detection - includes common BDC portfolio company patterns
+        const hasCompanySuffix = /(LLC|Inc\.?|Corp\.?|Corporation|L\.P\.?|LP|Ltd\.?|Limited|S\.A\.?|SAS|GmbH|Bidco|Holdco|Midco|Topco|Buyer|Acquisition|Holdings|Partners|Group|Groupe)\b/i.test(firstCellText);
+        
+        // GBDC uses + for continuation/footnote markers - these are companies, not industries
+        const hasContinuationMarker = /[+*]/.test(firstCellText);
+        
+        // Has footnote references like (1), (8)(9)(10)
+        const hasFootnotes = /\(\d+\)/.test(firstCellText);
+        
         const isTotal = /^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(firstCellText);
         const isHeader = /^(Portfolio|Borrower|Investment|Company|Fair Value|Cost|Par|Principal|Maturity)/i.test(firstCellText);
         const isNumeric = /^[\$\(\)\-\d,.\s%]+$/.test(firstCellText);
         const startsWithDigit = /^\d/.test(firstCellText);
         
-        if (!hasCompanySuffix && !isTotal && !isHeader && !isNumeric && !startsWithDigit) {
+        // Only treat as industry if it doesn't look like a company in any way
+        if (!hasCompanySuffix && !hasContinuationMarker && !hasFootnotes && 
+            !isTotal && !isHeader && !isNumeric && !startsWithDigit) {
           // This looks like an industry header row
           console.log(`   📌 Industry: "${firstCellText}" (cells: ${nonEmptyCells.length})`);
           currentIndustry = firstCellText;
