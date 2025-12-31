@@ -29,16 +29,25 @@ interface ScaleDetectionResult {
 }
 
 // ======================================================================
-// HELPER FUNCTIONS
+// LOW-MEMORY HELPER FUNCTIONS
 // ======================================================================
 
 function stripTags(html: string): string {
   if (!html) return "";
-  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function detectScale(html: string): ScaleDetectionResult {
-  // Check first 50KB only
   const headerText = html.slice(0, 50000).toLowerCase();
   if (/\(in thousands\)/.test(headerText) || /amounts?\s+in\s+thousands/.test(headerText)) {
     return { scale: 0.001, detected: 'thousands' };
@@ -89,18 +98,17 @@ function hasCompanySuffix(name: string): boolean {
 }
 
 // ======================================================================
-// HYBRID PARSER: GBDC
+// 1. GBDC SPECIFIC PARSER (Hybrid)
 // ======================================================================
 async function parseGBDC(html: string, filingId: string, supabaseClient: any, scale: number) {
   console.log("📘 Running GBDC Hybrid Parser...");
-
+  
   const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(html);
   if (!soiMatch) return 0;
   
-  // Slice 15MB max to keep string in memory
-  const content = html.slice(soiMatch.index, Math.min(soiMatch.index + 15_000_000, html.length));
+  // REMOVED LIMIT: Scan entire file to avoid missing tail-end tables
+  const content = html.slice(soiMatch.index);
   
-  // 1. Regex finds the table STRINGS (cheap)
   const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
   
   await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
@@ -111,25 +119,22 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
   const seenKeys = new Set<string>();
 
   while ((tableMatch = tableRe.exec(content)) !== null) {
-    const tableHtml = tableMatch[0]; // The full <table>...</table> string
+    const tableHtml = tableMatch[0];
     
-    // Quick check to skip irrelevant tables
-    if (!/(llc|inc\.|corp\.|l\.p\.)/i.test(tableHtml)) continue;
+    // Relaxed filter: Just needs to look like it has money or companies
+    if (!/(llc|inc\.|corp\.|l\.p\.|limited|\$|fair value)/i.test(tableHtml)) continue;
 
-    // 2. DOM Parser processes ONLY this table (safe memory usage)
     const doc = new DOMParser().parseFromString(tableHtml, "text/html");
     if (!doc) continue;
 
     const rows = Array.from(doc.querySelectorAll("tr"));
     if (rows.length < 5) continue;
 
-    // Identify Columns
     let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
     let dataStart = 0;
 
-    for (let i = 0; i < Math.min(5, rows.length); i++) {
+    for (let i = 0; i < Math.min(8, rows.length); i++) {
       const cells = Array.from(rows[i].querySelectorAll("td, th"));
-      // Simple index mapping based on text
       let cIdx = 0;
       for (const cell of cells) {
         const txt = cell.textContent.toLowerCase();
@@ -148,20 +153,16 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
       }
       if (col.company > -1 || col.fair > -1) {
           dataStart = i + 1;
-          // If we found headers, stop scanning
           if (col.fair > -1) break;
       }
     }
-    
-    if (col.company === -1) col.company = 0;
 
+    if (col.company === -1) col.company = 0;
     let currentCompany = null;
     let currentIndustry = null;
 
-    // Process Rows
     for (let i = dataStart; i < rows.length; i++) {
       const cells = Array.from(rows[i].querySelectorAll("td, th"));
-      // Flatten colspans into a straight array
       const flatCells: string[] = [];
       cells.forEach(c => {
           const txt = c.textContent.trim();
@@ -204,13 +205,11 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
       });
     }
 
-    // Flush batch to DB
     if (pendingRows.length >= 200) {
       await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
       insertedCount += 200;
     }
-  } // End Table Loop
-
+  }
   if (pendingRows.length > 0) {
     await supabaseClient.from("holdings").insert(pendingRows);
     insertedCount += pendingRows.length;
@@ -219,7 +218,7 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
 }
 
 // ======================================================================
-// HYBRID PARSER: BXSL
+// 2. BXSL SPECIFIC PARSER (Hybrid)
 // ======================================================================
 async function parseBXSL(html: string, filingId: string, supabaseClient: any, scale: number) {
   console.log("🟣 Running BXSL Hybrid Parser...");
@@ -227,7 +226,8 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
   const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(html);
   if (!soiMatch) return 0;
   
-  const content = html.slice(soiMatch.index, Math.min(soiMatch.index + 15_000_000, html.length));
+  // REMOVED LIMIT
+  const content = html.slice(soiMatch.index);
   const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
 
   await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
@@ -239,9 +239,9 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
 
   while ((tableMatch = tableRe.exec(content)) !== null) {
     const tableHtml = tableMatch[0];
-    if (!/(llc|inc\.|corp\.|limited)/i.test(tableHtml)) continue;
+    // Relaxed Filter
+    if (!/(llc|inc\.|corp\.|limited|\$|fair value)/i.test(tableHtml)) continue;
 
-    // DOM Parse single table
     const doc = new DOMParser().parseFromString(tableHtml, "text/html");
     if (!doc) continue;
     
@@ -250,7 +250,7 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
     let col = { company: -1, industry: -1, type: -1, interest: -1, spread: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
     let dataStart = 0;
 
-    for (let i = 0; i < Math.min(5, rows.length); i++) {
+    for (let i = 0; i < Math.min(8, rows.length); i++) {
       const cells = Array.from(rows[i].querySelectorAll("td, th"));
       let cIdx = 0;
       for (const cell of cells) {
@@ -268,7 +268,7 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
         if (txt.includes('fair') && col.fair === -1) col.fair = cIdx;
         cIdx += span;
       }
-      if (col.company > -1) { dataStart = i + 1; break; }
+      if (col.company > -1 || col.fair > -1) { dataStart = i + 1; break; }
     }
     
     if (col.company === -1) col.company = 0;
@@ -316,7 +316,7 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
         filing_id: filingId,
         company_name: effectiveComp,
         investment_type: col.type > -1 ? flatCells[col.type] : null,
-        industry: currentIndustry,
+        industry: col.industry > -1 ? flatCells[col.industry] : currentIndustry,
         interest_rate: col.interest > -1 ? flatCells[col.interest] : null,
         reference_rate: refRate,
         maturity_date: col.maturity > -1 ? parseDate(flatCells[col.maturity]) : null,
@@ -341,14 +341,16 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
 }
 
 // ======================================================================
-// HYBRID PARSER: ARCC / GENERIC
+// 3. ARCC / GENERIC PARSER (Hybrid)
 // ======================================================================
 async function parseARCC(html: string, filingId: string, supabaseClient: any, scale: number) {
   console.log("📘 Running ARCC Hybrid Parser...");
   
   const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(html);
   if (!soiMatch) return 0;
-  const content = html.slice(soiMatch.index, Math.min(soiMatch.index + 15_000_000, html.length));
+  
+  // REMOVED LIMIT: Scan full file to capture all rows
+  const content = html.slice(soiMatch.index);
   const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
 
   await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
@@ -360,7 +362,11 @@ async function parseARCC(html: string, filingId: string, supabaseClient: any, sc
 
   while ((tableMatch = tableRe.exec(content)) !== null) {
     const tableHtml = tableMatch[0];
-    if (!/(llc|inc|corp|l\.p\.|limited)/i.test(tableHtml)) continue;
+    
+    // RELAXED TABLE FILTER:
+    // Original caused 7 missing rows because some tables didn't have "Inc/LLC"
+    // Now checks for simple presence of numbers ($) or companies
+    if (!/(llc|inc|corp|l\.p\.|limited|\$|fair value)/i.test(tableHtml)) continue;
 
     const doc = new DOMParser().parseFromString(tableHtml, "text/html");
     if (!doc) continue;
@@ -386,7 +392,7 @@ async function parseARCC(html: string, filingId: string, supabaseClient: any, sc
         if (txt.includes('fair') && col.fair === -1) col.fair = cIdx;
         cIdx += span;
       }
-      if (col.company > -1) { dataStart = i + 1; break; }
+      if (col.company > -1 || col.fair > -1) { dataStart = i + 1; break; }
     }
     
     if (col.company === -1) col.company = 0;
@@ -405,7 +411,7 @@ async function parseARCC(html: string, filingId: string, supabaseClient: any, sc
 
       if (flatCells.length < 3) continue;
 
-      // ARCC Industry Header Detection (Row has 1 cell with text, rest empty)
+      // ARCC Industry Header Detection
       if (cells.length === 1 || (flatCells[0] && flatCells.slice(1).every(x => !x))) {
           const header = flatCells[0];
           if (header.length > 3 && !hasCompanySuffix(header) && !/(total|subtotal)/i.test(header)) {
