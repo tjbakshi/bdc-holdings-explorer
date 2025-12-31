@@ -1318,59 +1318,48 @@ function parseTables(
         const investType = holding.investment_type || 'unknown';
         debugAccepted.push(`${effectiveCompanyName.substring(0, 40)} [${investType.substring(0, 20)}] FV=$${fairValue}`);
       }
-      
-      // Cap total holdings to prevent excessive memory usage
-      if (holdings.length >= maxHoldings) {
-        console.log(`Reached max holdings cap (${maxHoldings}), stopping parse`);
-        break;
+    }
+    
+    // If we found holdings in this table, log debug info
+    // NOTE: Do NOT return early - continue processing all tables to capture the full SOI
+    if (holdings.length > 0 && debugMode) {
+      console.log(`✓ Table ${tableIndex}: Found ${holdings.length} holdings so far`);
+    }
+    
+    // Cap total holdings to prevent excessive memory usage
+    if (holdings.length >= maxHoldings) {
+      console.log(`Reached max holdings cap (${maxHoldings}), stopping parse`);
+      break;
+    }
+  }
+  
+  // Log final results after processing ALL tables
+  if (holdings.length > 0) {
+    // Count unique companies and industries
+    const uniqueCompanies = new Set(holdings.map(h => h.company_name)).size;
+    const uniqueIndustries = new Set(holdings.filter(h => h.industry).map(h => h.industry));
+    
+    // Group companies by industry for logging
+    const industryGroups: Record<string, string[]> = {};
+    for (const h of holdings) {
+      const ind = h.industry || 'Unknown';
+      if (!industryGroups[ind]) industryGroups[ind] = [];
+      if (!industryGroups[ind].includes(h.company_name)) {
+        industryGroups[ind].push(h.company_name);
       }
     }
     
-    // If we found holdings in this table, log debug info and stop searching
-    if (holdings.length > 0) {
-      // Count unique companies and industries
-      const uniqueCompanies = new Set(holdings.map(h => h.company_name)).size;
-      const uniqueIndustries = new Set(holdings.filter(h => h.industry).map(h => h.industry));
-      
-      // Group companies by industry for logging
-      const industryGroups: Record<string, string[]> = {};
-      for (const h of holdings) {
-        const ind = h.industry || 'Unknown';
-        if (!industryGroups[ind]) industryGroups[ind] = [];
-        if (!industryGroups[ind].includes(h.company_name)) {
-          industryGroups[ind].push(h.company_name);
-        }
-      }
-      
-      console.log(`\n=== Parsing Results ===`);
-      console.log(`✅ Accepted ${holdings.length} investment records from ${uniqueCompanies} unique companies`);
-      console.log(`📂 Industries found (${uniqueIndustries.size}): ${Array.from(uniqueIndustries).join(', ')}`);
-      console.log(`📊 Companies by industry:`);
-      for (const [ind, companies] of Object.entries(industryGroups)) {
-        console.log(`   ${ind}: ${companies.length} companies (${companies.slice(0, 3).join(', ')}${companies.length > 3 ? '...' : ''})`);
-      }
-      
-      // Validate expected major industries for ARCC
-      const expectedMajorIndustries = [
-        'Software and Services',
-        'Health Care Equipment and Services',
-        'Financial Services',
-        'Consumer Services',
-        'Capital Goods',
-      ];
-      const foundIndustryNames = Array.from(uniqueIndustries) as string[];
-      const missingIndustries = expectedMajorIndustries.filter(exp => 
-        !foundIndustryNames.some(found => found?.toLowerCase() === exp.toLowerCase())
-      );
-      if (missingIndustries.length > 0 && missingIndustries.length < expectedMajorIndustries.length) {
-        console.log(`⚠️ Some expected industries not found: ${missingIndustries.join(', ')}`);
-      }
-      
-      console.log(`First 10 accepted:`, debugAccepted);
-      console.log(`First 10 rejected:`, debugRejected);
-      console.log(`========================\n`);
-      return { holdings, lastIndustry: persistentIndustry, lastPeriodDate: persistentPeriodDate };
+    console.log(`\n=== Parsing Results ===`);
+    console.log(`✅ Accepted ${holdings.length} investment records from ${uniqueCompanies} unique companies`);
+    console.log(`📂 Industries found (${uniqueIndustries.size}): ${Array.from(uniqueIndustries).join(', ')}`);
+    console.log(`📊 Companies by industry:`);
+    for (const [ind, companies] of Object.entries(industryGroups)) {
+      console.log(`   ${ind}: ${companies.length} companies (${companies.slice(0, 3).join(', ')}${companies.length > 3 ? '...' : ''})`);
     }
+    
+    console.log(`First 10 accepted:`, debugAccepted);
+    console.log(`First 10 rejected:`, debugRejected);
+    console.log(`========================\n`);
   }
   
   // Log debug info even if no holdings found
