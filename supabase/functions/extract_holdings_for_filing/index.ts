@@ -3747,7 +3747,36 @@ serve(async (req) => {
               continue;
             }
 
-            // For OBDC, ARCC and other BDCs, use the existing segmented-DOM approach
+            // For OBDC, use streaming parser with multi-row header support
+            if (parserType === 'OBDC') {
+              console.log(`   🔀 OBDC detected - using STREAMING insert parser for large file`);
+
+              const { insertedCount, scaleResult: obdcScale } = await parseOBDCTableAndInsert({
+                html,
+                filingId,
+                supabaseClient,
+                debugMode,
+              });
+
+              if (insertedCount > 0) {
+                // Return immediately; data is already in DB
+                return new Response(
+                  JSON.stringify({
+                    filingId,
+                    holdingsInserted: insertedCount,
+                    valueScale: obdcScale.detected,
+                    scaleConfidence: obdcScale.confidence,
+                    method: 'obdc-streaming',
+                  }),
+                  { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+                );
+              }
+
+              console.log(`   ⚠️ OBDC streaming parser found no holdings, trying next document...`);
+              continue;
+            }
+
+            // For ARCC and other BDCs, use the existing segmented-DOM approach
             console.log(`   🔀 Using ARCC-style segmented parsing for large file`);
 
             // Find the boundaries of the Schedule of Investments section
