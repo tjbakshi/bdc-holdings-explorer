@@ -24,6 +24,71 @@ interface Holding {
   period_date?: string | null; // The period date from the SOI header (e.g., "2025-09-30")
 }
 
+// ======================================================================
+// SHARED PERIOD DATE EXTRACTION HELPERS
+// ======================================================================
+// These functions sanitize HTML and extract dates from header text.
+// Used by ARCC, BXSL, and other parsers for per-table period_date extraction.
+
+/**
+ * Strip all HTML tags and normalize whitespace from raw HTML text
+ */
+function sanitizeHtmlToText(rawHtml: string): string {
+  return rawHtml
+    .replace(/<[^>]*>?/gm, " ")
+    .replace(/&nbsp;|&#160;|&#xA0;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Extract period date in ISO format (YYYY-MM-DD) from text.
+ * Looks for patterns like "September 30, 2025" or "December 31, 2024".
+ * Returns the LAST match found (usually closest to the table context).
+ */
+function extractPeriodDateFromText(text: string): string | null {
+  const cleanText = sanitizeHtmlToText(text);
+
+  // Month DD, YYYY (any year)
+  const dateRe = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\s*,\s*\d{4}/gi;
+  const matches = Array.from(cleanText.matchAll(dateRe));
+  if (matches.length === 0) return null;
+
+  // Use the LAST match in the snippet as it's usually closest to the table/header context.
+  const dateText = matches[matches.length - 1][0];
+
+  const m = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*,\s*(\d{4})$/i.exec(
+    dateText
+  );
+  if (!m) return null;
+
+  const monthName = m[1].toLowerCase();
+  const day = Number(m[2]);
+  const year = Number(m[3]);
+
+  const monthMap: Record<string, number> = {
+    january: 1,
+    february: 2,
+    march: 3,
+    april: 4,
+    may: 5,
+    june: 6,
+    july: 7,
+    august: 8,
+    september: 9,
+    october: 10,
+    november: 11,
+    december: 12,
+  };
+
+  const month = monthMap[monthName];
+  if (!month || !Number.isFinite(day) || !Number.isFinite(year)) return null;
+
+  const mm = String(month).padStart(2, "0");
+  const dd = String(day).padStart(2, "0");
+  return `${year}-${mm}-${dd}`;
+}
+
 interface ScaleDetectionResult {
   scale: number; // Multiplier to convert to millions (e.g., 0.001 for thousands, 1 for millions)
   detected: 'thousands' | 'millions' | 'unknown';
@@ -723,7 +788,16 @@ function isRealHolding(companyName: string, fairValue: number | null, cost: numb
 
 // Parse tables looking for Schedule of Investments with multi-line investment support
 // Optional initialIndustry parameter allows carrying industry state from previous segments
-function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHoldings: number, debugMode = false, initialIndustry: string | null = null): { holdings: Holding[]; lastIndustry: string | null } {
+// Optional tablePeriodDates map provides per-table period dates extracted from pre-table HTML
+function parseTables(
+  tables: Iterable<Element>, 
+  maxRowsPerTable: number, 
+  maxHoldings: number, 
+  debugMode = false, 
+  initialIndustry: string | null = null,
+  tablePeriodDates?: Map<number, string | null>,
+  defaultPeriodDate?: string | null
+): { holdings: Holding[]; lastIndustry: string | null; lastPeriodDate: string | null } {
   const holdings: Holding[] = [];
   const debugAccepted: string[] = [];
   const debugRejected: { name: string; reason: string }[] = [];
@@ -731,9 +805,23 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
   // Track industry state across ALL tables in this segment
   let persistentIndustry: string | null = initialIndustry;
   
+  // Track period_date state across tables - if no specific date found, keep using the last known date
+  let persistentPeriodDate: string | null = defaultPeriodDate ?? null;
+  
   let tableIndex = 0;
   for (const table of tables) {
     tableIndex++;
+    
+    // Get the period date for this specific table (from pre-table header extraction)
+    // If not found, continue using the persistent date (for "continued" tables)
+    const tablePeriodDate = tablePeriodDates?.get(tableIndex);
+    if (tablePeriodDate !== undefined) {
+      if (tablePeriodDate !== null) {
+        persistentPeriodDate = tablePeriodDate;
+        console.log(`🔧 ARCC: Switched context to period: ${persistentPeriodDate}`);
+      }
+      // If tablePeriodDate is null, keep using the last known persistentPeriodDate
+    }
     
     // Find the header row (don't assume it's the first row)
     const headerRow = findHeaderRow(table as Element, debugMode);
@@ -1147,6 +1235,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
         par_amount: parseNumeric(parCell?.textContent?.trim()),
         cost,
         fair_value: fairValue,
+        period_date: persistentPeriodDate, // Apply the period date for this table
       };
       
       holdings.push(holding);
@@ -1207,7 +1296,7 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
       console.log(`First 10 accepted:`, debugAccepted);
       console.log(`First 10 rejected:`, debugRejected);
       console.log(`========================\n`);
-      return { holdings, lastIndustry: persistentIndustry };
+      return { holdings, lastIndustry: persistentIndustry, lastPeriodDate: persistentPeriodDate };
     }
   }
   
@@ -1218,12 +1307,17 @@ function parseTables(tables: Iterable<Element>, maxRowsPerTable: number, maxHold
     console.log(`============================================\n`);
   }
   
-  return { holdings, lastIndustry: persistentIndustry };
+  return { holdings, lastIndustry: persistentIndustry, lastPeriodDate: persistentPeriodDate };
 }
 
 // Parse HTML Schedule of Investments table from snippets
 // Optional initialIndustry parameter allows carrying industry state from previous calls
-function parseHtmlScheduleOfInvestments(html: string, debugMode = false, initialIndustry: string | null = null): { holdings: Holding[]; scaleResult: ScaleDetectionResult; lastIndustry: string | null } {
+function parseHtmlScheduleOfInvestments(
+  html: string, 
+  debugMode = false, 
+  initialIndustry: string | null = null,
+  initialPeriodDate: string | null = null
+): { holdings: Holding[]; scaleResult: ScaleDetectionResult; lastIndustry: string | null; lastPeriodDate: string | null } {
   // ARCC and other large BDCs can have 500+ companies with 2-5 investment lines each
   // Need to process at least 3000 rows to capture the full Schedule of Investments
   const maxRowsPerTable = 3000;
@@ -1235,8 +1329,9 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false, initial
   // Accumulate holdings from ALL snippets instead of returning on first match
   const allHoldings: Holding[] = [];
   
-  // Track industry state across snippets
+  // Track industry and period_date state across snippets
   let carryIndustry: string | null = initialIndustry;
+  let carryPeriodDate: string | null = initialPeriodDate;
   
   try {
     // Extract only relevant HTML snippets
@@ -1245,8 +1340,6 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false, initial
     
     for (let i = 0; i < snippets.length; i++) {
       const snippet = snippets[i];
-      const doc = new DOMParser().parseFromString(snippet, "text/html");
-      if (!doc) continue;
       
       // Calculate remaining capacity
       const remainingCapacity = maxHoldings - allHoldings.length;
@@ -1255,10 +1348,57 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false, initial
         break;
       }
       
+      // ============ PER-TABLE PERIOD DATE EXTRACTION ============
+      // Find all table positions in this snippet and extract period dates from pre-table text
+      const tablePeriodDates = new Map<number, string | null>();
+      const tableStartRe = /<table\b[^>]*>/gi;
+      let tableMatch;
+      let tableIndex = 0;
+      
+      while ((tableMatch = tableStartRe.exec(snippet)) !== null) {
+        tableIndex++;
+        const tableStartIdx = tableMatch.index;
+        
+        // Look at the 2,000 characters immediately before this <table> tag
+        const localHeaderRaw = snippet.slice(Math.max(0, tableStartIdx - 2000), tableStartIdx);
+        const tablePeriodDateISO = extractPeriodDateFromText(localHeaderRaw);
+        
+        // Store the found date (or null if not found)
+        tablePeriodDates.set(tableIndex, tablePeriodDateISO);
+        
+        if (tablePeriodDateISO && debugMode) {
+          console.log(`🔧 ARCC: Table ${tableIndex} header date: ${tablePeriodDateISO}`);
+        }
+      }
+      
+      // Also try to extract a default period date from the start of the snippet
+      if (!carryPeriodDate) {
+        const snippetStart = snippet.slice(0, 5000);
+        carryPeriodDate = extractPeriodDateFromText(snippetStart);
+        if (carryPeriodDate) {
+          console.log(`🔧 ARCC: Default Period Date (snippet header) = ${carryPeriodDate}`);
+        }
+      }
+      
+      // Parse with DOM parser
+      const doc = new DOMParser().parseFromString(snippet, "text/html");
+      if (!doc) continue;
+      
       const tables = Array.from(doc.querySelectorAll("table")) as Element[];
-      const parseResult = parseTables(tables, maxRowsPerTable, remainingCapacity, debugMode, carryIndustry);
+      
+      // Pass the per-table period dates to parseTables
+      const parseResult = parseTables(
+        tables, 
+        maxRowsPerTable, 
+        remainingCapacity, 
+        debugMode, 
+        carryIndustry,
+        tablePeriodDates,
+        carryPeriodDate
+      );
       const snippetHoldings = parseResult.holdings;
       carryIndustry = parseResult.lastIndustry; // Carry forward industry state
+      carryPeriodDate = parseResult.lastPeriodDate; // Carry forward period date state
       
       if (snippetHoldings.length > 0) {
         console.log(`Snippet ${i + 1}/${snippets.length}: Found ${snippetHoldings.length} holdings`);
@@ -1267,13 +1407,14 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false, initial
     }
     
     // Deduplicate holdings in case of overlapping chunks
-    // Use company_name + investment_type + fair_value as a composite key
+    // Use company_name + investment_type + fair_value + period_date as a composite key
     if (allHoldings.length > 0) {
       const seen = new Set<string>();
       const deduplicatedHoldings: Holding[] = [];
       
       for (const h of allHoldings) {
-        const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
+        // Include period_date in dedup key to preserve historical entries
+        const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}|${h.period_date || ''}`;
         if (!seen.has(key)) {
           seen.add(key);
           deduplicatedHoldings.push(h);
@@ -1284,7 +1425,7 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false, initial
         console.log(`Deduplicated: ${allHoldings.length} -> ${deduplicatedHoldings.length} holdings`);
       }
       console.log(`Total unique holdings from all snippets: ${deduplicatedHoldings.length}`);
-      return { holdings: deduplicatedHoldings, scaleResult, lastIndustry: carryIndustry };
+      return { holdings: deduplicatedHoldings, scaleResult, lastIndustry: carryIndustry, lastPeriodDate: carryPeriodDate };
     } else {
       console.log("No holdings found in any snippets");
     }
@@ -1293,7 +1434,7 @@ function parseHtmlScheduleOfInvestments(html: string, debugMode = false, initial
     console.error("Error parsing HTML:", error);
   }
   
-  return { holdings: allHoldings, scaleResult, lastIndustry: carryIndustry };
+  return { holdings: allHoldings, scaleResult, lastIndustry: carryIndustry, lastPeriodDate: carryPeriodDate };
 }
 
 // ======================================================================
@@ -3226,8 +3367,9 @@ serve(async (req) => {
               let runningTotalValue = 0;
               let skippedDuplicates = 0;
               
-              // Track industry state across segments for proper grouping
+              // Track industry and period_date state across segments for proper grouping
               let carryIndustry: string | null = null;
+              let carryPeriodDate: string | null = null;
               
               while (currentPosition < soiEnd) {
                 segmentCount++;
@@ -3249,16 +3391,18 @@ serve(async (req) => {
                     continue;
                   }
                   
-                  // Parse with DOM parser (but with small segment size), passing carry-forward industry
-                  const segmentResult = parseHtmlScheduleOfInvestments(segment, false, carryIndustry);
+                  // Parse with DOM parser (but with small segment size), passing carry-forward industry and period_date
+                  const segmentResult = parseHtmlScheduleOfInvestments(segment, false, carryIndustry, carryPeriodDate);
                   const segmentHoldings = segmentResult.holdings;
                   carryIndustry = segmentResult.lastIndustry; // Carry forward industry state to next segment
+                  carryPeriodDate = segmentResult.lastPeriodDate; // Carry forward period_date state to next segment
                   
                   if (segmentHoldings.length > 0) {
                     const newHoldings: Holding[] = [];
                     
                     for (const h of segmentHoldings) {
-                      const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}`;
+                      // Include period_date in dedup key to preserve historical entries
+                      const key = `${h.company_name}|${h.investment_type || ''}|${h.fair_value || ''}|${h.period_date || ''}`;
                       if (!seenHoldingKeys.has(key)) {
                         seenHoldingKeys.add(key);
                         newHoldings.push(h);
@@ -3283,6 +3427,7 @@ serve(async (req) => {
                         row_number: nextRowNumber + idx,
                         // Track approximate HTML position for ordering
                         source_pos: currentPosition + idx,
+                        period_date: h.period_date, // Add period_date from parsed holding
                       }));
                       
                       const { error: insertError } = await supabaseClient
@@ -3408,6 +3553,7 @@ serve(async (req) => {
         cost: toMillions(h.cost, scaleResult.scale),
         fair_value: toMillions(h.fair_value, scaleResult.scale),
         row_number: idx + 1,
+        period_date: h.period_date, // Add period_date from parsed holding
       }));
       
       // Log sample converted values
