@@ -44,6 +44,7 @@ const BdcDetail = () => {
   const [selectedFilingId, setSelectedFilingId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [isResetting, setIsResetting] = useState<string | null>(null);
+  const [isExtracting, setIsExtracting] = useState<string | null>(null);
   const [resetProgress, setResetProgress] = useState<'idle' | 'resetting' | 'extracting' | 'done'>('idle');
   const [isClearing, setIsClearing] = useState(false);
   const queryClient = useQueryClient();
@@ -249,15 +250,98 @@ const BdcDetail = () => {
     XLSX.writeFile(workbook, fileName);
   };
 
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const waitForHoldings = async (filingId: string, timeoutMs = 60_000) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const { count, error } = await supabase
+        .from("holdings")
+        .select("id", { count: "exact", head: true })
+        .eq("filing_id", filingId);
+
+      if (!error && (count ?? 0) > 0) return count ?? 0;
+      await sleep(2000);
+    }
+    return 0;
+  };
+
+  const handleExtractFiling = async (filingId: string) => {
+    setIsExtracting(filingId);
+
+    const selectedFiling = filings?.find((f) => f.id === filingId);
+    const filingLabel = selectedFiling ? formatDate(selectedFiling.period_end) : filingId;
+
+    addLog(`Starting extraction for filing: ${filingLabel}`, "info");
+
+    try {
+      const { data: extractData, error: extractError } = await supabase.functions.invoke(
+        "extract_holdings_for_filing",
+        {
+          body: { filingId },
+        }
+      );
+
+      if (extractError) {
+        // For large filings the browser request can time out even if the backend keeps working.
+        addLog(`⚠ Extraction request timed out: ${extractError.message}`, "warning");
+        toast({
+          title: "Extraction Running",
+          description: "This filing is large; extraction may still be processing. Checking for results...",
+        });
+
+        const count = await waitForHoldings(filingId);
+        queryClient.invalidateQueries({ queryKey: ["holdings", filingId] });
+
+        if (count > 0) {
+          addLog(`✓ Extraction complete: ${count} holdings found`, "success");
+          toast({
+            title: "Extraction Complete",
+            description: `Loaded ${count} holdings.`,
+          });
+        } else {
+          addLog("✗ No holdings found yet. Try again in a moment.", "error");
+          toast({
+            title: "No holdings yet",
+            description: "Extraction may have failed or is still running. Try 'Run Parser' again.",
+            variant: "destructive",
+          });
+        }
+
+        return;
+      }
+
+      const holdingsInserted = extractData?.holdingsInserted ?? extractData?.holdingsCount;
+      addLog(`✓ Extraction complete${holdingsInserted != null ? `: ${holdingsInserted} holdings` : ''}`, "success");
+      toast({
+        title: "Extraction Complete",
+        description: "Holdings have been extracted successfully.",
+      });
+
+      queryClient.invalidateQueries({ queryKey: ["filings", bdcId] });
+      queryClient.invalidateQueries({ queryKey: ["holdings", filingId] });
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      addLog(`✗ Error: ${errorMsg}`, "error");
+      toast({
+        title: "Error",
+        description: errorMsg,
+        variant: "destructive",
+      });
+    } finally {
+      setIsExtracting(null);
+    }
+  };
+
   const handleResetFiling = async (filingId: string) => {
     setIsResetting(filingId);
     setResetProgress('resetting');
-    
+
     const selectedFiling = filings?.find(f => f.id === filingId);
     const filingLabel = selectedFiling ? formatDate(selectedFiling.period_end) : filingId;
-    
+
     addLog(`Starting reset for filing: ${filingLabel}`, "info");
-    
+
     try {
       // Step 1: Reset the filing (delete holdings and reset status)
       addLog("Step 1: Deleting existing holdings...", "info");
@@ -277,34 +361,47 @@ const BdcDetail = () => {
       // Step 2: Re-extract holdings for the filing
       setResetProgress('extracting');
       addLog(`Step 2: Extracting holdings for ${bdc?.ticker || 'BDC'}...`, "info");
-      addLog("Fetching SEC filing document...", "info");
-      
-      const { data: extractData, error: extractError } = await supabase.functions.invoke("extract_holdings_for_filing", {
-        body: { filingId },
-      });
+
+      const { data: extractData, error: extractError } = await supabase.functions.invoke(
+        "extract_holdings_for_filing",
+        {
+          body: { filingId },
+        }
+      );
 
       if (extractError) {
+        // For large filings the browser request can time out even if the backend keeps working.
         console.error("Extract error:", extractError);
-        addLog(`⚠ Extraction may be processing in background: ${extractError.message}`, "warning");
+        addLog(`⚠ Extraction request timed out: ${extractError.message}`, "warning");
         toast({
-          title: "Extraction Started",
-          description: "Reset complete. Extraction may still be processing in the background.",
+          title: "Extraction Running",
+          description: "This filing is large; extraction may still be processing. Checking for results...",
         });
-      } else {
-        setResetProgress('done');
-        const holdingsCount = extractData?.holdingsCount || 0;
-        addLog(`✓ Extraction complete: ${holdingsCount} holdings found`, "success");
-        
-        // Log additional details if available
-        if (extractData?.logs && Array.isArray(extractData.logs)) {
-          extractData.logs.forEach((log: string) => {
-            addLog(log, "info");
+
+        const count = await waitForHoldings(filingId);
+
+        if (count > 0) {
+          setResetProgress('done');
+          addLog(`✓ Extraction complete: ${count} holdings found`, "success");
+          toast({
+            title: "Filing Re-Parsed",
+            description: `Loaded ${count} holdings.`,
+          });
+        } else {
+          addLog("✗ No holdings found yet. Try 'Run Parser' again.", "error");
+          toast({
+            title: "No holdings yet",
+            description: "Extraction may have failed or is still running. Try 'Run Parser' again.",
+            variant: "destructive",
           });
         }
-        
+      } else {
+        setResetProgress('done');
+        const holdingsInserted = extractData?.holdingsInserted ?? extractData?.holdingsCount;
+        addLog(`✓ Extraction complete${holdingsInserted != null ? `: ${holdingsInserted} holdings` : ''}`, "success");
         toast({
           title: "Filing Re-Parsed",
-          description: extractData?.message || "Holdings have been re-extracted successfully.",
+          description: "Holdings have been re-extracted successfully.",
         });
       }
 
@@ -457,17 +554,32 @@ const BdcDetail = () => {
                 </Select>
                 
                 {selectedFilingId && !isResetting && (
-                  <AlertDialog>
-                    <AlertDialogTrigger asChild>
-                      <Button 
-                        variant="outline" 
-                        size="sm" 
-                        className="text-destructive border-destructive hover:bg-destructive hover:text-destructive-foreground"
-                      >
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleExtractFiling(selectedFilingId)}
+                      disabled={isExtracting === selectedFilingId}
+                    >
+                      {isExtracting === selectedFilingId ? (
+                        <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                      ) : (
                         <RotateCcw className="mr-1 h-4 w-4" />
-                        Reset & Re-Parse
-                      </Button>
-                    </AlertDialogTrigger>
+                      )}
+                      Run Parser
+                    </Button>
+
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button 
+                          variant="outline" 
+                          size="sm" 
+                          className="text-destructive border-destructive hover:bg-destructive hover:text-destructive-foreground"
+                        >
+                          <RotateCcw className="mr-1 h-4 w-4" />
+                          Reset & Re-Parse
+                        </Button>
+                      </AlertDialogTrigger>
                     <AlertDialogContent>
                       <AlertDialogHeader>
                         <AlertDialogTitle className="flex items-center gap-2">
@@ -491,7 +603,8 @@ const BdcDetail = () => {
                         </AlertDialogAction>
                       </AlertDialogFooter>
                     </AlertDialogContent>
-                  </AlertDialog>
+                    </AlertDialog>
+                  </div>
                 )}
                 
                 {/* Progress indicator during reset/extraction */}
