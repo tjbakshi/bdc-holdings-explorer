@@ -2290,28 +2290,32 @@ async function parseBXSLTableAndInsert(params: {
   console.log(`   ✅ Found SOI at position ${soiStart} (match: "${soiMatch?.[0]}")`);
 
   // BXSL: Extract and normalize the period date from the SOI section.
-  // Step 1: Sanitize HTML - remove all tags to prevent <span> from breaking regex
+  // Sanitize HTML and collapse whitespace to become "blind" to messy SEC markup.
   const soiHeaderSection = html.slice(soiStart, Math.min(soiStart + 3000, html.length));
-  const cleanHeaderArea = soiHeaderSection.replace(/<[^>]*>?/gm, ' ').replace(/\s+/g, ' ');
-  
-  // Step 2: Search for current period date (prioritize current year dates)
-  // The first date found is the current period; comparative tables come later
-  const bxslDateRe = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}/i;
-  const dateMatch = bxslDateRe.exec(cleanHeaderArea);
+  const cleanText = soiHeaderSection
+    .replace(/<[^>]*>?/gm, " ")
+    .replace(/&nbsp;|&#160;|&#xA0;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Flexible date search for CURRENT YEAR (2025). Use first match only.
+  const bxslDateRe = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\s*,?\s+2025/i;
+  const dateMatch = bxslDateRe.exec(cleanText);
   const targetPeriodDateText = dateMatch?.[0]?.trim() || null;
-  
-  console.log(`🔧 BXSL: Raw date match from cleaned header: "${targetPeriodDateText}"`);
 
   const normalizePeriodDateToISO = (input: string): string | null => {
-    // Expect something like: "September 30, 2025"
-    const m = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4})$/i.exec(
-      input.trim()
+    // Accept variants like: "September 30, 2025" or "September 30 2025"
+    const m = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*,?\s+(\d{4})$/i.exec(
+      input.trim().replace(/\s+/g, " ")
     );
     if (!m) return null;
 
     const monthName = m[1].toLowerCase();
     const day = Number(m[2]);
     const year = Number(m[3]);
+
+    // BXSL requirement: strictly 2025
+    if (year !== 2025) return null;
 
     const monthMap: Record<string, number> = {
       january: 1,
@@ -2329,24 +2333,22 @@ async function parseBXSLTableAndInsert(params: {
     };
 
     const month = monthMap[monthName];
-    if (!month || !Number.isFinite(day) || !Number.isFinite(year)) return null;
+    if (!month || !Number.isFinite(day)) return null;
 
     const mm = String(month).padStart(2, "0");
     const dd = String(day).padStart(2, "0");
     return `${year}-${mm}-${dd}`;
   };
 
-  // Convert text date to ISO format for database storage
   let periodDateISO: string | null = null;
   if (targetPeriodDateText) {
     periodDateISO = normalizePeriodDateToISO(targetPeriodDateText);
-    if (periodDateISO) {
-      console.log(`🔧 BXSL: Found Current Period Date: ${targetPeriodDateText} → ${periodDateISO}`);
-    } else {
-      console.log(`❌ BXSL: Failed to normalize period date from: "${targetPeriodDateText}"`);
-    }
+  }
+
+  if (periodDateISO) {
+    console.log(`🔧 BXSL: Final Period Date set to ${periodDateISO}`);
   } else {
-    console.log(`❌ BXSL: Failed to find period date in cleaned header area.`);
+    console.log(`❌ BXSL: Failed to find or format period date (2025).`);
   }
 
   // Define prior period dates to skip (comparative tables)
@@ -2421,7 +2423,7 @@ async function parseBXSLTableAndInsert(params: {
       fair_value: toMillions(h.fair_value, scaleResult.scale),
       row_number: insertedCount + idx + 1,
       source_pos: h.source_pos ?? null,
-      period_date: periodDateISO,
+      period_date: h.period_date ?? periodDateISO,
     }));
 
     const { error: insertError } = await supabaseClient.from("holdings").insert(rows as any);
@@ -2703,6 +2705,7 @@ async function parseBXSLTableAndInsert(params: {
         cost,
         fair_value: fairValue,
         source_pos: soiStart + tableStartIdx + i,
+        period_date: periodDateISO,
       });
       totalProcessedRows++;
 
