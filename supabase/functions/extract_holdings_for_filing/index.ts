@@ -1652,89 +1652,116 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
     return { holdings: [], scaleResult };
   }
   
-  // Step 4: Extract the table immediately after the SOI header
-  // Look for the first <table> tag after the SOI header
+  // Step 4: Extract a larger section after SOI header to find the actual holdings table
+  // GBDC has multiple tables after the SOI header - we need to find the one with company holdings
   const afterSoi = processedHtml.slice(soiStart);
-  const tableStart = afterSoi.toLowerCase().indexOf('<table');
   
-  if (tableStart === -1) {
-    console.log(`🔧 GBDC Parser: No table found after SOI header`);
-    return { holdings: [], scaleResult };
-  }
+  // Extract up to 4MB after the SOI header to find the right table
+  const maxSearchSize = 4_000_000;
+  const searchSection = afterSoi.slice(0, maxSearchSize);
   
-  // Find the end of this table (limit to reasonable size)
-  const maxTableSize = 2_000_000; // 2MB max
-  const tableSection = afterSoi.slice(tableStart, tableStart + maxTableSize);
-  const tableEnd = tableSection.toLowerCase().indexOf('</table>');
-  const tableHtml = tableEnd !== -1 ? tableSection.slice(0, tableEnd + 8) : tableSection.slice(0, 500_000);
+  console.log(`🔧 GBDC Parser: Searching for holdings table in ${(searchSection.length / 1024).toFixed(0)} KB section`);
   
-  console.log(`🔧 GBDC Parser: Extracted table section: ${(tableHtml.length / 1024).toFixed(0)} KB`);
-  
-  // Step 5: Parse the table using DOM parser with chunked processing
+  // Step 5: Parse the section and look for tables with holdings headers
   try {
-    const doc = new DOMParser().parseFromString(`<html><body>${tableHtml}</body></html>`, "text/html");
+    const doc = new DOMParser().parseFromString(`<html><body>${searchSection}</body></html>`, "text/html");
     if (!doc) {
-      console.log(`🔧 GBDC Parser: Failed to parse table HTML`);
+      console.log(`🔧 GBDC Parser: Failed to parse section HTML`);
       return { holdings: [], scaleResult };
     }
     
     const tables = Array.from(doc.querySelectorAll("table")) as Element[];
     if (tables.length === 0) {
-      console.log(`🔧 GBDC Parser: No tables found in parsed HTML`);
+      console.log(`🔧 GBDC Parser: No tables found in section`);
       return { holdings: [], scaleResult };
     }
     
-    console.log(`🔧 GBDC Parser: Found ${tables.length} tables to process`);
+    console.log(`🔧 GBDC Parser: Found ${tables.length} tables to search for holdings`);
+    
+    // Find the table that looks like a holdings table (has Portfolio Company/Investment and Fair Value)
+    let holdingsTable: Element | null = null;
+    let holdingsTableIndex = -1;
+    
+    for (let ti = 0; ti < Math.min(tables.length, 20); ti++) {
+      const table = tables[ti];
+      const tableText = table.textContent?.toLowerCase() || '';
+      
+      // Skip tables that look like financial summaries or comparisons
+      if (tableText.includes('variance') || tableText.includes('vs. 2024') || 
+          tableText.includes('year ended') || tableText.includes('net assets')) {
+        continue;
+      }
+      
+      // Holdings tables typically have these columns
+      const hasPortfolioCompany = tableText.includes('portfolio company') || tableText.includes('borrower/portfolio');
+      const hasInvestmentColumn = tableText.includes('investment') && tableText.includes('type');
+      const hasFairValue = tableText.includes('fair value');
+      const hasPrincipal = tableText.includes('principal') || tableText.includes('par');
+      
+      // More specific check: look for actual company names (LLC, Inc, etc.)
+      const hasCompanyNames = /(llc|inc\.|corp\.|l\.p\.)/i.test(tableText);
+      
+      if ((hasPortfolioCompany || hasInvestmentColumn) && hasFairValue && hasCompanyNames) {
+        holdingsTable = table;
+        holdingsTableIndex = ti;
+        console.log(`🔧 GBDC Parser: Found holdings table at index ${ti} (hasPortfolio=${hasPortfolioCompany}, hasFV=${hasFairValue})`);
+        break;
+      }
+    }
+    
+    if (!holdingsTable) {
+      console.log(`🔧 GBDC Parser: No holdings table found in first 20 tables`);
+      return { holdings: [], scaleResult };
+    }
     
     let currentIndustry: string | null = null;
     let currentCompany: string | null = null;
     let processedRows = 0;
     let batchCount = 0;
     
-    for (const table of tables) {
-      const rows = Array.from(table.querySelectorAll("tr")) as Element[];
-      if (rows.length === 0) continue;
+    // Process the holdings table we found
+    const rows = Array.from(holdingsTable.querySelectorAll("tr")) as Element[];
+    
+    // Find header row with GBDC-specific column mapping
+    let headerRow: Element | null = null;
+    let headerRowIndex = 0;
+    
+    // Log first few rows to understand table structure
+    console.log(`🔧 GBDC Parser: Holdings table has ${rows.length} rows, scanning for header...`);
+    
+    for (let i = 0; i < Math.min(15, rows.length); i++) {
+      const rowText = rows[i].textContent?.toLowerCase() || '';
+      const firstFewChars = rowText.slice(0, 100).replace(/\s+/g, ' ').trim();
       
-      // Find header row with GBDC-specific column mapping
-      let headerRow: Element | null = null;
-      let headerRowIndex = 0;
-      
-      // Log first few rows to understand table structure
-      console.log(`🔧 GBDC Parser: Table has ${rows.length} rows, scanning for header...`);
-      
-      for (let i = 0; i < Math.min(15, rows.length); i++) {
-        const rowText = rows[i].textContent?.toLowerCase() || '';
-        const firstFewChars = rowText.slice(0, 100).replace(/\s+/g, ' ').trim();
-        
-        // Log first 5 rows to understand structure
-        if (i < 5) {
-          console.log(`🔧 GBDC Parser: Row ${i}: "${firstFewChars}..."`);
-        }
-        
-        // GBDC headers typically have: Investment, Industry, Interest Rate/Spread, Maturity, Par, Cost, Fair Value
-        if ((rowText.includes('investment') || rowText.includes('portfolio')) && 
-            (rowText.includes('fair value') || rowText.includes('fair'))) {
-          headerRow = rows[i];
-          headerRowIndex = i;
-          console.log(`🔧 GBDC Parser: Found header at row ${i}`);
-          break;
-        }
+      // Log first 5 rows to understand structure
+      if (i < 5) {
+        console.log(`🔧 GBDC Parser: Row ${i}: "${firstFewChars}..."`);
       }
       
-      if (!headerRow) {
-        console.log(`🔧 GBDC Parser: No header row found in table (scanned ${Math.min(15, rows.length)} rows)`);
-        continue;
+      // GBDC headers typically have: Investment, Industry, Interest Rate/Spread, Maturity, Par, Cost, Fair Value
+      if ((rowText.includes('investment') || rowText.includes('portfolio')) && 
+          (rowText.includes('fair value') || rowText.includes('fair'))) {
+        headerRow = rows[i];
+        headerRowIndex = i;
+        console.log(`🔧 GBDC Parser: Found header at row ${i}`);
+        break;
       }
-      
-      // Get GBDC-specific column indices - this logs the headers
-      const colIndices = findGBDCColumnIndices(headerRow);
-      
-      if (colIndices.investment === -1 || colIndices.fairValue === -1) {
-        console.log(`🔧 GBDC Parser: Missing required columns (investment=${colIndices.investment}, fairValue=${colIndices.fairValue})`);
-        continue;
-      }
-      
-      // Process data rows in batches
+    }
+    
+    if (!headerRow) {
+      console.log(`🔧 GBDC Parser: No header row found in holdings table (scanned ${Math.min(15, rows.length)} rows)`);
+      return { holdings: [], scaleResult };
+    }
+    
+    // Get GBDC-specific column indices - this logs the headers
+    const colIndices = findGBDCColumnIndices(headerRow);
+    
+    if (colIndices.investment === -1 || colIndices.fairValue === -1) {
+      console.log(`🔧 GBDC Parser: Missing required columns (investment=${colIndices.investment}, fairValue=${colIndices.fairValue})`);
+      return { holdings: [], scaleResult };
+    }
+    
+    // Process data rows
       for (let i = headerRowIndex + 1; i < rows.length; i++) {
         const row = rows[i];
         const cells = Array.from(row.querySelectorAll("td, th")) as Element[];
@@ -1910,7 +1937,6 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
           break;
         }
       }
-    }
     
     console.log(`🔧 GBDC Parser: Completed - ${holdings.length} holdings from ${processedRows} rows`);
     
