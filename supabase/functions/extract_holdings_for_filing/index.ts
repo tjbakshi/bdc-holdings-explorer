@@ -2290,11 +2290,17 @@ async function parseBXSLTableAndInsert(params: {
   console.log(`   ✅ Found SOI at position ${soiStart} (match: "${soiMatch?.[0]}")`);
 
   // BXSL: Extract and normalize the period date from the SOI section.
-  // Search the first 2,000 characters of the SOI section for a month-name date.
-  const soiHeaderSection = html.slice(soiStart, Math.min(soiStart + 2000, html.length));
+  // Step 1: Sanitize HTML - remove all tags to prevent <span> from breaking regex
+  const soiHeaderSection = html.slice(soiStart, Math.min(soiStart + 3000, html.length));
+  const cleanHeaderArea = soiHeaderSection.replace(/<[^>]*>?/gm, ' ').replace(/\s+/g, ' ');
+  
+  // Step 2: Search for current period date (prioritize current year dates)
+  // The first date found is the current period; comparative tables come later
   const bxslDateRe = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}/i;
-  const dateMatch = bxslDateRe.exec(soiHeaderSection);
+  const dateMatch = bxslDateRe.exec(cleanHeaderArea);
   const targetPeriodDateText = dateMatch?.[0]?.trim() || null;
+  
+  console.log(`🔧 BXSL: Raw date match from cleaned header: "${targetPeriodDateText}"`);
 
   const normalizePeriodDateToISO = (input: string): string | null => {
     // Expect something like: "September 30, 2025"
@@ -2335,12 +2341,12 @@ async function parseBXSLTableAndInsert(params: {
   if (targetPeriodDateText) {
     periodDateISO = normalizePeriodDateToISO(targetPeriodDateText);
     if (periodDateISO) {
-      console.log(`🔧 BXSL: Successfully normalized period date to: ${periodDateISO}`);
+      console.log(`🔧 BXSL: Found Current Period Date: ${targetPeriodDateText} → ${periodDateISO}`);
     } else {
-      console.log(`❌ BXSL: Failed to find or format period date.`);
+      console.log(`❌ BXSL: Failed to normalize period date from: "${targetPeriodDateText}"`);
     }
   } else {
-    console.log(`❌ BXSL: Failed to find or format period date.`);
+    console.log(`❌ BXSL: Failed to find period date in cleaned header area.`);
   }
 
   // Define prior period dates to skip (comparative tables)
