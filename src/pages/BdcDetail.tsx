@@ -744,6 +744,7 @@ const BdcDetail = () => {
                             <TableHead>Investment Type</TableHead>
                             <TableHead>Industry</TableHead>
                             <TableHead className="min-w-[250px]">Description</TableHead>
+                            <TableHead>Period Date</TableHead>
                             <TableHead>Interest Rate</TableHead>
                             <TableHead>Reference Rate</TableHead>
                             <TableHead>Maturity</TableHead>
@@ -786,6 +787,7 @@ const BdcDetail = () => {
                               <TableCell className="text-sm">
                                 {holding.description || "—"}
                               </TableCell>
+                              <TableCell>{holding.period_date ? formatDate(holding.period_date) : "—"}</TableCell>
                               <TableCell>{holding.interest_rate || "—"}</TableCell>
                               <TableCell>{holding.reference_rate || "—"}</TableCell>
                               <TableCell>{formatDate(holding.maturity_date)}</TableCell>
