@@ -677,8 +677,10 @@ const BdcDetail = () => {
                   {/* Portfolio Summary */}
                   {portfolioSummary && (
                     <div className="mb-6 p-4 bg-muted/50 rounded-lg border">
-                      <h3 className="text-sm font-semibold mb-3 text-muted-foreground uppercase tracking-wide">Portfolio Summary</h3>
-                      <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+                      <h3 className="text-sm font-semibold mb-3 text-muted-foreground uppercase tracking-wide">
+                        Portfolio Summary ({filteredHoldings?.length || 0} Holdings)
+                      </h3>
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
                         <div>
                           <p className="text-xs text-muted-foreground">Total Par</p>
                           <p className="text-lg font-semibold font-mono">{formatCurrencyMillions(portfolioSummary.totalPar)}</p>
@@ -700,43 +702,6 @@ const BdcDetail = () => {
                           <p className="text-lg font-semibold">{summaryFmvCost}</p>
                         </div>
                       </div>
-
-                      {/* Industry Breakdown */}
-                      {industrySummary.length > 0 && (
-                        <>
-                          <h4 className="text-sm font-semibold mb-3 text-muted-foreground uppercase tracking-wide">Industry Breakdown</h4>
-                          <div className="rounded-md border overflow-x-auto">
-                            <Table>
-                              <TableHeader>
-                                <TableRow>
-                                  <TableHead>Industry</TableHead>
-                                  <TableHead className="text-center"># Holdings</TableHead>
-                                  <TableHead className="text-right">Par</TableHead>
-                                  <TableHead className="text-right">Cost</TableHead>
-                                  <TableHead className="text-right">Fair Value</TableHead>
-                                  <TableHead className="text-right">FMV % Par</TableHead>
-                                  <TableHead className="text-right">FMV % Cost</TableHead>
-                                  <TableHead className="text-right">Allocation</TableHead>
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {industrySummary.map((ind) => (
-                                  <TableRow key={ind.industry}>
-                                    <TableCell className="font-medium">{ind.industry}</TableCell>
-                                    <TableCell className="text-center">{ind.count}</TableCell>
-                                    <TableCell className="text-right font-mono">{formatCurrencyMillions(ind.par)}</TableCell>
-                                    <TableCell className="text-right font-mono">{formatCurrencyMillions(ind.cost)}</TableCell>
-                                    <TableCell className="text-right font-mono">{formatCurrencyMillions(ind.fairValue)}</TableCell>
-                                    <TableCell className="text-right">{ind.fmvPar}</TableCell>
-                                    <TableCell className="text-right">{ind.fmvCost}</TableCell>
-                                    <TableCell className="text-right font-semibold">{ind.allocation}</TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                          </div>
-                        </>
-                      )}
                     </div>
                   )}
                   <TooltipProvider>
