@@ -1514,9 +1514,10 @@ function preprocessHtml(html: string): string {
  * GBDC Column Mapping - maps GBDC's specific column names to standard fields
  */
 interface GBDCColumnIndices {
-  investment: number;      // -> company_name
-  industry: number;        // -> industry
-  interestRate: number;    // -> interest_rate / reference_rate
+  investment: number;      // -> company_name (Portfolio Company/Investment)
+  investmentType: number;  // -> investment_type (Type of Investment)
+  industry: number;        // -> industry (Industry Classification)
+  interestRate: number;    // -> interest_rate
   spread: number;          // -> reference_rate
   maturity: number;
   par: number;
@@ -1526,11 +1527,21 @@ interface GBDCColumnIndices {
 
 /**
  * Find GBDC column indices from header row
+ * GBDC headers typically include:
+ * - Portfolio Company/Investment
+ * - Type of Investment  
+ * - Industry Classification
+ * - Interest Rate / Spread
+ * - Maturity Date
+ * - Par Amount
+ * - Cost
+ * - Fair Value
  */
 function findGBDCColumnIndices(headerRow: Element): GBDCColumnIndices {
   const cells = Array.from(headerRow.querySelectorAll("th, td"));
   const indices: GBDCColumnIndices = {
     investment: -1,
+    investmentType: -1,
     industry: -1,
     interestRate: -1,
     spread: -1,
@@ -1540,32 +1551,64 @@ function findGBDCColumnIndices(headerRow: Element): GBDCColumnIndices {
     fairValue: -1,
   };
   
+  // Log all headers for debugging
+  const headerTexts: string[] = [];
+  
   let position = 0;
   for (const cell of cells) {
     const text = (cell as Element).textContent?.toLowerCase().trim() || '';
     const colspan = parseInt((cell as Element).getAttribute("colspan") || "1", 10);
     
-    // GBDC-specific column mappings
-    if (text.includes('investment') || text.includes('portfolio company') || text.includes('borrower')) {
-      indices.investment = position;
-    } else if (text.includes('industry') || text.includes('sector')) {
-      indices.industry = position;
-    } else if (text.includes('interest rate') || text.includes('coupon') || text.includes('rate')) {
-      indices.interestRate = position;
-    } else if (text.includes('spread') || text.includes('floor')) {
-      indices.spread = position;
-    } else if (text.includes('maturity') || text.includes('due') || text.includes('expiration')) {
-      indices.maturity = position;
-    } else if (text.includes('par') || text.includes('principal') || text.includes('face')) {
-      indices.par = position;
-    } else if (text.includes('cost') || text.includes('amortized')) {
-      indices.cost = position;
-    } else if (text.includes('fair value') || text.includes('fair') || text.includes('market')) {
-      indices.fairValue = position;
+    headerTexts.push(`"${text}"@${position}`);
+    
+    // GBDC-specific column mappings (order matters - more specific first)
+    
+    // Investment Type column (must check before "investment" alone)
+    if (text.includes('type of investment') || text.includes('investment type') || 
+        (text.includes('type') && !text.includes('industry'))) {
+      if (indices.investmentType === -1) indices.investmentType = position;
+    }
+    // Industry Classification column
+    else if (text.includes('industry classification') || text.includes('industry') || text.includes('sector')) {
+      if (indices.industry === -1) indices.industry = position;
+    }
+    // Portfolio Company / Investment column (the company name)
+    else if (text.includes('portfolio company') || text.includes('borrower') || 
+             (text.includes('investment') && !text.includes('type'))) {
+      if (indices.investment === -1) indices.investment = position;
+    }
+    // Interest Rate column
+    else if (text.includes('interest rate') || text.includes('coupon') || 
+             (text.includes('rate') && !text.includes('spread'))) {
+      if (indices.interestRate === -1) indices.interestRate = position;
+    }
+    // Spread column
+    else if (text.includes('spread') || text.includes('floor')) {
+      if (indices.spread === -1) indices.spread = position;
+    }
+    // Maturity column
+    else if (text.includes('maturity') || text.includes('due date') || text.includes('expiration')) {
+      if (indices.maturity === -1) indices.maturity = position;
+    }
+    // Par Amount column
+    else if (text.includes('par amount') || text.includes('par value') || 
+             text.includes('principal') || text.includes('face')) {
+      if (indices.par === -1) indices.par = position;
+    }
+    // Cost column
+    else if (text.includes('cost') || text.includes('amortized')) {
+      if (indices.cost === -1) indices.cost = position;
+    }
+    // Fair Value column (check last as it's often at the end)
+    else if (text.includes('fair value') || text.includes('fair') || text.includes('market value')) {
+      if (indices.fairValue === -1) indices.fairValue = position;
     }
     
     position += colspan;
   }
+  
+  console.log(`🔧 GBDC Parser: Found headers: [${headerTexts.join(', ')}]`);
+  console.log(`🔧 GBDC Parser: Column indices: investment=${indices.investment}, investmentType=${indices.investmentType}, industry=${indices.industry}, interestRate=${indices.interestRate}, cost=${indices.cost}, fairValue=${indices.fairValue}`);
   
   return indices;
 }
@@ -1794,20 +1837,32 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
         const maturityCell = colIndices.maturity >= 0 ? getCellAtPos(colIndices.maturity) : null;
         const maturityDate = parseDate(maturityCell?.textContent?.trim());
         
-        // Try to extract investment type from the row
-        // GBDC often has investment type in a separate cell or within the investment description
+        // Get investment type from dedicated column first, then fallback to extraction
         let investmentType: string | null = null;
-        const investmentText = rawCompanyName.toLowerCase();
-        if (/(first lien|second lien|senior secured|subordinated|mezzanine|unitranche)/i.test(investmentText)) {
-          const match = investmentText.match(/(first lien|second lien|senior secured|subordinated|mezzanine|unitranche)[^,]*/i);
-          investmentType = match ? match[0].trim() : null;
-        } else {
-          // Look for investment type in cells after company name
-          for (let j = 1; j < Math.min(cells.length, 5); j++) {
-            const cellText = cells[j]?.textContent?.trim() || '';
-            if (/(first lien|second lien|senior|subordinated|mezzanine|equity|preferred|common|warrant|unitranche|loan|note|bond)/i.test(cellText)) {
-              investmentType = cellText.slice(0, 100);
-              break;
+        
+        // GBDC has a dedicated "Type of Investment" column
+        if (colIndices.investmentType >= 0) {
+          const typeCell = getCellAtPos(colIndices.investmentType);
+          const typeText = typeCell?.textContent?.trim();
+          if (typeText && typeText.length > 2 && typeText.length < 150) {
+            investmentType = typeText;
+          }
+        }
+        
+        // Fallback: try to extract from company name or other cells
+        if (!investmentType) {
+          const investmentText = rawCompanyName.toLowerCase();
+          if (/(first lien|second lien|senior secured|subordinated|mezzanine|unitranche)/i.test(investmentText)) {
+            const match = investmentText.match(/(first lien|second lien|senior secured|subordinated|mezzanine|unitranche)[^,]*/i);
+            investmentType = match ? match[0].trim() : null;
+          } else {
+            // Look for investment type in cells after company name
+            for (let j = 1; j < Math.min(cells.length, 5); j++) {
+              const cellText = cells[j]?.textContent?.trim() || '';
+              if (/(first lien|second lien|senior|subordinated|mezzanine|equity|preferred|common|warrant|unitranche|loan|note|bond)/i.test(cellText)) {
+                investmentType = cellText.slice(0, 100);
+                break;
+              }
             }
           }
         }
