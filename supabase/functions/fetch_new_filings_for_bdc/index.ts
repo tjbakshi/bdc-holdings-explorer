@@ -1,7 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// 🚨 MEMORY SAFE: No heavy DOM libraries. We use a custom "DOM-like" helper.
+// 🚨 MEMORY SAFE: No heavy DOM libraries. Strict Streaming.
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -11,10 +11,8 @@ const corsHeaders = {
 const SEC_USER_AGENT = "BDCTrackerApp/1.0 (contact@bdctracker.com)";
 
 // ======================================================================
-// 1. LIGHTWEIGHT "DOM-LIKE" PARSER
+// 1. LIGHTWEIGHT "DOM-LIKE" PARSER (Regex)
 // ======================================================================
-// These functions mimic DOM behavior (traversing rows/cells) using strict Regex.
-// They consume almost 0 memory compared to a real DOM Parser.
 
 function stripTags(html: string): string {
   if (!html) return "";
@@ -31,9 +29,6 @@ function stripTags(html: string): string {
     .trim();
 }
 
-/**
- * Extracts rows <tr> from a table string.
- */
 function getRows(tableHtml: string): string[] {
   const rows: string[] = [];
   const rowRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
@@ -44,10 +39,6 @@ function getRows(tableHtml: string): string[] {
   return rows;
 }
 
-/**
- * Extracts cells <td>/<th> from a row string.
- * CRITICAL: Handles 'colspan' to ensure data stays in the correct column index.
- */
 function getCells(rowHtml: string): string[] {
   const cells: string[] = [];
   const cellRe = /<t[dh]\b([^>]*)>([\s\S]*?)<\/t[dh]>/gi;
@@ -57,9 +48,7 @@ function getCells(rowHtml: string): string[] {
     const content = stripTags(match[2]);
     const colspanMatch = attrs.match(/colspan=["']?(\d+)["']?/i);
     const span = colspanMatch ? parseInt(colspanMatch[1]) : 1;
-    
     cells.push(content);
-    // Insert placeholders for merged cells so columns stay aligned
     for (let i = 1; i < span; i++) cells.push(""); 
   }
   return cells;
@@ -105,14 +94,11 @@ function hasCompanySuffix(name: string): boolean {
 }
 
 // ======================================================================
-// 2. PARSING LOGIC (The Switchboard)
+// 2. PARSING LOGIC (Switchboard)
 // ======================================================================
-// These functions accept ONE table string at a time.
 
 function processTable_GBDC(tableHtml: string, scale: number): any[] {
-  // GBDC Filter
   if (!/(llc|inc\.|corp\.|l\.p\.|limited|\$|fair value)/i.test(tableHtml)) return [];
-
   const rows = getRows(tableHtml);
   if (rows.length < 3) return [];
 
@@ -120,7 +106,6 @@ function processTable_GBDC(tableHtml: string, scale: number): any[] {
   let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
   let dataStart = 0;
 
-  // Header Scan
   for (let i = 0; i < Math.min(8, rows.length); i++) {
     const cells = getCells(rows[i]);
     cells.forEach((t, idx) => {
@@ -141,7 +126,6 @@ function processTable_GBDC(tableHtml: string, scale: number): any[] {
   let currentCompany = null;
   let currentIndustry = null;
 
-  // Row Scan
   for (let i = dataStart; i < rows.length; i++) {
     const cells = getCells(rows[i]);
     if (cells.length < 3) continue;
@@ -177,7 +161,6 @@ function processTable_GBDC(tableHtml: string, scale: number): any[] {
 
 function processTable_BXSL(tableHtml: string, scale: number): any[] {
   if (!/(llc|inc\.|corp\.|limited|\$|fair value)/i.test(tableHtml)) return [];
-
   const rows = getRows(tableHtml);
   if (rows.length < 3) return [];
 
@@ -244,7 +227,7 @@ function processTable_BXSL(tableHtml: string, scale: number): any[] {
 }
 
 function processTable_ARCC(tableHtml: string, scale: number): any[] {
-  // Relaxed ARCC filter
+  // Relaxed ARCC filter (accepts numbers only tables)
   if (!/(\$|fair value)/i.test(tableHtml)) return [];
 
   const rows = getRows(tableHtml);
@@ -278,7 +261,7 @@ function processTable_ARCC(tableHtml: string, scale: number): any[] {
     const cells = getCells(rows[i]);
     if (cells.length < 3) continue;
 
-    // ARCC Industry Header (Row with 1 meaningful cell)
+    // ARCC Industry Header Detection
     const firstText = cells[0];
     const hasNumbers = cells.slice(1).some(x => /\d/.test(x));
     if (firstText && firstText.length > 3 && !hasNumbers && !/(company|issuer|total)/i.test(firstText)) {
@@ -316,7 +299,7 @@ function processTable_ARCC(tableHtml: string, scale: number): any[] {
 }
 
 // ======================================================================
-// 3. STREAMING ENGINE
+// 3. STREAMING ENGINE (Fixes Memory & Stop Sign Bug)
 // ======================================================================
 
 async function processStream(
@@ -331,10 +314,10 @@ async function processStream(
   const decoder = new TextDecoder("utf-8");
   
   let buffer = "";
-  let scale = 0.001; // Default
+  let scale = 0.001; 
   let scaleDetected = false;
-  let inSOI = false; // "Inside Schedule of Investments" flag
-  let inPriorPeriod = false; // Flag to stop processing if we hit prior year
+  let inSOI = false; 
+  let inPriorPeriod = false; 
   
   let insertedCount = 0;
   let pendingRows: any[] = [];
@@ -349,74 +332,68 @@ async function processStream(
       
       buffer += decoder.decode(value, { stream: true });
 
-      // 1. Detect Scale (Only need to do this once, early in file)
+      // 1. Detect Scale (Once)
       if (!scaleDetected && buffer.length > 50000) {
         if (/\(in millions\)/i.test(buffer)) scale = 1;
         scaleDetected = true;
-        console.log(`Scale detected: ${scale === 1 ? "Millions" : "Thousands"}`);
       }
 
-      // 2. Check for SOI Start (Context Gate)
+      // 2. Check for SOI Start
       if (!inSOI) {
         const soiIdx = buffer.toLowerCase().indexOf("schedule of investments");
         if (soiIdx !== -1) {
-          console.log("✅ Found Schedule of Investments start.");
           inSOI = true;
-          // Trim buffer before SOI to save memory
           buffer = buffer.slice(soiIdx);
         } else {
-          // Keep buffer small if we haven't found start yet
-          // Keep last 1000 chars for overlap safety
           if (buffer.length > 100000) buffer = buffer.slice(-1000);
           continue;
         }
       }
 
-      // 3. Check for Prior Period / End (Context Stop)
+      // 3. Check for END or PRIOR PERIOD (The Logic Fix)
       if (inSOI && !inPriorPeriod) {
-        // Look for end markers or next SOI header (indicating prior period)
         const lowerBuf = buffer.toLowerCase();
-        // Check for Notes or Financial Statements
-        if (lowerBuf.includes("notes to") || lowerBuf.includes("statements of operations")) {
-           console.log("🛑 Found End Marker (Notes). Stopping.");
+        
+        // Strict End Markers
+        if (lowerBuf.includes("notes to consolidated") || lowerBuf.includes("notes to financial")) {
+           console.log("🛑 Found Notes. Stopping.");
            break; 
         }
-        // Check for SECOND occurrence of SOI (Prior Period)
-        // We assume the first occurrence was removed from buffer or is at index 0.
-        // We look for a *new* header further down.
-        // Warning: We must be careful not to match the *current* header if it's still in buffer.
-        // Simple heuristic: If we see "December 31" (Prior Year End) nearby "Schedule of Investments"
-        // For simplicity in streaming: If we see another "Schedule of Investments" header
-        // and we have already processed at least 1 table, it's likely the prior period.
-        if (insertedCount > 50 && lowerBuf.includes("schedule of investments")) {
-           console.log("🛑 Found Prior Period Header. Stopping.");
-           break;
+
+        // PRIOR PERIOD CHECK:
+        // We look for "Schedule of Investments" + "December 31" (or similar prior dates)
+        // We do NOT stop just for "Continued".
+        if (insertedCount > 50) {
+           const nextSoi = lowerBuf.indexOf("schedule of investments");
+           // Only stop if we see a date that indicates old data nearby
+           if (nextSoi !== -1 && (
+               lowerBuf.includes("december 31, 2024") || 
+               lowerBuf.includes("december 31, 2023")
+           )) {
+               console.log("🛑 Found Prior Period Date. Stopping.");
+               break;
+           }
         }
       }
 
-      // 4. Extract and Process Tables
-      // Loop to find all COMPLETE tables in current buffer
+      // 4. Extract Tables
       while (true) {
         const tableStart = buffer.indexOf("<table");
         if (tableStart === -1) break;
 
         const tableEnd = buffer.indexOf("</table>", tableStart);
-        if (tableEnd === -1) break; // Table not complete yet, wait for more chunks
+        if (tableEnd === -1) break; 
 
-        // Extract complete table
-        const tableHtml = buffer.slice(tableStart, tableEnd + 8); // +8 for </table>
-        
-        // Remove this table from buffer to free memory
+        const tableHtml = buffer.slice(tableStart, tableEnd + 8);
         buffer = buffer.slice(tableEnd + 8);
 
-        // PROCESS THIS TABLE
+        // PROCESS TABLE
         let newRows: any[] = [];
         if (parserType === 'GBDC') newRows = processTable_GBDC(tableHtml, scale);
         else if (parserType === 'BXSL') newRows = processTable_BXSL(tableHtml, scale);
         else newRows = processTable_ARCC(tableHtml, scale);
 
         if (newRows.length > 0) {
-          // Deduplicate & Batch
           for (const row of newRows) {
             const key = `${row.company_name}-${row.fair_value}-${row.cost}`;
             if (!seenKeys.has(key)) {
@@ -430,26 +407,22 @@ async function processStream(
           }
         }
 
-        // Flush to DB if batch full
         if (pendingRows.length >= 200) {
           await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
           insertedCount += 200;
-          console.log(`Inserted ${insertedCount} rows...`);
         }
       }
 
-      // 5. Memory Safety Valve
-      // If buffer grows too large (e.g. huge text block between tables), trim it.
-      if (buffer.length > 5_000_000) {
-        console.warn("⚠️ Buffer too large, trimming start...");
-        buffer = buffer.slice(-1000); // Keep overlap
+      // 5. Buffer Safety (Increased to 15MB)
+      if (buffer.length > 15_000_000) {
+        console.warn("⚠️ Buffer > 15MB. Trimming safely.");
+        buffer = buffer.slice(-2000); 
       }
     }
   } catch (err) {
     console.error("Stream Error:", err);
   }
 
-  // Flush remaining
   if (pendingRows.length > 0) {
     await supabaseClient.from("holdings").insert(pendingRows);
     insertedCount += pendingRows.length;
@@ -498,8 +471,6 @@ serve(async (req) => {
 
     const paddedCik = cik.replace(/^0+/, "");
     const accNoClean = accessionNo.replace(/-/g, "");
-    
-    // Index
     const indexUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accNoClean}/index.json`;
     const indexRes = await fetch(indexUrl, { headers: { "User-Agent": SEC_USER_AGENT } });
     const indexJson = await indexRes.json();
@@ -508,14 +479,10 @@ serve(async (req) => {
     const htmDocs = docs.filter((d: any) => d.name.endsWith(".htm") || d.name.endsWith(".html"));
     if (htmDocs.length === 0) throw new Error("No HTML found");
 
-    // Target Doc
     const targetDoc = htmDocs.sort((a: any, b: any) => parseInt(b.size) - parseInt(a.size))[0];
     const docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accNoClean}/${targetDoc.name}`;
     
-    // START STREAMING REQUEST
     const htmlRes = await fetch(docUrl, { headers: { "User-Agent": SEC_USER_AGENT } });
-    
-    // Process stream
     const result = await processStream(htmlRes, filingId, supabaseClient, parserType);
 
     if (result.count > 0) {
