@@ -1852,9 +1852,8 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       colIndices.fairValue = colIndices.cost + 1;
     }
     
-    if (tableIdx === 0) {
-      console.log(`   Column indices: company=${colIndices.company}, type=${colIndices.investmentType}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
-    }
+    // Log column indices for debugging
+    console.log(`   Table ${tableIdx + 1} columns: company=${colIndices.company}, type=${colIndices.investmentType}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
     
     // Find data start row by looking for first row with company name suffix
     let dataStartRow = -1;
@@ -1862,12 +1861,16 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       const rowText = rows[i].textContent || '';
       if (/(LLC|Inc\.|Corp\.|Co\.|L\.P\.|LP|Ltd\.)/i.test(rowText)) {
         dataStartRow = i;
+        if (tableIdx < 3) {
+          console.log(`   Table ${tableIdx + 1} data starts at row ${i}: "${rowText.slice(0, 50).replace(/\s+/g, ' ')}..."`);
+        }
         break;
       }
     }
     
     if (dataStartRow === -1) {
-      dataStartRow = 5;
+      console.log(`   ⚠️ Table ${tableIdx + 1}: No company row found, skipping`);
+      continue;
     }
     
     // Extract holdings from data rows
