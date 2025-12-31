@@ -48,8 +48,6 @@ export type Database = {
         Row: {
           bdc_id: string
           created_at: string | null
-          current_byte_offset: number | null
-          current_industry_state: string | null
           data_source: string | null
           filing_type: string
           filing_url: string | null
@@ -57,14 +55,11 @@ export type Database = {
           parsed_successfully: boolean | null
           period_end: string
           sec_accession_no: string | null
-          total_file_size: number | null
           value_scale: string | null
         }
         Insert: {
           bdc_id: string
           created_at?: string | null
-          current_byte_offset?: number | null
-          current_industry_state?: string | null
           data_source?: string | null
           filing_type: string
           filing_url?: string | null
@@ -72,14 +67,11 @@ export type Database = {
           parsed_successfully?: boolean | null
           period_end: string
           sec_accession_no?: string | null
-          total_file_size?: number | null
           value_scale?: string | null
         }
         Update: {
           bdc_id?: string
           created_at?: string | null
-          current_byte_offset?: number | null
-          current_industry_state?: string | null
           data_source?: string | null
           filing_type?: string
           filing_url?: string | null
@@ -87,7 +79,6 @@ export type Database = {
           parsed_successfully?: boolean | null
           period_end?: string
           sec_accession_no?: string | null
-          total_file_size?: number | null
           value_scale?: string | null
         }
         Relationships: [
