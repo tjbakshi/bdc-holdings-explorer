@@ -1930,32 +1930,46 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       const companyCell = getCellAtPos(colIndices.company);
       const rawCompanyName = companyCell?.textContent?.trim() || '';
       
-      // Check for industry header row (single non-empty cell, not a company)
-      const nonEmptyCells = cells.filter(c => {
-        const t = c.textContent?.trim() || '';
-        return t.length > 1 && !/^[-—$\s]*$/.test(t);
-      });
+      // GBDC-specific: Check first cell (column 0) for industry name
+      // Industry headers have industry text in column 0 AND no company in column 3
+      const firstCell = cells[0];
+      const firstCellText = firstCell?.textContent?.trim() || '';
       
-      // GBDC: Industry headers are rows where:
-      // 1. Few non-empty cells (typically 1-3)
-      // 2. Text doesn't look like a company name
-      // 3. Text is a known industry or reasonable length
-      if (nonEmptyCells.length <= 3) {
-        // Check the first non-empty cell for industry name
-        const firstCellText = nonEmptyCells[0]?.textContent?.trim() || '';
-        const looksLikeCompany = /(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd)/i.test(firstCellText);
-        const looksLikeTotal = /^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(firstCellText);
-        const looksLikeHeader = /^(Portfolio|Borrower|Investment|Industry|Company)/i.test(firstCellText);
-        const looksLikeNumeric = /^[\$\(\)\-\d,.\s%]+$/.test(firstCellText);
+      // Check if this is an industry header row:
+      // 1. First cell has text that looks like an industry (not a company suffix)
+      // 2. Company column is empty or doesn't have a company suffix
+      const looksLikeIndustry = firstCellText.length > 3 && firstCellText.length < 80 &&
+          !/(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd|S\.A\.|GmbH)/i.test(firstCellText) &&
+          !/^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(firstCellText) &&
+          !/^(Portfolio|Borrower|Investment|Company|Fair Value|Cost|Par|Principal)/i.test(firstCellText) &&
+          !/^[\$\(\)\-\d,.\s%]+$/.test(firstCellText) &&
+          !/^\d/.test(firstCellText);
+      
+      const companyIsEmpty = !rawCompanyName || rawCompanyName.length < 3 ||
+          /^[-—\s]+$/.test(rawCompanyName);
+      
+      const companyDoesNotLookLikeCompany = !/(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd)/i.test(rawCompanyName);
+      
+      if (looksLikeIndustry && (companyIsEmpty || companyDoesNotLookLikeCompany)) {
+        // Log industry changes
+        console.log(`   📌 Industry: "${firstCellText}" (company col was: "${rawCompanyName.slice(0, 30)}")`);
+        currentIndustry = firstCellText;
+        globalCurrentIndustry = firstCellText;
+        continue;
+      }
+      
+      // Also check if rawCompanyName itself is an industry (for tables where company=0)
+      if (colIndices.company === 0 && looksLikeIndustry && companyDoesNotLookLikeCompany) {
+        // Check if this row has no financial data
+        const nonEmptyCells = cells.filter(c => {
+          const t = c.textContent?.trim() || '';
+          return t.length > 1 && !/^[-—$\s]*$/.test(t);
+        });
         
-        if (firstCellText.length > 2 && firstCellText.length < 80 && 
-            !looksLikeCompany && !looksLikeTotal && !looksLikeHeader && !looksLikeNumeric) {
-          // Log industry changes for debugging
-          if (holdings.length % 300 === 0 || firstCellText.toLowerCase().includes('software')) {
-            console.log(`   📌 Industry detected at row ${i}: "${firstCellText}" (nonEmptyCells: ${nonEmptyCells.length})`);
-          }
-          currentIndustry = firstCellText;
-          globalCurrentIndustry = firstCellText;
+        if (nonEmptyCells.length <= 3) {
+          console.log(`   📌 Industry (alt): "${rawCompanyName}"`);
+          currentIndustry = rawCompanyName;
+          globalCurrentIndustry = rawCompanyName;
           continue;
         }
       }
