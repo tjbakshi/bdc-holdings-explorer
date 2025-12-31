@@ -1863,8 +1863,16 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       hasFoundFirstTable = true;
     }
     
+    // GBDC: Industry is typically in column 0 when company is at column 3
+    if (colIndices.industry === -1 && colIndices.company >= 1) {
+      colIndices.industry = 0;
+      if (!hasFoundFirstTable) {
+        savedColIndices.industry = 0;
+      }
+    }
+    
     // Log column indices for debugging
-    console.log(`   Table ${tableIdx + 1} columns: company=${colIndices.company}, type=${colIndices.investmentType}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
+    console.log(`   Table ${tableIdx + 1} columns: company=${colIndices.company}, industry=${colIndices.industry}, type=${colIndices.investmentType}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
     
     // Find data start row by looking for first row with company name suffix
     let dataStartRow = -1;
@@ -1972,13 +1980,23 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       const parCell = colIndices.par >= 0 ? getCellAtPos(colIndices.par) : null;
       const parAmount = cleanGBDCNumeric(parCell?.textContent);
       
-      // Get industry
+      // Get industry from column 0 (GBDC format: industry is first column)
       let industry = currentIndustry;
       if (colIndices.industry >= 0) {
         const industryCell = getCellAtPos(colIndices.industry);
-        const industryText = industryCell?.textContent?.trim();
-        if (industryText && industryText.length > 2 && industryText.length < 100) {
+        const industryText = industryCell?.textContent?.trim() || '';
+        
+        // GBDC: Industry appears on first row of each group, subsequent rows are blank
+        // Only update currentIndustry if this cell has meaningful industry text
+        if (industryText.length > 2 && industryText.length < 100 && 
+            !/(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd)/i.test(industryText) &&
+            !/^\d/.test(industryText) && !/^[\$\(\)\-\d,.\s]+$/.test(industryText)) {
+          currentIndustry = industryText;
+          globalCurrentIndustry = industryText;
           industry = industryText;
+        } else {
+          // Use the tracked current industry for rows without industry text
+          industry = currentIndustry;
         }
       }
       
