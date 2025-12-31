@@ -1348,15 +1348,35 @@ function parseHtmlScheduleOfInvestments(
         break;
       }
       
-      // ============ OPTIMIZED PERIOD DATE EXTRACTION ============
-      // Extract a single period date from the start of the snippet (CPU-efficient)
-      // For large segmented processing, dates carry forward across segments
+      // ============ PER-TABLE PERIOD DATE EXTRACTION ============
+      // Find all table positions in this snippet and extract period dates from pre-table text
+      const tablePeriodDates = new Map<number, string | null>();
+      const tableStartRe = /<table\b[^>]*>/gi;
+      let tableMatch;
+      let tableIndex = 0;
+      
+      while ((tableMatch = tableStartRe.exec(snippet)) !== null) {
+        tableIndex++;
+        const tableStartIdx = tableMatch.index;
+        
+        // Look at the 2,000 characters immediately before this <table> tag
+        const localHeaderRaw = snippet.slice(Math.max(0, tableStartIdx - 2000), tableStartIdx);
+        const tablePeriodDateISO = extractPeriodDateFromText(localHeaderRaw);
+        
+        // Store the found date (or null if not found)
+        tablePeriodDates.set(tableIndex, tablePeriodDateISO);
+        
+        if (tablePeriodDateISO && debugMode) {
+          console.log(`🔧 ARCC: Table ${tableIndex} header date: ${tablePeriodDateISO}`);
+        }
+      }
+      
+      // Also try to extract a default period date from the start of the snippet
       if (!carryPeriodDate) {
-        // Only check first 3000 chars - enough to find header dates
-        const snippetStart = snippet.slice(0, 3000);
+        const snippetStart = snippet.slice(0, 5000);
         carryPeriodDate = extractPeriodDateFromText(snippetStart);
         if (carryPeriodDate) {
-          console.log(`🔧 ARCC: Switched context to period: ${carryPeriodDate}`);
+          console.log(`🔧 ARCC: Default Period Date (snippet header) = ${carryPeriodDate}`);
         }
       }
       
@@ -1366,14 +1386,14 @@ function parseHtmlScheduleOfInvestments(
       
       const tables = Array.from(doc.querySelectorAll("table")) as Element[];
       
-      // Pass the carry-forward period date to parseTables (no per-table map needed)
+      // Pass the per-table period dates to parseTables
       const parseResult = parseTables(
         tables, 
         maxRowsPerTable, 
         remainingCapacity, 
         debugMode, 
         carryIndustry,
-        undefined,  // No per-table dates - use carry-forward for efficiency
+        tablePeriodDates,
         carryPeriodDate
       );
       const snippetHoldings = parseResult.holdings;
