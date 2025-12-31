@@ -1610,6 +1610,13 @@ function findGBDCColumnIndices(headerRow: Element): GBDCColumnIndices {
   console.log(`🔧 GBDC Parser: Found headers: [${headerTexts.join(', ')}]`);
   console.log(`🔧 GBDC Parser: Column indices: investment=${indices.investment}, investmentType=${indices.investmentType}, industry=${indices.industry}, interestRate=${indices.interestRate}, cost=${indices.cost}, fairValue=${indices.fairValue}`);
   
+  // GBDC-specific fallback: if we found other columns but not investment (company name),
+  // assume it's in position 0 (first column - common for GBDC's format where company is first but unlabeled)
+  if (indices.investment === -1 && indices.fairValue >= 0) {
+    console.log(`🔧 GBDC Parser: Investment column not found, defaulting to position 0 (first column)`);
+    indices.investment = 0;
+  }
+  
   return indices;
 }
 
@@ -1652,43 +1659,77 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
     return { holdings: [], scaleResult };
   }
   
-  // Step 4: Find the holdings table using regex first (to avoid DOM parsing large sections)
+  // Step 4: Find the holdings table - limit search to first 2MB after SOI to avoid regex timeout
   // GBDC has multiple tables - we need to find the one with company holdings
-  const afterSoi = processedHtml.slice(soiStart);
+  const searchLimit = 2_000_000; // 2MB max search area
+  const afterSoi = processedHtml.slice(soiStart, soiStart + searchLimit);
+  const afterSoiLower = afterSoi.toLowerCase();
   
-  // Use regex to find table boundaries without parsing the entire document
-  // Look for tables that contain "portfolio company" or "borrower" near the header
-  const tablePattern = /<table[^>]*>([\s\S]*?)<\/table>/gi;
-  let match;
+  console.log(`🔧 GBDC Parser: Searching in first ${(afterSoi.length / 1024).toFixed(0)} KB after SOI header`);
+  
+  // Find table boundaries by looking for <table> and </table> tags
+  // This is faster than regex on large strings
+  let searchPos = 0;
   let holdingsTableHtml: string | null = null;
   let tableSearchCount = 0;
   const maxTablesToSearch = 30;
   
-  console.log(`🔧 GBDC Parser: Searching for holdings table using regex...`);
-  
-  while ((match = tablePattern.exec(afterSoi)) !== null && tableSearchCount < maxTablesToSearch) {
+  while (searchPos < afterSoi.length && tableSearchCount < maxTablesToSearch) {
+    // Find next table start
+    const tableStartIdx = afterSoiLower.indexOf('<table', searchPos);
+    if (tableStartIdx === -1) break;
+    
+    // Find table end
+    const tableEndIdx = afterSoiLower.indexOf('</table>', tableStartIdx);
+    if (tableEndIdx === -1) break;
+    
     tableSearchCount++;
-    const tableHtml = match[0];
+    const tableHtml = afterSoi.slice(tableStartIdx, tableEndIdx + 8);
     const tableLower = tableHtml.toLowerCase();
+    searchPos = tableEndIdx + 8;
+    
+    // Log progress
+    if (tableSearchCount <= 5 || tableSearchCount % 10 === 0) {
+      console.log(`🔧 GBDC Parser: Checking table ${tableSearchCount} (size: ${(tableHtml.length / 1024).toFixed(0)} KB)`);
+    }
     
     // Skip small tables (likely navigation or formatting)
-    if (tableHtml.length < 5000) continue;
+    if (tableHtml.length < 10000) continue;
     
     // Skip tables that look like financial summaries
     if (tableLower.includes('variance') || tableLower.includes('vs. 2024') || 
-        tableLower.includes('year ended') && !tableLower.includes('portfolio')) {
+        (tableLower.includes('year ended') && !tableLower.includes('portfolio'))) {
+      console.log(`🔧 GBDC Parser: Table ${tableSearchCount} skipped (financial summary)`);
       continue;
     }
     
     // Look for holdings table characteristics
     const hasPortfolioCompany = tableLower.includes('portfolio company') || tableLower.includes('borrower/portfolio');
-    const hasInvestmentHeader = tableLower.includes('investment') && tableLower.includes('type');
-    const hasFairValue = tableLower.includes('fair value');
+    const hasInvestmentHeader = tableLower.includes('type of investment') || 
+                                (tableLower.includes('investment') && tableLower.includes('type'));
+    // GBDC might use different terminology - check for both "fair value" and just "fair"
+    const hasFairValue = tableLower.includes('fair value') || 
+                         (tableLower.includes('fair') && tableLower.includes('value')) ||
+                         tableLower.includes('fv') ||
+                         tableLower.includes('market value');
     const hasCompanyNames = /(llc|inc\.|corp\.|l\.p\.)/i.test(tableLower);
+    // Also check for column that looks like dollars/amounts
+    const hasAmounts = /\$\d|[\d,]+\.\d{1,2}/.test(tableLower);
     
+    console.log(`🔧 GBDC Parser: Table ${tableSearchCount}: portfolio=${hasPortfolioCompany}, invType=${hasInvestmentHeader}, fv=${hasFairValue}, companies=${hasCompanyNames}, amounts=${hasAmounts}`);
+    
+    // Relaxed criteria: need investment type + companies + amounts
+    // (fair value header might be in a different format)
+    if (hasInvestmentHeader && hasCompanyNames && hasAmounts && tableHtml.length > 50000) {
+      holdingsTableHtml = tableHtml;
+      console.log(`🔧 GBDC Parser: ✅ Found holdings table at index ${tableSearchCount} (size: ${(tableHtml.length / 1024).toFixed(0)} KB)`);
+      break;
+    }
+    
+    // Original strict criteria
     if ((hasPortfolioCompany || hasInvestmentHeader) && hasFairValue && hasCompanyNames) {
       holdingsTableHtml = tableHtml;
-      console.log(`🔧 GBDC Parser: Found holdings table at search index ${tableSearchCount} (size: ${(tableHtml.length / 1024).toFixed(0)} KB)`);
+      console.log(`🔧 GBDC Parser: ✅ Found holdings table at index ${tableSearchCount} (size: ${(tableHtml.length / 1024).toFixed(0)} KB)`);
       break;
     }
   }
@@ -1762,28 +1803,40 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
     }
     
     // Process data rows
-      for (let i = headerRowIndex + 1; i < rows.length; i++) {
-        const row = rows[i];
-        const cells = Array.from(row.querySelectorAll("td, th")) as Element[];
-        
-        if (cells.length < 3) continue;
-        
-        // Get cell at position helper
-        const getCellAtPos = (pos: number): Element | null => {
-          let currentPos = 0;
-          for (const cell of cells) {
-            const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
-            if (currentPos <= pos && pos < currentPos + colspan) {
-              return cell;
-            }
-            currentPos += colspan;
+    console.log(`🔧 GBDC Parser: Processing ${rows.length - headerRowIndex - 1} data rows (starting after row ${headerRowIndex})`);
+    let skippedRows = 0;
+    
+    for (let i = headerRowIndex + 1; i < rows.length; i++) {
+      const row = rows[i];
+      const cells = Array.from(row.querySelectorAll("td, th")) as Element[];
+      
+      // Debug: log first few rows
+      if (i < headerRowIndex + 5) {
+        const cellTexts = cells.slice(0, 5).map(c => c.textContent?.trim().slice(0, 20) || '');
+        console.log(`🔧 GBDC Parser: Data row ${i}: ${cells.length} cells, first cells: [${cellTexts.join(', ')}]`);
+      }
+      
+      if (cells.length < 3) {
+        skippedRows++;
+        continue;
+      }
+      
+      // Get cell at position helper
+      const getCellAtPos = (pos: number): Element | null => {
+        let currentPos = 0;
+        for (const cell of cells) {
+          const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+          if (currentPos <= pos && pos < currentPos + colspan) {
+            return cell;
           }
-          return null;
-        };
-        
-        // Get company name from Investment column
-        const investmentCell = getCellAtPos(colIndices.investment);
-        const rawCompanyName = investmentCell?.textContent?.trim() || '';
+          currentPos += colspan;
+        }
+        return null;
+      };
+      
+      // Get company name from Investment column
+      const investmentCell = getCellAtPos(colIndices.investment);
+      const rawCompanyName = investmentCell?.textContent?.trim() || '';
         
         // Check if this is an industry header (text in first cell, mostly empty elsewhere)
         const nonEmptyCells = cells.filter(c => {
