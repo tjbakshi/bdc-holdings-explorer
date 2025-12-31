@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { supabase } from '../lib/supabase';
+import { supabase } from '@/integrations/supabase/client';
 import { 
   ArrowLeft, 
   RefreshCw, 
@@ -17,13 +17,13 @@ import * as XLSX from 'xlsx';
 
 interface Filing {
   id: string;
-  period_end_date: string;
+  period_end: string;
   sec_accession_no: string;
-  document_url: string;
-  parsed_successfully: boolean;
+  filing_url: string | null;
+  parsed_successfully: boolean | null;
   value_scale: string | null;
-  current_byte_offset: number;
-  total_file_size: number;
+  current_byte_offset: number | null;
+  total_file_size: number | null;
 }
 
 interface Holding {
@@ -158,7 +158,7 @@ const BdcDetail = () => {
     const worksheet = XLSX.utils.json_to_sheet(filteredHoldings);
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, "Holdings");
-    XLSX.writeFile(workbook, `${ticker}_Holdings_${selectedFiling?.period_end_date}.xlsx`);
+    XLSX.writeFile(workbook, `${ticker}_Holdings_${selectedFiling?.period_end}.xlsx`);
   };
 
   // Calculations for Summary
@@ -218,7 +218,7 @@ const BdcDetail = () => {
                 className={`p-4 border-b border-gray-100 cursor-pointer transition-colors ${selectedFiling?.id === filing.id ? 'bg-blue-50' : 'hover:bg-gray-50'}`}
               >
                 <div className="flex justify-between items-start mb-2">
-                  <span className="font-medium">{filing.period_end_date}</span>
+                  <span className="font-medium">{filing.period_end}</span>
                   {filing.parsed_successfully ? (
                     <span className="bg-green-100 text-green-700 text-xs px-2 py-1 rounded">Parsed</span>
                   ) : (
@@ -226,15 +226,17 @@ const BdcDetail = () => {
                   )}
                 </div>
                 <div className="flex justify-between items-center">
-                  <a 
-                    href={filing.document_url} 
-                    target="_blank" 
-                    rel="noreferrer" 
-                    className="text-xs text-blue-500 hover:underline"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    View SEC Source
-                  </a>
+                  {filing.filing_url && (
+                    <a 
+                      href={filing.filing_url} 
+                      target="_blank" 
+                      rel="noreferrer" 
+                      className="text-xs text-blue-500 hover:underline"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      View SEC Source
+                    </a>
+                  )}
                   <button 
                     onClick={(e) => { e.stopPropagation(); handleResetFiling(filing.id); }}
                     className="p-1 text-gray-400 hover:text-red-500"
