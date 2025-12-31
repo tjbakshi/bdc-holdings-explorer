@@ -1927,13 +1927,18 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       const companyCell = getCellAtPos(colIndices.company);
       const rawCompanyName = companyCell?.textContent?.trim() || '';
       
-      // DEBUG: Log cell structure periodically to understand the format
-      if (tableIdx === 0 && i >= dataStartRow && i <= dataStartRow + 10) {
-        const cellsPreview = cells.slice(0, 5).map(c => {
-          const text = (c.textContent?.trim() || '').slice(0, 25);
+      // DEBUG: Log cell structure for first few rows to understand GBDC format
+      if (tableIdx === 0 && i >= dataStartRow && i <= dataStartRow + 3) {
+        const allCellTexts = cells.map(c => {
+          const text = (c.textContent?.trim() || '').slice(0, 20);
           return text || '[empty]';
         });
-        console.log(`   DEBUG T${tableIdx}R${i}: [${cellsPreview.join(' | ')}]`);
+        console.log(`   DEBUG T${tableIdx}R${i} (${cells.length} cells): [${allCellTexts.slice(0, 8).join(' | ')}]`);
+      }
+      // Also log when we find an industry header
+      if (tableIdx === 0 && i === dataStartRow - 1) {
+        const allCellTexts = cells.map(c => (c.textContent?.trim() || '').slice(0, 25) || '[empty]');
+        console.log(`   DEBUG Header Row: [${allCellTexts.slice(0, 8).join(' | ')}]`);
       }
       // GBDC Industry Detection Strategy:
       // GBDC tables have cell[0] empty, and text content starts in cell[1]
