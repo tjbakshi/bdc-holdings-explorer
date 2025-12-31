@@ -2289,25 +2289,58 @@ async function parseBXSLTableAndInsert(params: {
   }
   console.log(`   ✅ Found SOI at position ${soiStart} (match: "${soiMatch?.[0]}")`);
 
-  // BXSL: Extract and validate the period date from SOI header
-  // Look for date patterns like "September 30, 2025" or "As of September 30, 2025"
+  // BXSL: Extract and normalize the period date from the SOI section.
+  // Search the first 2,000 characters of the SOI section for a month-name date.
   const soiHeaderSection = html.slice(soiStart, Math.min(soiStart + 2000, html.length));
-  const datePattern = /(?:as\s+of\s+)?(\w+\s+\d{1,2},?\s+\d{4})/i;
-  const dateMatch = datePattern.exec(soiHeaderSection);
-  const targetPeriodDateText = dateMatch?.[1]?.trim() || null;
-  
+  const bxslDateRe = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}/i;
+  const dateMatch = bxslDateRe.exec(soiHeaderSection);
+  const targetPeriodDateText = dateMatch?.[0]?.trim() || null;
+
+  const normalizePeriodDateToISO = (input: string): string | null => {
+    // Expect something like: "September 30, 2025"
+    const m = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4})$/i.exec(
+      input.trim()
+    );
+    if (!m) return null;
+
+    const monthName = m[1].toLowerCase();
+    const day = Number(m[2]);
+    const year = Number(m[3]);
+
+    const monthMap: Record<string, number> = {
+      january: 1,
+      february: 2,
+      march: 3,
+      april: 4,
+      may: 5,
+      june: 6,
+      july: 7,
+      august: 8,
+      september: 9,
+      october: 10,
+      november: 11,
+      december: 12,
+    };
+
+    const month = monthMap[monthName];
+    if (!month || !Number.isFinite(day) || !Number.isFinite(year)) return null;
+
+    const mm = String(month).padStart(2, "0");
+    const dd = String(day).padStart(2, "0");
+    return `${year}-${mm}-${dd}`;
+  };
+
   // Convert text date to ISO format for database storage
   let periodDateISO: string | null = null;
   if (targetPeriodDateText) {
-    console.log(`🔧 BXSL: Extraction target confirmed for period: ${targetPeriodDateText}`);
-    // Parse "September 30, 2025" to "2025-09-30"
-    const parsed = new Date(targetPeriodDateText);
-    if (!isNaN(parsed.getTime())) {
-      periodDateISO = parsed.toISOString().split('T')[0];
-      console.log(`   📅 Period date parsed: ${periodDateISO}`);
+    periodDateISO = normalizePeriodDateToISO(targetPeriodDateText);
+    if (periodDateISO) {
+      console.log(`🔧 BXSL: Successfully normalized period date to: ${periodDateISO}`);
+    } else {
+      console.log(`❌ BXSL: Failed to find or format period date.`);
     }
   } else {
-    console.log(`⚠️ BXSL: Could not extract period date from SOI header`);
+    console.log(`❌ BXSL: Failed to find or format period date.`);
   }
 
   // Define prior period dates to skip (comparative tables)
