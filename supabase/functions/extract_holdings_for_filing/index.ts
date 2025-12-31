@@ -1916,6 +1916,315 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
 }
 
 /**
+ * GBDC streaming insert path
+ * Avoids keeping thousands of Holding objects and many DOM tables in memory at once.
+ */
+async function parseGBDCTableAndInsert(params: {
+  html: string;
+  filingId: string;
+  // NOTE: keep this as `any` to avoid type coupling in edge runtime
+  supabaseClient: any;
+  debugMode?: boolean;
+}): Promise<{ insertedCount: number; scaleResult: ScaleDetectionResult }> {
+  const { html, filingId, supabaseClient } = params;
+  const debugMode = params.debugMode ?? false;
+
+  console.log(`\n🟢 GBDC STREAMING PARSER: Starting (input size: ${(html.length / 1024 / 1024).toFixed(2)} MB)`);
+
+  console.log(`🔍 STEP 1: Detecting value scale...`);
+  const scaleResult = detectScale(html);
+  console.log(`   Scale: ${scaleResult.detected} (confidence: ${scaleResult.confidence})`);
+
+  console.log(`🔍 STEP 2: Searching for 'Schedule of Investments' section...`);
+  const soiRe = /(consolidated schedule of investments|schedule of investments)/i;
+  const soiMatch = soiRe.exec(html);
+  const soiStart = soiMatch?.index ?? -1;
+
+  if (soiStart === -1) {
+    console.log(`   ❌ No SOI section found`);
+    return { insertedCount: 0, scaleResult };
+  }
+  console.log(`   ✅ Found SOI at position ${soiStart} (match: "${soiMatch?.[0]}")`);
+
+  console.log(`🔍 STEP 3: Extracting post-SOI section...`);
+  const MAX_SEARCH = 10_000_000; // 10MB to capture full GBDC SOI
+  const afterSoi = html.slice(soiStart, Math.min(soiStart + MAX_SEARCH, html.length));
+  console.log(`   Extracted ${(afterSoi.length / 1024).toFixed(0)} KB after SOI header`);
+
+  console.log(`🔍 STEP 4: Scanning and processing holdings tables (streaming inserts)...`);
+  const tableStartRe = /<table\b[^>]*>/ig;
+  const tableEndRe = /<\/table\s*>/ig;
+
+  const MAX_TABLES = 150;
+  const MAX_HOLDINGS = 2500;
+  const INSERT_BATCH = 250;
+
+  // Always start clean for this filing (avoids duplicates / partial data)
+  const { error: deleteError } = await supabaseClient
+    .from("holdings")
+    .delete()
+    .eq("filing_id", filingId);
+  if (deleteError) {
+    console.error(`   ⚠️ Error clearing existing holdings:`, deleteError);
+  }
+
+  let searchPos = 0;
+  let tableCount = 0;
+  let holdingsTableCount = 0;
+  let insertedCount = 0;
+  let totalProcessedRows = 0;
+  let totalRowsSkipped = 0;
+
+  const seen = new Set<string>();
+  const pending: Holding[] = [];
+  let globalCurrentIndustry: string | null = null;
+
+  let savedColIndices = {
+    company: 0,
+    investmentType: -1,
+    industry: -1,
+    interestRate: -1,
+    spread: -1,
+    maturity: -1,
+    par: -1,
+    cost: -1,
+    fairValue: -1,
+  };
+  let hasFoundFirstTable = false;
+
+  const flush = async () => {
+    if (pending.length === 0) return;
+
+    const rows = pending.splice(0, pending.length).map((h, idx) => ({
+      filing_id: filingId,
+      company_name: h.company_name,
+      investment_type: h.investment_type,
+      industry: h.industry,
+      description: h.description,
+      interest_rate: h.interest_rate,
+      reference_rate: h.reference_rate,
+      maturity_date: h.maturity_date,
+      par_amount: toMillions(h.par_amount, scaleResult.scale),
+      cost: toMillions(h.cost, scaleResult.scale),
+      fair_value: toMillions(h.fair_value, scaleResult.scale),
+      row_number: insertedCount + idx + 1,
+      source_pos: h.source_pos ?? null,
+    }));
+
+    const { error: insertError } = await supabaseClient.from("holdings").insert(rows as any);
+    if (insertError) {
+      console.error(`   ❌ Insert error (batch size ${rows.length}):`, insertError);
+      return;
+    }
+
+    insertedCount += rows.length;
+    if (insertedCount % 500 === 0) {
+      console.log(`   Progress: inserted ${insertedCount} holdings...`);
+    }
+  };
+
+  while (searchPos < afterSoi.length && tableCount < MAX_TABLES && insertedCount < MAX_HOLDINGS) {
+    tableStartRe.lastIndex = searchPos;
+    const startMatch = tableStartRe.exec(afterSoi);
+    if (!startMatch) break;
+    const tableStartIdx = startMatch.index;
+
+    tableEndRe.lastIndex = tableStartIdx;
+    const endMatch = tableEndRe.exec(afterSoi);
+    if (!endMatch) break;
+
+    const tableEndIdx = endMatch.index;
+    const tableEndLen = endMatch[0].length;
+
+    tableCount++;
+    const tableHtml = afterSoi.slice(tableStartIdx, tableEndIdx + tableEndLen);
+    const tableLower = tableHtml.toLowerCase();
+    const tableSizeKB = tableHtml.length / 1024;
+    searchPos = tableEndIdx + tableEndLen;
+
+    if (tableCount <= 5 || tableCount % 20 === 0) {
+      console.log(`   Table ${tableCount}: ${tableSizeKB.toFixed(0)} KB`);
+    }
+
+    if (tableHtml.length < 15_000) continue;
+
+    if (
+      tableLower.includes("total liabilities") ||
+      tableLower.includes("total assets") ||
+      tableLower.includes("stockholders") ||
+      tableLower.includes("shareholders") ||
+      tableLower.includes("statements of operations") ||
+      tableLower.includes("statements of changes") ||
+      (tableLower.includes("liabilities") && tableLower.includes("assets") && !tableLower.includes("portfolio"))
+    ) {
+      continue;
+    }
+
+    const companyMatches = tableLower.match(/(?:llc|inc\.|corp\.|l\.p\.|, lp|ltd\.)/gi) || [];
+    const companyCount = companyMatches.length;
+    const hasCompanies = companyCount >= 5;
+    const hasFairValue = tableLower.includes("fair value") || tableLower.includes("fair");
+    const hasCost = tableLower.includes("cost") || tableLower.includes("amortized");
+
+    if (!hasCompanies || (!hasFairValue && !hasCost)) continue;
+
+    holdingsTableCount++;
+    console.log(`   ✅ HOLDINGS TABLE ${holdingsTableCount} at index ${tableCount} (${tableSizeKB.toFixed(0)} KB, ${companyCount} companies)`);
+
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(`<html><body>${tableHtml}</body></html>`, "text/html");
+    } catch {
+      continue;
+    }
+    if (!doc) continue;
+
+    const table = doc.querySelector("table") as Element;
+    if (!table) continue;
+
+    const rows = Array.from(table.querySelectorAll("tr")) as Element[];
+
+    let colIndices = { ...savedColIndices };
+    if (!hasFoundFirstTable) {
+      for (let i = 0; i < Math.min(5, rows.length); i++) {
+        const cells = Array.from(rows[i].querySelectorAll("th, td")) as Element[];
+        let position = 0;
+        for (const cell of cells) {
+          const text = (cell.textContent?.toLowerCase() || "").replace(/\s+/g, " ").trim();
+          const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+          if ((text.includes("portfolio company") || text.includes("borrower") || text.includes("investment")) && !text.includes("type") && colIndices.company === 0) colIndices.company = position;
+          else if ((text.includes("investment type") || text.includes("type of investment")) && colIndices.investmentType === -1) colIndices.investmentType = position;
+          else if ((text.includes("interest rate") || text.includes("coupon")) && colIndices.interestRate === -1) colIndices.interestRate = position;
+          else if (text.includes("maturity") && colIndices.maturity === -1) colIndices.maturity = position;
+          else if ((text.includes("principal") || text.includes("par")) && colIndices.par === -1) colIndices.par = position;
+          else if ((text.includes("cost") || text.includes("amortized")) && colIndices.cost === -1) colIndices.cost = position;
+          else if ((text.includes("fair value") || (text.includes("fair") && !text.includes("unfair"))) && colIndices.fairValue === -1) colIndices.fairValue = position;
+          position += colspan;
+        }
+      }
+      if (colIndices.fairValue === -1 && colIndices.cost >= 0) colIndices.fairValue = colIndices.cost + 1;
+      savedColIndices = { ...colIndices };
+      hasFoundFirstTable = true;
+    }
+    colIndices.industry = -1;
+
+    let dataStartRow = -1;
+    for (let i = 0; i < rows.length; i++) {
+      const rowText = rows[i].textContent || "";
+      if (/(LLC|Inc\.|Corp\.|Co\.|L\.P\.|LP|Ltd\.)/i.test(rowText)) {
+        dataStartRow = i;
+        break;
+      }
+    }
+    if (dataStartRow === -1) continue;
+
+    let currentIndustry: string | null = globalCurrentIndustry;
+    let currentCompany: string | null = null;
+
+    for (let i = dataStartRow; i < rows.length && insertedCount + pending.length < MAX_HOLDINGS; i++) {
+      const row = rows[i];
+      const cells = Array.from(row.querySelectorAll("td, th")) as Element[];
+
+      const rowText = row.textContent?.trim() || "";
+      if (!rowText || /^[-—\s]*$/.test(rowText)) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      const getCellAtPos = (pos: number): Element | null => {
+        if (pos < 0) return null;
+        let currentPos = 0;
+        for (const cell of cells) {
+          const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+          if (currentPos <= pos && pos < currentPos + colspan) return cell;
+          currentPos += colspan;
+        }
+        return cells[Math.min(pos, cells.length - 1)] || null;
+      };
+
+      const companyCell = getCellAtPos(colIndices.company);
+      const rawCompanyName = companyCell?.textContent?.trim() || "";
+      if (/^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(rawCompanyName)) continue;
+
+      const cleanedName = cleanCompanyName(rawCompanyName);
+      let effectiveCompany = cleanedName;
+      if (cleanedName && hasCompanySuffix(cleanedName)) currentCompany = cleanedName;
+      else if (currentCompany && (!cleanedName || cleanedName.length < 5)) effectiveCompany = currentCompany;
+      else if (!cleanedName || cleanedName.length < 3) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      const fairValueCell = colIndices.fairValue >= 0 ? getCellAtPos(colIndices.fairValue) : null;
+      const fairValue = cleanGBDCNumeric(fairValueCell?.textContent);
+      const costCell = colIndices.cost >= 0 ? getCellAtPos(colIndices.cost) : null;
+      const cost = cleanGBDCNumeric(costCell?.textContent);
+
+      if (fairValue === null && cost === null) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      let investmentType: string | null = null;
+      if (colIndices.investmentType >= 0) {
+        const typeCell = getCellAtPos(colIndices.investmentType);
+        const typeText = typeCell?.textContent?.trim();
+        if (typeText && typeText.length > 2 && typeText.length < 150) investmentType = typeText;
+      }
+
+      const key = `${effectiveCompany}|${investmentType || ""}|${fairValue || ""}|${cost || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const parCell = colIndices.par >= 0 ? getCellAtPos(colIndices.par) : null;
+      const parAmount = cleanGBDCNumeric(parCell?.textContent);
+
+      const maturityCell = colIndices.maturity >= 0 ? getCellAtPos(colIndices.maturity) : null;
+      const maturityDate = parseDate(maturityCell?.textContent?.trim());
+
+      pending.push({
+        company_name: effectiveCompany,
+        investment_type: investmentType,
+        industry: currentIndustry,
+        description: null,
+        interest_rate: null,
+        reference_rate: null,
+        maturity_date: maturityDate,
+        par_amount: parAmount,
+        cost,
+        fair_value: fairValue,
+        source_pos: soiStart + tableStartIdx + i,
+      });
+      totalProcessedRows++;
+
+      if (pending.length >= INSERT_BATCH) {
+        await flush();
+      }
+    }
+
+    globalCurrentIndustry = currentIndustry;
+
+    if (debugMode && holdingsTableCount >= 2) {
+      console.log(`   (debug) stopping early after 2 holdings tables`);
+      break;
+    }
+  }
+
+  await flush();
+
+  console.log(`\n🟢 GBDC STREAMING: Completed - inserted ${insertedCount} holdings from ${holdingsTableCount} tables (${totalProcessedRows} processed, ${totalRowsSkipped} skipped)`);
+
+  if (insertedCount > 100) {
+    await supabaseClient
+      .from("filings")
+      .update({ parsed_successfully: true, value_scale: scaleResult.detected } as any)
+      .eq("id", filingId);
+  }
+
+  return { insertedCount, scaleResult };
+}
+
+/**
  * Generic parser for unknown BDCs - uses conservative settings
  * Falls back to the standard ARCC logic but with more lenient column matching
  */
@@ -2106,31 +2415,39 @@ serve(async (req) => {
           let textToParse = html;
           if (html.length > 5_000_000) {
             console.log(`   📦 Large document (${(html.length / 1024 / 1024).toFixed(1)} MB)`);
-            
-            // For GBDC, use the specialist parser which handles large files differently
+
+            // For GBDC, stream inserts to avoid WORKER_LIMIT (memory)
             if (parserType === 'GBDC') {
-              console.log(`   🔀 GBDC detected - using specialist parser for large file`);
-              
-              // GBDC specialist parser has its own pre-processing and chunking
-              const gbdcResult = parseGBDCTable(html, debugMode);
-              holdings = gbdcResult.holdings;
-              scaleResult = gbdcResult.scaleResult;
-              
-              console.log(`   Result: ${holdings.length} holdings found (method: gbdc-specialist)`);
-              
-              if (holdings.length > 0) {
-                console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name} using gbdc-specialist`);
-                break;
-              } else {
-                // If GBDC parser didn't find holdings, continue to next document
-                console.log(`   ⚠️ GBDC specialist parser found no holdings, trying next document...`);
-                continue;
+              console.log(`   🔀 GBDC detected - using STREAMING insert parser for large file`);
+
+              const { insertedCount, scaleResult: gbdcScale } = await parseGBDCTableAndInsert({
+                html,
+                filingId,
+                supabaseClient,
+                debugMode,
+              });
+
+              if (insertedCount > 0) {
+                // Return immediately; data is already in DB
+                return new Response(
+                  JSON.stringify({
+                    filingId,
+                    holdingsInserted: insertedCount,
+                    valueScale: gbdcScale.detected,
+                    scaleConfidence: gbdcScale.confidence,
+                    method: 'gbdc-streaming',
+                  }),
+                  { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+                );
               }
+
+              console.log(`   ⚠️ GBDC streaming parser found no holdings, trying next document...`);
+              continue;
             }
-            
+
             // For ARCC and other BDCs, use the existing segmented-DOM approach
             console.log(`   🔀 Using ARCC-style segmented parsing for large file`);
-            
+
             // Find the boundaries of the Schedule of Investments section
             const lower = html.toLowerCase();
             
