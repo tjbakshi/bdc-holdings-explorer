@@ -1652,65 +1652,65 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
     return { holdings: [], scaleResult };
   }
   
-  // Step 4: Extract a larger section after SOI header to find the actual holdings table
-  // GBDC has multiple tables after the SOI header - we need to find the one with company holdings
+  // Step 4: Find the holdings table using regex first (to avoid DOM parsing large sections)
+  // GBDC has multiple tables - we need to find the one with company holdings
   const afterSoi = processedHtml.slice(soiStart);
   
-  // Extract up to 4MB after the SOI header to find the right table
-  const maxSearchSize = 4_000_000;
-  const searchSection = afterSoi.slice(0, maxSearchSize);
+  // Use regex to find table boundaries without parsing the entire document
+  // Look for tables that contain "portfolio company" or "borrower" near the header
+  const tablePattern = /<table[^>]*>([\s\S]*?)<\/table>/gi;
+  let match;
+  let holdingsTableHtml: string | null = null;
+  let tableSearchCount = 0;
+  const maxTablesToSearch = 30;
   
-  console.log(`🔧 GBDC Parser: Searching for holdings table in ${(searchSection.length / 1024).toFixed(0)} KB section`);
+  console.log(`🔧 GBDC Parser: Searching for holdings table using regex...`);
   
-  // Step 5: Parse the section and look for tables with holdings headers
+  while ((match = tablePattern.exec(afterSoi)) !== null && tableSearchCount < maxTablesToSearch) {
+    tableSearchCount++;
+    const tableHtml = match[0];
+    const tableLower = tableHtml.toLowerCase();
+    
+    // Skip small tables (likely navigation or formatting)
+    if (tableHtml.length < 5000) continue;
+    
+    // Skip tables that look like financial summaries
+    if (tableLower.includes('variance') || tableLower.includes('vs. 2024') || 
+        tableLower.includes('year ended') && !tableLower.includes('portfolio')) {
+      continue;
+    }
+    
+    // Look for holdings table characteristics
+    const hasPortfolioCompany = tableLower.includes('portfolio company') || tableLower.includes('borrower/portfolio');
+    const hasInvestmentHeader = tableLower.includes('investment') && tableLower.includes('type');
+    const hasFairValue = tableLower.includes('fair value');
+    const hasCompanyNames = /(llc|inc\.|corp\.|l\.p\.)/i.test(tableLower);
+    
+    if ((hasPortfolioCompany || hasInvestmentHeader) && hasFairValue && hasCompanyNames) {
+      holdingsTableHtml = tableHtml;
+      console.log(`🔧 GBDC Parser: Found holdings table at search index ${tableSearchCount} (size: ${(tableHtml.length / 1024).toFixed(0)} KB)`);
+      break;
+    }
+  }
+  
+  if (!holdingsTableHtml) {
+    console.log(`🔧 GBDC Parser: No holdings table found after searching ${tableSearchCount} tables`);
+    return { holdings: [], scaleResult };
+  }
+  
+  // Step 5: Parse ONLY the holdings table (much smaller than 4MB)
+  console.log(`🔧 GBDC Parser: Parsing holdings table (${(holdingsTableHtml.length / 1024).toFixed(0)} KB)`);
+  
   try {
-    const doc = new DOMParser().parseFromString(`<html><body>${searchSection}</body></html>`, "text/html");
+    const doc = new DOMParser().parseFromString(`<html><body>${holdingsTableHtml}</body></html>`, "text/html");
     if (!doc) {
-      console.log(`🔧 GBDC Parser: Failed to parse section HTML`);
+      console.log(`🔧 GBDC Parser: Failed to parse holdings table HTML`);
       return { holdings: [], scaleResult };
     }
     
-    const tables = Array.from(doc.querySelectorAll("table")) as Element[];
-    if (tables.length === 0) {
-      console.log(`🔧 GBDC Parser: No tables found in section`);
-      return { holdings: [], scaleResult };
-    }
-    
-    console.log(`🔧 GBDC Parser: Found ${tables.length} tables to search for holdings`);
-    
-    // Find the table that looks like a holdings table (has Portfolio Company/Investment and Fair Value)
-    let holdingsTable: Element | null = null;
-    let holdingsTableIndex = -1;
-    
-    for (let ti = 0; ti < Math.min(tables.length, 20); ti++) {
-      const table = tables[ti];
-      const tableText = table.textContent?.toLowerCase() || '';
-      
-      // Skip tables that look like financial summaries or comparisons
-      if (tableText.includes('variance') || tableText.includes('vs. 2024') || 
-          tableText.includes('year ended') || tableText.includes('net assets')) {
-        continue;
-      }
-      
-      // Holdings tables typically have these columns
-      const hasPortfolioCompany = tableText.includes('portfolio company') || tableText.includes('borrower/portfolio');
-      const hasInvestmentColumn = tableText.includes('investment') && tableText.includes('type');
-      const hasFairValue = tableText.includes('fair value');
-      const hasPrincipal = tableText.includes('principal') || tableText.includes('par');
-      
-      // More specific check: look for actual company names (LLC, Inc, etc.)
-      const hasCompanyNames = /(llc|inc\.|corp\.|l\.p\.)/i.test(tableText);
-      
-      if ((hasPortfolioCompany || hasInvestmentColumn) && hasFairValue && hasCompanyNames) {
-        holdingsTable = table;
-        holdingsTableIndex = ti;
-        console.log(`🔧 GBDC Parser: Found holdings table at index ${ti} (hasPortfolio=${hasPortfolioCompany}, hasFV=${hasFairValue})`);
-        break;
-      }
-    }
-    
+    const holdingsTable = doc.querySelector("table") as Element;
     if (!holdingsTable) {
-      console.log(`🔧 GBDC Parser: No holdings table found in first 20 tables`);
+      console.log(`🔧 GBDC Parser: No table element found in parsed HTML`);
       return { holdings: [], scaleResult };
     }
     
