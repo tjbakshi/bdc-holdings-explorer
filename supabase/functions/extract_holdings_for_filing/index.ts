@@ -1927,57 +1927,80 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       const companyCell = getCellAtPos(colIndices.company);
       const rawCompanyName = companyCell?.textContent?.trim() || '';
       
-      // GBDC Industry Detection: Industry header rows have these characteristics:
-      // 1. First non-empty cell contains industry name (text, not numeric, not company suffix)
-      // 2. Row has relatively few non-empty cells (typically 1-4)
-      // 3. No company suffix pattern in the first cell
+      // GBDC Industry Detection Strategy:
+      // 1. Check the FIRST physical cell (column 0) - this is where GBDC puts industry names
+      // 2. Industry names match GICS industry classification
+      // 3. Industry header rows have the industry name ONLY in column 0, other cells are empty or contain just the industry name
       
+      const firstPhysicalCellText = cells[0]?.textContent?.trim() || '';
+      
+      // GICS Industry names that appear in GBDC SOIs (comprehensive list)
+      const gicsIndustries = new Set([
+        'aerospace & defense', 'air freight & logistics', 'airlines', 'auto components',
+        'automobiles', 'banks', 'beverages', 'biotechnology', 'building products',
+        'capital markets', 'chemicals', 'commercial services & supplies', 
+        'communications equipment', 'construction & engineering', 'construction materials',
+        'consumer finance', 'containers & packaging', 'distributors',
+        'diversified consumer services', 'diversified financial services', 
+        'diversified telecommunication services', 'electric utilities', 'electrical equipment',
+        'electronic equipment, instruments & components', 'energy equipment & services',
+        'entertainment', 'food & staples retailing', 'food products', 
+        'gas utilities', 'health care equipment & supplies', 'healthcare equipment & supplies',
+        'health care providers & services', 'healthcare providers & services',
+        'health care technology', 'healthcare technology', 'hotels, restaurants & leisure',
+        'household durables', 'household products', 'independent power and renewable electricity producers',
+        'industrial conglomerates', 'insurance', 'interactive media & services',
+        'internet & direct marketing retail', 'it services', 'leisure products',
+        'life sciences tools & services', 'machinery', 'marine', 'media', 'metals & mining',
+        'multiline retail', 'multi-utilities', 'oil, gas & consumable fuels',
+        'paper & forest products', 'personal products', 'pharmaceuticals',
+        'professional services', 'real estate management & development', 'road & rail',
+        'semiconductors & semiconductor equipment', 'software', 'specialty retail',
+        'technology hardware, storage & peripherals', 'textiles, apparel & luxury goods',
+        'thrifts & mortgage finance', 'tobacco', 'trading companies & distributors',
+        'transportation infrastructure', 'water utilities', 'wireless telecommunication services'
+      ]);
+      
+      // Check if first cell matches a GICS industry (exact or close match)
+      const firstCellLower = firstPhysicalCellText.toLowerCase().trim();
+      const isExactGicsIndustry = gicsIndustries.has(firstCellLower);
+      
+      // Also check for partial matches (e.g., "Software" should match even without "&")
+      const isPartialGicsMatch = firstCellLower.length > 3 && 
+        Array.from(gicsIndustries).some(ind => 
+          ind.includes(firstCellLower) || firstCellLower.includes(ind.split(' ')[0])
+        );
+      
+      if ((isExactGicsIndustry || isPartialGicsMatch) && firstPhysicalCellText.length < 80) {
+        // Verify this isn't a company name that happens to contain industry keywords
+        const hasCompanyPattern = /(LLC|Inc\.|Corp|Ltd|Limited|L\.P\.|Holdings|Partners|Buyer|Bidco|\+|\*|\(\d)/i.test(firstPhysicalCellText);
+        
+        if (!hasCompanyPattern) {
+          console.log(`   📌 Industry: "${firstPhysicalCellText}" (GICS match)`);
+          currentIndustry = firstPhysicalCellText;
+          globalCurrentIndustry = firstPhysicalCellText;
+          continue;
+        }
+      }
+      
+      // Legacy detection for non-GICS formatted industries
       const nonEmptyCells = cells.filter(c => {
         const t = c.textContent?.trim() || '';
         return t.length > 1 && !/^[-—$\s]*$/.test(t);
       });
       
-      // Get first non-empty cell content
-      const firstNonEmptyCell = nonEmptyCells[0];
-      const firstCellText = firstNonEmptyCell?.textContent?.trim() || '';
-      
-      // Detect industry header row
-      // GBDC industry headers can have varying numbers of cells (some tables have more columns)
-      // Key indicator: first cell has industry text without company patterns
-      if (firstCellText.length > 2 && firstCellText.length < 80) {
-        // Comprehensive company suffix detection - includes common BDC portfolio company patterns
-        const hasCompanySuffix = /(LLC|Inc\.?|Corp\.?|Corporation|L\.P\.?|LP|Ltd\.?|Limited|S\.A\.?|SAS|GmbH|Bidco|Holdco|Midco|Topco|Buyer|Acquisition|Holdings|Partners|Group|Groupe|Systems|Networks|Technologies)\b/i.test(firstCellText);
+      if (nonEmptyCells.length <= 2 && firstPhysicalCellText.length > 3 && firstPhysicalCellText.length < 80) {
+        const hasCompanySuffix = /(LLC|Inc\.?|Corp\.?|Corporation|L\.P\.?|LP|Ltd\.?|Limited|S\.A\.?|SAS|GmbH|Bidco|Holdco|Midco|Topco|Buyer|Acquisition|Holdings|Partners|Group|Groupe|Systems|Networks|Technologies|\+|\*)\b/i.test(firstPhysicalCellText);
+        const hasFootnotes = /\(\d+\)/.test(firstPhysicalCellText);
+        const isTotal = /^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(firstPhysicalCellText);
+        const isHeader = /^(Portfolio|Borrower|Investment|Company|Fair Value|Cost|Par|Principal|Maturity)/i.test(firstPhysicalCellText);
+        const isNumeric = /^[\$\(\)\-\d,.\s%]+$/.test(firstPhysicalCellText);
+        const startsWithDigit = /^\d/.test(firstPhysicalCellText);
         
-        // GBDC uses + for continuation/footnote markers - these are companies, not industries
-        const hasContinuationMarker = /[+*]/.test(firstCellText);
-        
-        // Has footnote references like (1), (8)(9)(10)
-        const hasFootnotes = /\(\d+\)/.test(firstCellText);
-        
-        const isTotal = /^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(firstCellText);
-        const isHeader = /^(Portfolio|Borrower|Investment|Company|Fair Value|Cost|Par|Principal|Maturity)/i.test(firstCellText);
-        const isNumeric = /^[\$\(\)\-\d,.\s%]+$/.test(firstCellText);
-        const startsWithDigit = /^\d/.test(firstCellText);
-        
-        // Additional check: known industries list
-        const knownIndustries = [
-          'software', 'healthcare', 'technology', 'financial', 'consumer', 
-          'industrial', 'insurance', 'retail', 'services', 'pharmaceuticals',
-          'media', 'energy', 'utilities', 'chemicals', 'automobiles', 'aerospace',
-          'biotechnology', 'leisure', 'hotels', 'restaurants', 'machinery'
-        ];
-        const looksLikeKnownIndustry = knownIndustries.some(ind => 
-          firstCellText.toLowerCase().includes(ind)
-        );
-        
-        // Only treat as industry if it has few cells and doesn't look like a company
-        if ((nonEmptyCells.length <= 4 || looksLikeKnownIndustry) && 
-            !hasCompanySuffix && !hasContinuationMarker && !hasFootnotes && 
-            !isTotal && !isHeader && !isNumeric && !startsWithDigit) {
-          // This looks like an industry header row
-          console.log(`   📌 Industry: "${firstCellText}" (cells: ${nonEmptyCells.length})`);
-          currentIndustry = firstCellText;
-          globalCurrentIndustry = firstCellText;
+        if (!hasCompanySuffix && !hasFootnotes && !isTotal && !isHeader && !isNumeric && !startsWithDigit) {
+          console.log(`   📌 Industry: "${firstPhysicalCellText}" (legacy detection, cells: ${nonEmptyCells.length})`);
+          currentIndustry = firstPhysicalCellText;
+          globalCurrentIndustry = firstPhysicalCellText;
           continue;
         }
       }
