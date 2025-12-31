@@ -1927,6 +1927,14 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       const companyCell = getCellAtPos(colIndices.company);
       const rawCompanyName = companyCell?.textContent?.trim() || '';
       
+      // DEBUG: Log cell structure periodically to understand the format
+      if (tableIdx === 0 && i >= dataStartRow && i <= dataStartRow + 10) {
+        const cellsPreview = cells.slice(0, 5).map(c => {
+          const text = (c.textContent?.trim() || '').slice(0, 25);
+          return text || '[empty]';
+        });
+        console.log(`   DEBUG T${tableIdx}R${i}: [${cellsPreview.join(' | ')}]`);
+      }
       // GBDC Industry Detection Strategy:
       // 1. Check the FIRST physical cell (column 0) - this is where GBDC puts industry names
       // 2. Industry names match GICS industry classification
