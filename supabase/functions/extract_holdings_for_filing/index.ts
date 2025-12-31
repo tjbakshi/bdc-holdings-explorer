@@ -2328,6 +2328,7 @@ async function parseBXSLTableAndInsert(params: {
     industry: -1,
     interestRate: -1,
     spread: -1,
+    spreadSpan: 1, // BXSL "Reference Rate and Spread" often spans 2 columns (e.g., "SOFR +" and "5.98%")
     maturity: -1,
     par: -1,
     cost: -1,
@@ -2453,9 +2454,10 @@ async function parseBXSLTableAndInsert(params: {
           else if ((text.includes("interest rate") || text.includes("coupon")) && !text.includes("spread") && !text.includes("reference") && colIndices.interestRate === -1) {
             colIndices.interestRate = position;
           }
-          // BXSL: "Reference Rate and Spread" column - captures the full spread info
+          // BXSL: "Reference Rate and Spread" header may span multiple columns
           else if ((text.includes("reference rate") || text.includes("spread")) && colIndices.spread === -1) {
             colIndices.spread = position;
+            colIndices.spreadSpan = Math.max(1, colspan);
           }
           else if (text.includes("maturity") && colIndices.maturity === -1) {
             colIndices.maturity = position;
@@ -2475,7 +2477,7 @@ async function parseBXSLTableAndInsert(params: {
       if (colIndices.fairValue === -1 && colIndices.cost >= 0) colIndices.fairValue = colIndices.cost + 1;
       savedColIndices = { ...colIndices };
       hasFoundFirstTable = true;
-      console.log(`   📋 BXSL Column indices: company=${colIndices.company}, industry=${colIndices.industry}, investmentType=${colIndices.investmentType}, interestRate=${colIndices.interestRate}, spread=${colIndices.spread}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
+      console.log(`   📋 BXSL Column indices: company=${colIndices.company}, industry=${colIndices.industry}, investmentType=${colIndices.investmentType}, interestRate=${colIndices.interestRate}, spread=${colIndices.spread} (span=${colIndices.spreadSpan}), cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
     }
 
     // Find data start row using company suffixes
@@ -2560,35 +2562,43 @@ async function parseBXSLTableAndInsert(params: {
         if (rateText && rateText.length > 0 && rateText.length < 50) interestRate = rateText;
       }
 
-      // Extract spread (reference_rate) - BXSL has "Reference Rate and Spread" column
-      // The cell may have "SOFR +" and "5.98%" in separate spans, so concatenate all text
+      // Extract spread (reference_rate) - BXSL has "Reference Rate and Spread" header that may span 2 columns
+      // The HTML often splits "SOFR +" and "5.98%" into separate <td> cells; capture & join them.
       let referenceRate: string | null = null;
       if (colIndices.spread >= 0) {
-        const spreadCell = getCellAtPos(colIndices.spread);
-        if (spreadCell) {
-          // Concatenate all text from child elements to capture full "SOFR + 5.98%"
+        const pieces: string[] = [];
+
+        const collectTextDeep = (root: Element) => {
           const allText: string[] = [];
           const walker = (node: any) => {
-            if (node.nodeType === 3) { // Text node
-              const text = node.textContent?.trim();
-              if (text) allText.push(text);
-            } else if (node.childNodes) {
-              for (const child of Array.from(node.childNodes) as any[]) {
-                walker(child);
-              }
+            if (node?.nodeType === 3) {
+              const t = node.textContent?.trim();
+              if (t) allText.push(t);
+              return;
             }
+            if (!node?.childNodes) return;
+            for (const child of Array.from(node.childNodes) as any[]) walker(child);
           };
-          walker(spreadCell);
-          
-          // Join with spaces and clean up
-          let spreadText = allText.join(' ')
-            .replace(/\s+/g, ' ')
-            .replace(/\(\d+\)/g, '') // Remove footnote numbers like (2)
-            .trim();
-          
-          if (spreadText && spreadText.length > 0 && spreadText.length < 80 && !/^[-—\s]*$/.test(spreadText)) {
-            referenceRate = spreadText;
-          }
+          walker(root);
+          return allText;
+        };
+
+        const span = Math.max(1, (colIndices as any).spreadSpan ?? 1);
+        for (let offset = 0; offset < span; offset++) {
+          const cell = getCellAtPos(colIndices.spread + offset);
+          if (!cell) continue;
+          pieces.push(...collectTextDeep(cell));
+        }
+
+        let spreadText = pieces
+          .join(" ")
+          .replace(/\s*\+\s*/g, " + ") // normalize spacing around plus
+          .replace(/\s+/g, " ")
+          .replace(/\(\d+\)/g, "") // remove footnote markers like (2)
+          .trim();
+
+        if (spreadText && spreadText.length > 0 && spreadText.length < 80 && !/^[-—\s]*$/.test(spreadText)) {
+          referenceRate = spreadText;
         }
       }
 
