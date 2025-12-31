@@ -442,7 +442,7 @@ function findHeaderRow(table: Element, debugMode = false): Element | null {
           const nextRowCells = Array.from(nextRow.querySelectorAll("th, td"));
           const nextHeaders = nextRowCells.map(h => (h as Element).textContent?.trim() || "");
           // If next row has header cells and looks like sub-headers, note it
-          if (nextRowCells.length > 0 && nextRowCells[0].tagName === 'TH') {
+          if (nextRowCells.length > 0 && (nextRowCells[0] as Element).tagName === 'TH') {
             console.log("  Found sub-header row:", nextHeaders);
           }
         }
@@ -3424,7 +3424,7 @@ async function parseOBDCTableAndInsert(params: {
       let pikText: string | null = null;
       if (colIndices.pikRate >= 0) {
         const pikCell = getCellAtPos(colIndices.pikRate);
-        pikText = pikCell?.textContent?.trim();
+        pikText = pikCell?.textContent?.trim() ?? null;
         if (pikText && pikText.length > 0 && !/^[-—\s]*$/.test(pikText) && pikText !== 'N/A') {
           refRateParts.push(`PIK: ${pikText}`);
         }
@@ -3644,11 +3644,21 @@ serve(async (req) => {
       );
       
       // Prioritize documents that might contain schedules
+      // IMPORTANT: First priority should be docs matching the ticker name (e.g., obdc-20250930.htm for OBDC)
+      const tickerLower = ticker?.toLowerCase() || '';
+      
       const prioritizedDocs = [...htmDocs].sort((a: any, b: any) => {
         const aName = a.name.toLowerCase();
         const bName = b.name.toLowerCase();
         
-        // Highest priority: documents with "schedule", "soi", "portfolio" in name
+        // HIGHEST priority: documents starting with the ticker (e.g., obdc-20250930.htm for OBDC)
+        // This is the main filing document and should be tried first
+        const aMatchesTicker = tickerLower && aName.startsWith(tickerLower);
+        const bMatchesTicker = tickerLower && bName.startsWith(tickerLower);
+        if (aMatchesTicker && !bMatchesTicker) return -1;
+        if (!aMatchesTicker && bMatchesTicker) return 1;
+        
+        // Next priority: documents with "schedule", "soi", "portfolio" in name
         const aIsSchedule = aName.includes("schedule") || aName.includes("soi") || aName.includes("portfolio");
         const bIsSchedule = bName.includes("schedule") || bName.includes("soi") || bName.includes("portfolio");
         if (aIsSchedule && !bIsSchedule) return -1;
@@ -3658,11 +3668,23 @@ serve(async (req) => {
         if (a.type === "primary" && b.type !== "primary") return -1;
         if (a.type !== "primary" && b.type === "primary") return 1;
         
+        // Deprioritize subsidiary documents (often contain LLC, Holdings, etc. in name)
+        const aIsSubsidiary = aName.includes("llc") || aName.includes("holdings") || aName.includes("credit");
+        const bIsSubsidiary = bName.includes("llc") || bName.includes("holdings") || bName.includes("credit");
+        if (!aIsSubsidiary && bIsSubsidiary) return -1;
+        if (aIsSubsidiary && !bIsSubsidiary) return 1;
+        
         // Deprioritize documents with underscores (usually graphics/exhibits)
         const aHasUnderscore = aName.includes("_");
         const bHasUnderscore = bName.includes("_");
         if (!aHasUnderscore && bHasUnderscore) return -1;
         if (aHasUnderscore && !bHasUnderscore) return 1;
+        
+        // Prefer larger documents (more likely to contain full SOI)
+        const aSize = parseInt(a.size) || 0;
+        const bSize = parseInt(b.size) || 0;
+        if (aSize > bSize) return -1;
+        if (aSize < bSize) return 1;
         
         return 0;
       });
