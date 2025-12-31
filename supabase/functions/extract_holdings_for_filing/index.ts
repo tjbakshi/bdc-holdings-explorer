@@ -597,9 +597,24 @@ const SKIP_PATTERNS = [
 
 // Company suffixes that strongly indicate a real holding
 const COMPANY_SUFFIXES = [
+  // US/UK
   "inc.", "inc", "llc", "l.l.c.", "lp", "l.p.", "corp.", "corp",
-  "corporation", "company", "co.", "ltd.", "ltd", "limited",
+  "corporation", "company", "co.", "ltd.", "ltd", "limited", "plc", "p.l.c.",
+  // Luxembourg
   "s.a.r.l.", "s.a.r.l", "sarl", "s.à r.l.", "s.à r.l",
+  // Netherlands
+  "b.v.", "b.v", "bv", "n.v.", "n.v", "nv",
+  // Germany/Switzerland/Austria
+  "gmbh", "g.m.b.h.", "ag", "a.g.",
+  // France/Spain/Belgium
+  "s.a.", "s.a", "sa",
+  // Italy
+  "s.p.a.", "s.p.a", "spa", "s.r.l.", "s.r.l", "srl",
+  // Scandinavia
+  "a/s", "as", "ab", "oy", "aps", "a.s.",
+  // Asia/Pacific
+  "pte ltd", "pte. ltd.", "pte. ltd", "pty ltd", "pty. ltd.", "pty. ltd",
+  "k.k.", "kk", "bhd", "bhd.", "sdn bhd", "sdn. bhd.",
 ];
 
 // Check if text is an industry section header
