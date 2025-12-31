@@ -1,7 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-// 🟢 LIGHTWEIGHT DOM PARSER (Fixes Error 546)
-import { parseHTML } from "https://esm.sh/linkedom";
+
+// 🚨 MEMORY SAFE: No heavy DOM libraries. We use a custom "DOM-like" helper.
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -11,25 +11,68 @@ const corsHeaders = {
 const SEC_USER_AGENT = "BDCTrackerApp/1.0 (contact@bdctracker.com)";
 
 // ======================================================================
-// HELPERS
+// 1. LIGHTWEIGHT "DOM-LIKE" PARSER
 // ======================================================================
+// These functions mimic DOM behavior (traversing rows/cells) using strict Regex.
+// They consume almost 0 memory compared to a real DOM Parser.
 
-function detectScale(html: string): number {
-  const headerText = html.slice(0, 50000).toLowerCase();
-  if (/\(in millions\)/.test(headerText) || /amounts?\s+in\s+millions/.test(headerText)) {
-    return 1;
-  }
-  return 0.001;
+function stripTags(html: string): string {
+  if (!html) return "";
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\s+/g, " ")
+    .trim();
 }
+
+/**
+ * Extracts rows <tr> from a table string.
+ */
+function getRows(tableHtml: string): string[] {
+  const rows: string[] = [];
+  const rowRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+  let match;
+  while ((match = rowRe.exec(tableHtml)) !== null) {
+    rows.push(match[1]);
+  }
+  return rows;
+}
+
+/**
+ * Extracts cells <td>/<th> from a row string.
+ * CRITICAL: Handles 'colspan' to ensure data stays in the correct column index.
+ */
+function getCells(rowHtml: string): string[] {
+  const cells: string[] = [];
+  const cellRe = /<t[dh]\b([^>]*)>([\s\S]*?)<\/t[dh]>/gi;
+  let match;
+  while ((match = cellRe.exec(rowHtml)) !== null) {
+    const attrs = match[1];
+    const content = stripTags(match[2]);
+    const colspanMatch = attrs.match(/colspan=["']?(\d+)["']?/i);
+    const span = colspanMatch ? parseInt(colspanMatch[1]) : 1;
+    
+    cells.push(content);
+    // Insert placeholders for merged cells so columns stay aligned
+    for (let i = 1; i < span; i++) cells.push(""); 
+  }
+  return cells;
+}
+
+// --- Data Cleaners ---
 
 function cleanNumeric(value: string | null | undefined): number | null {
   if (!value) return null;
   let cleaned = value.replace(/[$,\s]/g, '').trim();
   if (!cleaned || cleaned === '-' || cleaned === '—' || cleaned === '') return null;
-  
   const isNegative = cleaned.startsWith('(') && cleaned.endsWith(')');
   if (isNegative) cleaned = cleaned.slice(1, -1);
-  
   const parsed = parseFloat(cleaned);
   return isNaN(parsed) ? null : (isNegative ? -parsed : parsed);
 }
@@ -54,8 +97,7 @@ function parseDate(value: string | null | undefined): string | null {
 
 function cleanCompanyName(name: string): string {
   if (!name) return "";
-  // Strip tags manually just in case LinkeDOM leaves some
-  return name.replace(/<[^>]+>/g, "").replace(/(\(\d+\))+\s*$/g, "").trim();
+  return name.replace(/(\(\d+\))+\s*$/g, "").trim();
 }
 
 function hasCompanySuffix(name: string): boolean {
@@ -63,408 +105,361 @@ function hasCompanySuffix(name: string): boolean {
 }
 
 // ======================================================================
-// UNIVERSAL SCOPING LOGIC ("The Date Gate")
+// 2. PARSING LOGIC (The Switchboard)
 // ======================================================================
+// These functions accept ONE table string at a time.
 
-function getTargetContentSlice(html: string): string {
-  const lower = html.toLowerCase();
-  
-  // 1. FIND START: First "Schedule of Investments" (skip TOC)
-  const startSearchPos = Math.floor(html.length * 0.05); 
-  const startIdx = lower.indexOf("schedule of investments", startSearchPos);
-  
-  if (startIdx === -1) {
-    console.log("❌ Could not find 'Schedule of Investments' header.");
-    return "";
+function processTable_GBDC(tableHtml: string, scale: number): any[] {
+  // GBDC Filter
+  if (!/(llc|inc\.|corp\.|l\.p\.|limited|\$|fair value)/i.test(tableHtml)) return [];
+
+  const rows = getRows(tableHtml);
+  if (rows.length < 3) return [];
+
+  const results: any[] = [];
+  let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
+  let dataStart = 0;
+
+  // Header Scan
+  for (let i = 0; i < Math.min(8, rows.length); i++) {
+    const cells = getCells(rows[i]);
+    cells.forEach((t, idx) => {
+      const lt = t.toLowerCase();
+      if (lt.includes('company') && !lt.includes('type') && col.company === -1) col.company = idx;
+      if (lt.includes('type') && col.type === -1) col.type = idx;
+      if (lt.includes('industry') && col.industry === -1) col.industry = idx;
+      if ((lt.includes('interest') || lt.includes('spread') || lt.includes('floor')) && col.interest === -1) col.interest = idx;
+      if (lt.includes('maturity') && col.maturity === -1) col.maturity = idx;
+      if ((lt.includes('principal') || lt.includes('par')) && col.par === -1) col.par = idx;
+      if (lt.includes('cost') && col.cost === -1) col.cost = idx;
+      if (lt.includes('fair') && !lt.includes('un') && col.fair === -1) col.fair = idx;
+    });
+    if (col.company > -1 || col.fair > -1) { dataStart = i + 1; if (col.fair > -1) break; }
   }
+  if (col.company === -1) col.company = 0;
 
-  // 2. FIND END: The START of the Prior Period or Notes
-  let endIdx = lower.length;
-  
-  const endMarkers = [
-    "notes to consolidated financial statements",
-    "notes to financial statements",
-    "consolidated statements of operations"
-  ];
-  
-  for (const marker of endMarkers) {
-    const markerPos = lower.indexOf(marker, startIdx + 5000); 
-    if (markerPos !== -1 && markerPos < endIdx) {
-      endIdx = markerPos;
+  let currentCompany = null;
+  let currentIndustry = null;
+
+  // Row Scan
+  for (let i = dataStart; i < rows.length; i++) {
+    const cells = getCells(rows[i]);
+    if (cells.length < 3) continue;
+
+    let comp = cleanCompanyName(cells[col.company] || cells[0]);
+    if (/(total|subtotal|balance)/i.test(comp)) continue;
+
+    let effectiveComp = comp;
+    if (hasCompanySuffix(comp)) currentCompany = comp;
+    else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
+    else if (!comp) continue;
+
+    if (col.industry > -1 && cells[col.industry].length > 3) currentIndustry = cells[col.industry];
+
+    const fairVal = col.fair > -1 ? cleanNumeric(cells[col.fair]) : cleanNumeric(cells[cells.length - 1]);
+    const costVal = col.cost > -1 ? cleanNumeric(cells[col.cost]) : cleanNumeric(cells[cells.length - 2]);
+
+    if (fairVal === null && costVal === null) continue;
+
+    results.push({
+      company_name: effectiveComp,
+      investment_type: col.type > -1 ? cells[col.type] : null,
+      industry: currentIndustry,
+      interest_rate: col.interest > -1 ? cells[col.interest] : null,
+      maturity_date: col.maturity > -1 ? parseDate(cells[col.maturity]) : null,
+      par_amount: col.par > -1 ? toMillions(cleanNumeric(cells[col.par]), scale) : null,
+      cost: toMillions(costVal, scale),
+      fair_value: toMillions(fairVal, scale),
+    });
+  }
+  return results;
+}
+
+function processTable_BXSL(tableHtml: string, scale: number): any[] {
+  if (!/(llc|inc\.|corp\.|limited|\$|fair value)/i.test(tableHtml)) return [];
+
+  const rows = getRows(tableHtml);
+  if (rows.length < 3) return [];
+
+  const results: any[] = [];
+  let col = { company: -1, industry: -1, type: -1, interest: -1, spread: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
+  let dataStart = 0;
+
+  for (let i = 0; i < Math.min(8, rows.length); i++) {
+    const cells = getCells(rows[i]);
+    cells.forEach((t, idx) => {
+      const lt = t.toLowerCase();
+      if ((lt.includes('company') || lt.includes('investments')) && !lt.includes('type') && col.company === -1) col.company = idx;
+      if ((lt.includes('industry') || lt.includes('sector')) && col.industry === -1) col.industry = idx;
+      if (lt.includes('type') && col.type === -1) col.type = idx;
+      if (lt.includes('interest') && !lt.includes('spread') && col.interest === -1) col.interest = idx;
+      if ((lt.includes('spread') || lt.includes('reference')) && col.spread === -1) col.spread = idx;
+      if (lt.includes('maturity') && col.maturity === -1) col.maturity = idx;
+      if ((lt.includes('principal') || lt.includes('par')) && col.par === -1) col.par = idx;
+      if (lt.includes('cost') && col.cost === -1) col.cost = idx;
+      if (lt.includes('fair') && col.fair === -1) col.fair = idx;
+    });
+    if (col.company > -1 || col.fair > -1) { dataStart = i + 1; break; }
+  }
+  if (col.company === -1) col.company = 0;
+
+  let currentCompany = null;
+  let currentIndustry = null;
+
+  for (let i = dataStart; i < rows.length; i++) {
+    const cells = getCells(rows[i]);
+    if (cells.length < 3) continue;
+
+    let comp = cleanCompanyName(cells[col.company] || cells[0]);
+    if (/(total|subtotal)/i.test(comp)) continue;
+
+    let effectiveComp = comp;
+    if (hasCompanySuffix(comp)) currentCompany = comp;
+    else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
+    else if (!comp) continue;
+
+    if (col.industry > -1 && cells[col.industry].length > 3) currentIndustry = cells[col.industry];
+
+    const fairVal = col.fair > -1 ? cleanNumeric(cells[col.fair]) : cleanNumeric(cells[cells.length - 1]);
+    const costVal = col.cost > -1 ? cleanNumeric(cells[col.cost]) : cleanNumeric(cells[cells.length - 2]);
+
+    if (fairVal === null && costVal === null) continue;
+
+    let refRate = null;
+    if (col.spread > -1) refRate = cells[col.spread];
+
+    results.push({
+      company_name: effectiveComp,
+      investment_type: col.type > -1 ? cells[col.type] : null,
+      industry: currentIndustry,
+      interest_rate: col.interest > -1 ? cells[col.interest] : null,
+      reference_rate: refRate,
+      maturity_date: col.maturity > -1 ? parseDate(cells[col.maturity]) : null,
+      par_amount: col.par > -1 ? toMillions(cleanNumeric(cells[col.par]), scale) : null,
+      cost: toMillions(costVal, scale),
+      fair_value: toMillions(fairVal, scale),
+    });
+  }
+  return results;
+}
+
+function processTable_ARCC(tableHtml: string, scale: number): any[] {
+  // Relaxed ARCC filter
+  if (!/(\$|fair value)/i.test(tableHtml)) return [];
+
+  const rows = getRows(tableHtml);
+  if (rows.length < 3) return [];
+
+  const results: any[] = [];
+  let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
+  let dataStart = 0;
+
+  for (let i = 0; i < Math.min(8, rows.length); i++) {
+    const cells = getCells(rows[i]);
+    cells.forEach((t, idx) => {
+      const lt = t.toLowerCase();
+      if ((lt.includes('company') || lt.includes('issuer')) && !lt.includes('type') && col.company === -1) col.company = idx;
+      if (lt.includes('industry') && col.industry === -1) col.industry = idx;
+      if (lt.includes('type') && col.type === -1) col.type = idx;
+      if (lt.includes('interest') && col.interest === -1) col.interest = idx;
+      if (lt.includes('maturity') && col.maturity === -1) col.maturity = idx;
+      if ((lt.includes('principal') || lt.includes('par')) && col.par === -1) col.par = idx;
+      if (lt.includes('cost') && col.cost === -1) col.cost = idx;
+      if (lt.includes('fair') && col.fair === -1) col.fair = idx;
+    });
+    if (col.company > -1 || col.fair > -1) { dataStart = i + 1; break; }
+  }
+  if (col.company === -1) col.company = 0;
+
+  let currentCompany = null;
+  let currentIndustry = null;
+
+  for (let i = dataStart; i < rows.length; i++) {
+    const cells = getCells(rows[i]);
+    if (cells.length < 3) continue;
+
+    // ARCC Industry Header (Row with 1 meaningful cell)
+    const firstText = cells[0];
+    const hasNumbers = cells.slice(1).some(x => /\d/.test(x));
+    if (firstText && firstText.length > 3 && !hasNumbers && !/(company|issuer|total)/i.test(firstText)) {
+      if (!hasCompanySuffix(firstText)) {
+         currentIndustry = firstText;
+         continue;
+      }
     }
-  }
 
-  // STOP before the Prior Period (e.g. 12/31/2024)
-  // Scan for the *next* "Schedule of Investments" header
-  const nextSoiIdx = lower.indexOf("schedule of investments", startIdx + 50000);
-  if (nextSoiIdx !== -1 && nextSoiIdx < endIdx) {
-    console.log("✂️ Cutting off Prior Period data at index " + nextSoiIdx);
-    endIdx = nextSoiIdx;
-  }
+    let comp = cleanCompanyName(cells[col.company] || cells[0]);
+    if (/(total|subtotal|balance)/i.test(comp)) continue;
 
-  console.log(`✅ Scoped: Extracted ${(endIdx - startIdx) / 1024} KB of Current Quarter data.`);
-  return html.slice(startIdx, endIdx);
+    let effectiveComp = comp;
+    if (hasCompanySuffix(comp)) currentCompany = comp;
+    else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
+    else if (!comp) continue;
+
+    const fairVal = col.fair > -1 ? cleanNumeric(cells[col.fair]) : cleanNumeric(cells[cells.length - 1]);
+    const costVal = col.cost > -1 ? cleanNumeric(cells[col.cost]) : cleanNumeric(cells[cells.length - 2]);
+
+    if (fairVal === null && costVal === null) continue;
+
+    results.push({
+      company_name: effectiveComp,
+      investment_type: col.type > -1 ? cells[col.type] : null,
+      industry: currentIndustry,
+      interest_rate: col.interest > -1 ? cells[col.interest] : null,
+      maturity_date: col.maturity > -1 ? parseDate(cells[col.maturity]) : null,
+      par_amount: col.par > -1 ? toMillions(cleanNumeric(cells[col.par]), scale) : null,
+      cost: toMillions(costVal, scale),
+      fair_value: toMillions(fairVal, scale),
+    });
+  }
+  return results;
 }
 
 // ======================================================================
-// 1. GBDC PARSER (DOM - LinkeDOM)
+// 3. STREAMING ENGINE
 // ======================================================================
-async function parseGBDC(html: string, filingId: string, supabaseClient: any, scale: number) {
-  console.log("📘 Running GBDC Parser (LinkeDOM)...");
-  
-  const content = getTargetContentSlice(html);
-  if (!content) return 0;
 
-  // Regex to find table boundaries (Cheap)
-  const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
-  
-  await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
+async function processStream(
+  response: Response, 
+  filingId: string, 
+  supabaseClient: any, 
+  parserType: string
+) {
+  if (!response.body) throw new Error("No response body");
 
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  
+  let buffer = "";
+  let scale = 0.001; // Default
+  let scaleDetected = false;
+  let inSOI = false; // "Inside Schedule of Investments" flag
+  let inPriorPeriod = false; // Flag to stop processing if we hit prior year
+  
   let insertedCount = 0;
-  let tableMatch;
-  const pendingRows: any[] = [];
+  let pendingRows: any[] = [];
   const seenKeys = new Set<string>();
 
-  while ((tableMatch = tableRe.exec(content)) !== null) {
-    const tableHtml = tableMatch[0];
-    
-    // Valid table check
-    if (!/\$/.test(tableHtml)) continue;
+  await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
 
-    // DOM PARSING (Lightweight)
-    const { document } = parseHTML(tableHtml);
-    const rows = Array.from(document.querySelectorAll("tr"));
-    if (rows.length < 3) continue;
-
-    // GBDC Column Mapping
-    let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
-    let dataStart = 0;
-
-    for (let i = 0; i < Math.min(8, rows.length); i++) {
-      const cells = Array.from(rows[i].querySelectorAll("td, th"));
-      let cIdx = 0;
-      for (const cell of cells) {
-        const txt = (cell.textContent || "").toLowerCase();
-        const span = parseInt(cell.getAttribute("colspan") || "1");
-        
-        if (txt.includes('company') && !txt.includes('type') && col.company === -1) col.company = cIdx;
-        if (txt.includes('type') && col.type === -1) col.type = cIdx;
-        if (txt.includes('industry') && col.industry === -1) col.industry = cIdx;
-        if (txt.includes('interest') && col.interest === -1) col.interest = cIdx;
-        if ((txt.includes('spread') || txt.includes('floor')) && col.interest === -1) col.interest = cIdx;
-        if (txt.includes('maturity') && col.maturity === -1) col.maturity = cIdx;
-        if ((txt.includes('principal') || txt.includes('par')) && col.par === -1) col.par = cIdx;
-        if (txt.includes('cost') && col.cost === -1) col.cost = cIdx;
-        if (txt.includes('fair') && !txt.includes('un') && col.fair === -1) col.fair = cIdx;
-        
-        cIdx += span;
-      }
-      if (col.company > -1 || col.fair > -1) { 
-        dataStart = i + 1; 
-        if (col.fair > -1) break; 
-      }
-    }
-    
-    if (col.company === -1) col.company = 0;
-    let currentCompany = null;
-    let currentIndustry = null;
-
-    for (let i = dataStart; i < rows.length; i++) {
-      const cells = Array.from(rows[i].querySelectorAll("td, th"));
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
       
-      // Flatten colspans
-      const flatCells: string[] = [];
-      cells.forEach(c => {
-          const txt = c.textContent?.trim() || "";
-          const span = parseInt(c.getAttribute("colspan") || "1");
-          flatCells.push(txt);
-          for(let k=1; k<span; k++) flatCells.push("");
-      });
+      buffer += decoder.decode(value, { stream: true });
 
-      if (flatCells.length < 3) continue;
-
-      let comp = flatCells[col.company] || flatCells[0];
-      comp = cleanCompanyName(comp);
-      if (/(total|subtotal|balance)/i.test(comp)) continue;
-
-      let effectiveComp = comp;
-      if (hasCompanySuffix(comp)) currentCompany = comp;
-      else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
-      else if (!comp) continue;
-
-      if (col.industry > -1 && flatCells[col.industry] && flatCells[col.industry].length > 3) currentIndustry = flatCells[col.industry];
-
-      const fairVal = col.fair > -1 ? cleanNumeric(flatCells[col.fair]) : cleanNumeric(flatCells[flatCells.length - 1]);
-      const costVal = col.cost > -1 ? cleanNumeric(flatCells[col.cost]) : cleanNumeric(flatCells[flatCells.length - 2]);
-
-      if (fairVal === null && costVal === null) continue;
-
-      const key = `${effectiveComp}-${fairVal}-${costVal}`;
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
-
-      pendingRows.push({
-        filing_id: filingId,
-        company_name: effectiveComp,
-        investment_type: col.type > -1 ? flatCells[col.type] : null,
-        industry: col.industry > -1 ? flatCells[col.industry] : currentIndustry,
-        interest_rate: col.interest > -1 ? flatCells[col.interest] : null,
-        maturity_date: col.maturity > -1 ? parseDate(flatCells[col.maturity]) : null,
-        par_amount: col.par > -1 ? toMillions(cleanNumeric(flatCells[col.par]), scale) : null,
-        cost: toMillions(costVal, scale),
-        fair_value: toMillions(fairVal, scale),
-        row_number: insertedCount + pendingRows.length + 1
-      });
-
-      if (pendingRows.length >= 200) {
-        await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
-        insertedCount += 200;
+      // 1. Detect Scale (Only need to do this once, early in file)
+      if (!scaleDetected && buffer.length > 50000) {
+        if (/\(in millions\)/i.test(buffer)) scale = 1;
+        scaleDetected = true;
+        console.log(`Scale detected: ${scale === 1 ? "Millions" : "Thousands"}`);
       }
-    }
-  }
-  if (pendingRows.length > 0) {
-    await supabaseClient.from("holdings").insert(pendingRows);
-    insertedCount += pendingRows.length;
-  }
-  return insertedCount;
-}
 
-// ======================================================================
-// 2. BXSL PARSER (DOM - LinkeDOM)
-// ======================================================================
-async function parseBXSL(html: string, filingId: string, supabaseClient: any, scale: number) {
-  console.log("🟣 Running BXSL Parser (LinkeDOM)...");
-  
-  const content = getTargetContentSlice(html);
-  if (!content) return 0;
-
-  const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
-  
-  await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
-
-  let insertedCount = 0;
-  let tableMatch;
-  const pendingRows: any[] = [];
-  const seenKeys = new Set<string>();
-
-  while ((tableMatch = tableRe.exec(content)) !== null) {
-    const tableHtml = tableMatch[0];
-    if (!/\$/.test(tableHtml)) continue;
-
-    const { document } = parseHTML(tableHtml);
-    const rows = Array.from(document.querySelectorAll("tr"));
-    
-    let col = { company: -1, industry: -1, type: -1, interest: -1, spread: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
-    let dataStart = 0;
-
-    for (let i = 0; i < Math.min(8, rows.length); i++) {
-      const cells = Array.from(rows[i].querySelectorAll("td, th"));
-      let cIdx = 0;
-      for (const cell of cells) {
-        const txt = (cell.textContent || "").toLowerCase();
-        const span = parseInt(cell.getAttribute("colspan") || "1");
-
-        if ((txt.includes('company') || txt.includes('investments')) && !txt.includes('type') && col.company === -1) col.company = cIdx;
-        if ((txt.includes('industry') || txt.includes('sector')) && col.industry === -1) col.industry = cIdx;
-        if (txt.includes('type') && col.type === -1) col.type = cIdx;
-        if (txt.includes('interest') && !txt.includes('spread') && col.interest === -1) col.interest = cIdx;
-        if ((txt.includes('spread') || txt.includes('reference')) && col.spread === -1) col.spread = cIdx;
-        if (txt.includes('maturity') && col.maturity === -1) col.maturity = cIdx;
-        if ((txt.includes('principal') || txt.includes('par')) && col.par === -1) col.par = cIdx;
-        if (txt.includes('cost') && col.cost === -1) col.cost = cIdx;
-        if (txt.includes('fair') && col.fair === -1) col.fair = cIdx;
-        cIdx += span;
+      // 2. Check for SOI Start (Context Gate)
+      if (!inSOI) {
+        const soiIdx = buffer.toLowerCase().indexOf("schedule of investments");
+        if (soiIdx !== -1) {
+          console.log("✅ Found Schedule of Investments start.");
+          inSOI = true;
+          // Trim buffer before SOI to save memory
+          buffer = buffer.slice(soiIdx);
+        } else {
+          // Keep buffer small if we haven't found start yet
+          // Keep last 1000 chars for overlap safety
+          if (buffer.length > 100000) buffer = buffer.slice(-1000);
+          continue;
+        }
       }
-      if (col.company > -1) { dataStart = i + 1; break; }
-    }
-    
-    if (col.company === -1) col.company = 0;
-    let currentCompany = null;
-    let currentIndustry = null;
 
-    for (let i = dataStart; i < rows.length; i++) {
-      const cells = Array.from(rows[i].querySelectorAll("td, th"));
-      const flatCells: string[] = [];
-      cells.forEach(c => {
-          const txt = c.textContent?.trim() || "";
-          const span = parseInt(c.getAttribute("colspan") || "1");
-          flatCells.push(txt);
-          for(let k=1; k<span; k++) flatCells.push("");
-      });
-
-      if (flatCells.length < 3) continue;
-
-      let comp = flatCells[col.company] || flatCells[0];
-      comp = cleanCompanyName(comp);
-      if (/(total|subtotal)/i.test(comp)) continue;
-
-      let effectiveComp = comp;
-      if (hasCompanySuffix(comp)) currentCompany = comp;
-      else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
-      else if (!comp) continue;
-
-      if (col.industry > -1 && flatCells[col.industry] && flatCells[col.industry].length > 3) currentIndustry = flatCells[col.industry];
-
-      const fairVal = col.fair > -1 ? cleanNumeric(flatCells[col.fair]) : cleanNumeric(flatCells[flatCells.length - 1]);
-      const costVal = col.cost > -1 ? cleanNumeric(flatCells[col.cost]) : cleanNumeric(flatCells[flatCells.length - 2]);
-
-      if (fairVal === null && costVal === null) continue;
-
-      const key = `${effectiveComp}-${fairVal}-${costVal}`;
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
-
-      let refRate = null;
-      if (col.spread > -1 && flatCells[col.spread]) refRate = flatCells[col.spread];
-
-      pendingRows.push({
-        filing_id: filingId,
-        company_name: effectiveComp,
-        investment_type: col.type > -1 ? flatCells[col.type] : null,
-        industry: col.industry > -1 ? flatCells[col.industry] : currentIndustry,
-        interest_rate: col.interest > -1 ? flatCells[col.interest] : null,
-        reference_rate: refRate,
-        maturity_date: col.maturity > -1 ? parseDate(flatCells[col.maturity]) : null,
-        par_amount: col.par > -1 ? toMillions(cleanNumeric(flatCells[col.par]), scale) : null,
-        cost: toMillions(costVal, scale),
-        fair_value: toMillions(fairVal, scale),
-        row_number: insertedCount + pendingRows.length + 1
-      });
-
-      if (pendingRows.length >= 200) {
-        await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
-        insertedCount += 200;
+      // 3. Check for Prior Period / End (Context Stop)
+      if (inSOI && !inPriorPeriod) {
+        // Look for end markers or next SOI header (indicating prior period)
+        const lowerBuf = buffer.toLowerCase();
+        // Check for Notes or Financial Statements
+        if (lowerBuf.includes("notes to") || lowerBuf.includes("statements of operations")) {
+           console.log("🛑 Found End Marker (Notes). Stopping.");
+           break; 
+        }
+        // Check for SECOND occurrence of SOI (Prior Period)
+        // We assume the first occurrence was removed from buffer or is at index 0.
+        // We look for a *new* header further down.
+        // Warning: We must be careful not to match the *current* header if it's still in buffer.
+        // Simple heuristic: If we see "December 31" (Prior Year End) nearby "Schedule of Investments"
+        // For simplicity in streaming: If we see another "Schedule of Investments" header
+        // and we have already processed at least 1 table, it's likely the prior period.
+        if (insertedCount > 50 && lowerBuf.includes("schedule of investments")) {
+           console.log("🛑 Found Prior Period Header. Stopping.");
+           break;
+        }
       }
-    }
-  }
 
-  if (pendingRows.length > 0) {
-    await supabaseClient.from("holdings").insert(pendingRows);
-    insertedCount += pendingRows.length;
-  }
-  return insertedCount;
-}
+      // 4. Extract and Process Tables
+      // Loop to find all COMPLETE tables in current buffer
+      while (true) {
+        const tableStart = buffer.indexOf("<table");
+        if (tableStart === -1) break;
 
-// ======================================================================
-// 3. ARCC PARSER (DOM - LinkeDOM)
-// ======================================================================
-async function parseARCC(html: string, filingId: string, supabaseClient: any, scale: number) {
-  console.log("📘 Running ARCC Parser (LinkeDOM)...");
-  
-  const content = getTargetContentSlice(html);
-  if (!content) return 0;
+        const tableEnd = buffer.indexOf("</table>", tableStart);
+        if (tableEnd === -1) break; // Table not complete yet, wait for more chunks
 
-  const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
-
-  await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
-
-  let insertedCount = 0;
-  let tableMatch;
-  const pendingRows: any[] = [];
-  const seenKeys = new Set<string>();
-
-  while ((tableMatch = tableRe.exec(content)) !== null) {
-    const tableHtml = tableMatch[0];
-    if (!/(\$|fair value)/i.test(tableHtml)) continue;
-
-    const { document } = parseHTML(tableHtml);
-    const rows = Array.from(document.querySelectorAll("tr"));
-
-    // --- ARCC LOGIC START ---
-    let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
-    let dataStart = 0;
-
-    for (let i = 0; i < Math.min(8, rows.length); i++) {
-      const cells = Array.from(rows[i].querySelectorAll("td, th"));
-      let cIdx = 0;
-      for (const cell of cells) {
-        const txt = (cell.textContent || "").toLowerCase();
-        const span = parseInt(cell.getAttribute("colspan") || "1");
+        // Extract complete table
+        const tableHtml = buffer.slice(tableStart, tableEnd + 8); // +8 for </table>
         
-        if ((txt.includes('company') || txt.includes('issuer')) && !txt.includes('type') && col.company === -1) col.company = cIdx;
-        if (txt.includes('industry') && col.industry === -1) col.industry = cIdx;
-        if (txt.includes('type') && col.type === -1) col.type = cIdx;
-        if (txt.includes('interest') && col.interest === -1) col.interest = cIdx;
-        if (txt.includes('maturity') && col.maturity === -1) col.maturity = cIdx;
-        if ((txt.includes('principal') || txt.includes('par')) && col.par === -1) col.par = cIdx;
-        if (txt.includes('cost') && col.cost === -1) col.cost = cIdx;
-        if (txt.includes('fair') && col.fair === -1) col.fair = cIdx;
-        cIdx += span;
-      }
-      if (col.company > -1 || col.fair > -1) { dataStart = i + 1; break; }
-    }
-    
-    if (col.company === -1) col.company = 0;
-    let currentCompany = null;
-    let currentIndustry = null;
+        // Remove this table from buffer to free memory
+        buffer = buffer.slice(tableEnd + 8);
 
-    for (let i = dataStart; i < rows.length; i++) {
-      const cells = Array.from(rows[i].querySelectorAll("td, th"));
-      const flatCells: string[] = [];
-      cells.forEach(c => {
-          const txt = c.textContent?.trim() || "";
-          const span = parseInt(c.getAttribute("colspan") || "1");
-          flatCells.push(txt);
-          for(let k=1; k<span; k++) flatCells.push("");
-      });
+        // PROCESS THIS TABLE
+        let newRows: any[] = [];
+        if (parserType === 'GBDC') newRows = processTable_GBDC(tableHtml, scale);
+        else if (parserType === 'BXSL') newRows = processTable_BXSL(tableHtml, scale);
+        else newRows = processTable_ARCC(tableHtml, scale);
 
-      if (flatCells.length < 3) continue;
-
-      const firstText = flatCells[0];
-      const hasNumbers = flatCells.slice(1).some(x => /\d/.test(x));
-      if (firstText && firstText.length > 3 && !hasNumbers && !/(company|issuer|total)/i.test(firstText)) {
-          if (!hasCompanySuffix(firstText)) {
-             currentIndustry = firstText;
-             continue;
+        if (newRows.length > 0) {
+          // Deduplicate & Batch
+          for (const row of newRows) {
+            const key = `${row.company_name}-${row.fair_value}-${row.cost}`;
+            if (!seenKeys.has(key)) {
+              seenKeys.add(key);
+              pendingRows.push({
+                ...row,
+                filing_id: filingId,
+                row_number: insertedCount + pendingRows.length + 1
+              });
+            }
           }
+        }
+
+        // Flush to DB if batch full
+        if (pendingRows.length >= 200) {
+          await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
+          insertedCount += 200;
+          console.log(`Inserted ${insertedCount} rows...`);
+        }
       }
 
-      let comp = flatCells[col.company] || flatCells[0];
-      comp = cleanCompanyName(comp);
-      if (/(total|subtotal|balance)/i.test(comp)) continue;
-
-      let effectiveComp = comp;
-      if (hasCompanySuffix(comp)) currentCompany = comp;
-      else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
-      else if (!comp) continue;
-
-      const fairVal = col.fair > -1 ? cleanNumeric(flatCells[col.fair]) : cleanNumeric(flatCells[flatCells.length - 1]);
-      const costVal = col.cost > -1 ? cleanNumeric(flatCells[col.cost]) : cleanNumeric(flatCells[flatCells.length - 2]);
-
-      if (fairVal === null && costVal === null) continue;
-
-      const key = `${effectiveComp}-${fairVal}-${costVal}`;
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
-
-      pendingRows.push({
-        filing_id: filingId,
-        company_name: effectiveComp,
-        investment_type: col.type > -1 ? flatCells[col.type] : null,
-        industry: col.industry > -1 ? flatCells[col.industry] : currentIndustry,
-        interest_rate: col.interest > -1 ? flatCells[col.interest] : null,
-        maturity_date: col.maturity > -1 ? parseDate(flatCells[col.maturity]) : null,
-        par_amount: col.par > -1 ? toMillions(cleanNumeric(flatCells[col.par]), scale) : null,
-        cost: toMillions(costVal, scale),
-        fair_value: toMillions(fairVal, scale),
-        row_number: insertedCount + pendingRows.length + 1
-      });
-
-      if (pendingRows.length >= 200) {
-        await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
-        insertedCount += 200;
+      // 5. Memory Safety Valve
+      // If buffer grows too large (e.g. huge text block between tables), trim it.
+      if (buffer.length > 5_000_000) {
+        console.warn("⚠️ Buffer too large, trimming start...");
+        buffer = buffer.slice(-1000); // Keep overlap
       }
     }
+  } catch (err) {
+    console.error("Stream Error:", err);
   }
+
+  // Flush remaining
   if (pendingRows.length > 0) {
     await supabaseClient.from("holdings").insert(pendingRows);
     insertedCount += pendingRows.length;
   }
-  return insertedCount;
+
+  return { count: insertedCount, scale: scale === 1 ? 'millions' : 'thousands' };
 }
 
 // ======================================================================
-// MAIN SWITCHBOARD
+// MAIN HANDLER
 // ======================================================================
 
 function determineParserType(ticker: string | null, bdcName: string): 'ARCC' | 'GBDC' | 'BXSL' | 'GENERIC' {
@@ -498,54 +493,43 @@ serve(async (req) => {
 
     const { cik, bdc_name, ticker } = filing.bdcs;
     const accessionNo = filing.sec_accession_no;
-    
     const parserType = determineParserType(ticker, bdc_name);
-    console.log(`Processing ${accessionNo} using ${parserType} parser`);
+    console.log(`Processing ${accessionNo} (${parserType}) via STREAM`);
 
     const paddedCik = cik.replace(/^0+/, "");
     const accNoClean = accessionNo.replace(/-/g, "");
     
-    // Fetch Index
+    // Index
     const indexUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accNoClean}/index.json`;
     const indexRes = await fetch(indexUrl, { headers: { "User-Agent": SEC_USER_AGENT } });
-    if (!indexRes.ok) throw new Error("Failed to fetch index.json");
-    
     const indexJson = await indexRes.json();
     const docs = indexJson.directory?.item || [];
     
     const htmDocs = docs.filter((d: any) => d.name.endsWith(".htm") || d.name.endsWith(".html"));
     if (htmDocs.length === 0) throw new Error("No HTML found");
 
-    // Process largest file
+    // Target Doc
     const targetDoc = htmDocs.sort((a: any, b: any) => parseInt(b.size) - parseInt(a.size))[0];
     const docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accNoClean}/${targetDoc.name}`;
     
+    // START STREAMING REQUEST
     const htmlRes = await fetch(docUrl, { headers: { "User-Agent": SEC_USER_AGENT } });
-    const html = await htmlRes.text();
-    const scaleRes = detectScale(html);
     
-    let totalInserted = 0;
+    // Process stream
+    const result = await processStream(htmlRes, filingId, supabaseClient, parserType);
 
-    if (parserType === 'GBDC') {
-      totalInserted = await parseGBDC(html, filingId, supabaseClient, scaleRes);
-    } else if (parserType === 'BXSL') {
-      totalInserted = await parseBXSL(html, filingId, supabaseClient, scaleRes);
-    } else {
-      totalInserted = await parseARCC(html, filingId, supabaseClient, scaleRes);
-    }
-
-    if (totalInserted > 0) {
+    if (result.count > 0) {
       await supabaseClient.from("filings")
-        .update({ parsed_successfully: true, value_scale: scaleRes === 1 ? 'millions' : 'thousands' })
+        .update({ parsed_successfully: true, value_scale: result.scale })
         .eq("id", filingId);
     }
 
-    return new Response(JSON.stringify({ success: true, count: totalInserted }), {
+    return new Response(JSON.stringify({ success: true, count: result.count }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" }
     });
 
   } catch (error) {
-    console.error("Error:", error);
+    console.error("Critical Error:", error);
     return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Unknown" }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" }
