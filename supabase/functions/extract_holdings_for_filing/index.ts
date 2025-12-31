@@ -2288,6 +2288,26 @@ async function parseBXSLTableAndInsert(params: {
   }
   console.log(`   ✅ Found SOI at position ${soiStart} (match: "${soiMatch?.[0]}")`);
 
+  // BXSL: Extract and validate the period date from SOI header
+  // Look for date patterns like "September 30, 2025" or "As of September 30, 2025"
+  const soiHeaderSection = html.slice(soiStart, Math.min(soiStart + 2000, html.length));
+  const datePattern = /(?:as\s+of\s+)?(\w+\s+\d{1,2},?\s+\d{4})/i;
+  const dateMatch = datePattern.exec(soiHeaderSection);
+  const targetPeriodDate = dateMatch?.[1]?.trim() || null;
+  
+  if (targetPeriodDate) {
+    console.log(`🔧 BXSL: Extraction target confirmed for period: ${targetPeriodDate}`);
+  } else {
+    console.log(`⚠️ BXSL: Could not extract period date from SOI header`);
+  }
+
+  // Define prior period dates to skip (comparative tables)
+  const priorPeriodPatterns = [
+    /december\s+31,?\s+2024/i,
+    /as\s+of\s+december\s+31,?\s+2024/i,
+    /12\/31\/2024/i,
+  ];
+
   console.log(`🔍 STEP 3: Extracting post-SOI section...`);
   const MAX_SEARCH = 10_000_000; // 10MB to capture full BXSL SOI
   const afterSoi = html.slice(soiStart, Math.min(soiStart + MAX_SEARCH, html.length));
@@ -2391,6 +2411,16 @@ async function parseBXSLTableAndInsert(params: {
     }
 
     if (tableHtml.length < 15_000) continue;
+
+    // BXSL: Skip prior period comparative tables (December 31, 2024)
+    // Check the table and surrounding context for prior period dates
+    const tableContext = afterSoi.slice(Math.max(0, tableStartIdx - 500), tableStartIdx + 2000);
+    const isPriorPeriodTable = priorPeriodPatterns.some(pattern => pattern.test(tableContext));
+    
+    if (isPriorPeriodTable) {
+      console.log(`   ⏭️ Skipping prior period table (December 31, 2024) at index ${tableCount}`);
+      continue;
+    }
 
     // Skip financial summary tables
     if (
@@ -2643,6 +2673,11 @@ async function parseBXSLTableAndInsert(params: {
   await flush();
 
   console.log(`\n🟣 BXSL STREAMING: Completed - inserted ${insertedCount} holdings from ${holdingsTableCount} tables (${totalProcessedRows} processed, ${totalRowsSkipped} skipped)`);
+
+  // Fallback warning if no current period data was found
+  if (insertedCount === 0 && targetPeriodDate) {
+    console.log(`⚠️ BXSL: Current period table not found; check for date formatting variations.`);
+  }
 
   if (insertedCount > 100) {
     await supabaseClient
