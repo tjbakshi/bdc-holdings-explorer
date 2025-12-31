@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { TextLineStream } from "https://deno.land/std@0.168.0/streams/mod.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -12,10 +13,87 @@ const SEC_USER_AGENT = "BDCTrackerApp/1.0 (contact@bdctracker.com)";
 const MAX_BYTES_PER_RUN = 800_000;
 
 // ======================================================================
-// 1. HELPERS & FILTERS (The "Strict Bouncer")
+// 1. HELPERS
 // ======================================================================
 
-// Terms that indicate a row is NOT a portfolio company
+function cleanNumeric(value: string | null | undefined): number | null {
+  if (!value) return null;
+  let cleaned = value.replace(/[$,\s]/g, "").trim();
+  // Remove HTML entities like &nbsp;
+  cleaned = cleaned.replace(/&nbsp;/g, "").replace(/&#160;/g, "");
+
+  if (!cleaned || cleaned === "-" || cleaned === "—" || cleaned === "") return null;
+
+  const isNegative = cleaned.startsWith("(") && cleaned.endsWith(")");
+  if (isNegative) cleaned = cleaned.slice(1, -1);
+
+  const parsed = parseFloat(cleaned);
+  return isNaN(parsed) ? null : isNegative ? -parsed : parsed;
+}
+
+function toMillions(value: number | null | undefined, scale: number): number | null {
+  if (value === null || value === undefined) return null;
+  return Math.round(value * scale * 100) / 100;
+}
+
+function parseDate(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const cleaned = value.trim();
+  // Match MM/YYYY or MM/DD/YYYY
+  const dateMatch = cleaned.match(/(\d{1,2})\/?(\d{1,2})?\/(\d{4})/);
+  if (dateMatch) {
+    const month = dateMatch[1].padStart(2, "0");
+    const year = dateMatch[3];
+    // If day is missing (MM/YYYY), default to 01
+    const day = dateMatch[2] ? dateMatch[2].padStart(2, "0") : "01";
+    return `${year}-${month}-${day}`;
+  }
+  return null;
+}
+
+function cleanCompanyName(name: string): string {
+  if (!name) return "";
+  let clean = name
+    .replace(/<[^>]+>/g, "")
+    .replace(/(\(\d+\))+\s*$/g, "") // Remove footnote refs like (1)(2)
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#160;/g, " ")
+    .trim();
+  return clean;
+}
+
+function stripTags(html: string): string {
+  return html
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractCellsWithColspan(rowHtml: string): string[] {
+  const cells: string[] = [];
+  const cellRe = /<t[dh]\b([^>]*)>([\s\S]*?)<\/t[dh]>/gi;
+  let match;
+
+  while ((match = cellRe.exec(rowHtml)) !== null) {
+    const attrs = match[1];
+    const content = stripTags(match[2]);
+    cells.push(content);
+
+    // Handle colspan to keep indices aligned
+    const spanMatch = attrs.match(/colspan=["']?(\d+)["']?/i);
+    const span = spanMatch ? parseInt(spanMatch[1]) : 1;
+    for (let i = 1; i < span; i++) {
+      cells.push(""); // Ghost cells
+    }
+  }
+  return cells;
+}
+
+// ======================================================================
+// 2. PARSING LOGIC (The "Backup" / Generic Logic)
+// ======================================================================
+
+// Terms that indicate a row is probably a Header or Footer (Junk)
 const JUNK_TERMS = [
   "total",
   "subtotal",
@@ -58,156 +136,108 @@ const JUNK_TERMS = [
   "income",
   "fees",
   "tax",
-  "attributable",
-  "voting",
-  "non-voting",
-  "member",
-  "issuer",
-  "investment",
-  "at the market",
-  "shares",
-  "units",
 ];
 
 function isJunkRow(text: string): boolean {
   const lower = text.toLowerCase().trim();
-
-  // 1. Check Blacklist
-  if (JUNK_TERMS.some((term) => lower.includes(term))) return true;
-
-  // 2. Check for numeric-only or garbage names (e.g. "1,048,546" or "1 &nbsp;")
-  if (/^[\d,.\s&#;]+$/.test(lower)) return true;
-
-  // 3. Check for parenthetical starts often used in financial statements
-  if (lower.startsWith("(")) return true;
-
-  // 4. Too short
   if (lower.length < 3) return true;
-
+  if (JUNK_TERMS.some((term) => lower.includes(term))) return true;
+  // Numeric only or garbage
+  if (/^[\d,.\s&#;()]+$/.test(lower)) return true;
   return false;
 }
 
-function cleanNumeric(value: string | null | undefined): number | null {
-  if (!value) return null;
-  let cleaned = value.replace(/[$,\s]/g, "").trim();
-  // Remove HTML entities like &nbsp;
-  cleaned = cleaned.replace(/&nbsp;/g, "").replace(/&#160;/g, "");
+function processLine_Generic(line: string, state: any): any | null {
+  const lower = line.toLowerCase();
 
-  if (!cleaned || cleaned === "-" || cleaned === "—" || cleaned === "") return null;
+  // 1. Detect Scale
+  if (!state.scaleDetected) {
+    if (lower.includes("amounts in thousands") || lower.includes("(in thousands)")) {
+      state.scale = 0.001;
+      state.scaleDetected = true;
+    } else if (lower.includes("amounts in millions") || lower.includes("(in millions)")) {
+      state.scale = 1;
+      state.scaleDetected = true;
+    }
+  }
 
-  const isNegative = cleaned.startsWith("(") && cleaned.endsWith(")");
-  if (isNegative) cleaned = cleaned.slice(1, -1);
+  // 2. Start Logic
+  if (!state.inSOI) {
+    if (lower.includes("schedule of investments")) {
+      state.inSOI = true;
+      console.log("✅ Entered Schedule of Investments");
+    }
+    return null;
+  }
 
-  const parsed = parseFloat(cleaned);
-  return isNaN(parsed) ? null : isNegative ? -parsed : parsed;
-}
+  // 3. Stop Logic (Strict)
+  // Stop if we hit Financial Statements or Notes
+  if (state.inSOI) {
+    if (
+      lower.includes("consolidated statements of assets") ||
+      lower.includes("consolidated statements of operations") ||
+      lower.includes("notes to consolidated") ||
+      lower.includes("liabilities and net assets")
+    ) {
+      state.done = true;
+      console.log("🛑 Reached end of Schedule of Investments (Stop Sign Found)");
+      return null;
+    }
+  }
 
-function toMillions(value: number | null | undefined, scale: number): number | null {
-  if (value === null || value === undefined) return null;
-  return Math.round(value * scale * 100) / 100;
-}
+  // 4. Row Capture
+  if (line.includes("<tr")) {
+    state.inRow = true;
+    state.currentRow = "";
+  }
 
-function parseDate(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const cleaned = value.trim();
-  const dateMatch = cleaned.match(/(\d{1,2})\/?(\d{1,2})?\/(\d{4})/);
-  if (dateMatch) {
-    const month = dateMatch[1].padStart(2, "0");
-    const year = dateMatch[3];
-    const day = dateMatch[2] ? dateMatch[2].padStart(2, "0") : "01";
-    return `${year}-${month}-${day}`;
+  if (state.inRow) {
+    state.currentRow += " " + line;
+    if (line.includes("</tr>")) {
+      state.inRow = false;
+      return parseSingleRow_Generic(state.currentRow, state);
+    }
   }
   return null;
 }
 
-function cleanCompanyName(name: string): string {
-  if (!name) return "";
-  let clean = name
-    .replace(/<[^>]+>/g, "")
-    .replace(/(\(\d+\))+\s*$/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&#160;/g, " ")
-    .trim();
-  return clean;
-}
-
-function stripTags(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function extractCellsWithColspan(rowHtml: string): string[] {
-  const cells: string[] = [];
-  const cellRe = /<t[dh]\b([^>]*)>([\s\S]*?)<\/t[dh]>/gi;
-  let match;
-  while ((match = cellRe.exec(rowHtml)) !== null) {
-    const attrs = match[1];
-    const content = stripTags(match[2]);
-    cells.push(content);
-
-    const spanMatch = attrs.match(/colspan=["']?(\d+)["']?/i);
-    const span = spanMatch ? parseInt(spanMatch[1]) : 1;
-    for (let i = 1; i < span; i++) cells.push("");
-  }
-  return cells;
-}
-
-// ======================================================================
-// 2. PARSING LOGIC (OBDC Specialist)
-// ======================================================================
-
-function parseSingleRow(rowHtml: string, state: any): any | null {
+function parseSingleRow_Generic(rowHtml: string, state: any): any | null {
   const cells = extractCellsWithColspan(rowHtml);
-
-  // Validation: Row must have enough columns (OBDC usually has ~9)
-  if (cells.length < 5) return null;
+  if (cells.length < 3) return null;
 
   const company = cleanCompanyName(cells[0]);
 
-  // Validation: Must be a valid company name (The Strict Bouncer)
-  if (isJunkRow(company)) return null;
+  // Validation
+  if (!company || isJunkRow(company)) return null;
 
-  // OBDC MAPPING (Column Indices based on your screenshot):
-  // [0] Company
-  // [1] Investment Type
-  // [2] Ref Rate (e.g. S+)
-  // [3] Cash/Interest (e.g. 5.50%)
-  // ...
-  // [Last] Fair Value
-  // [Last-1] Cost
+  // DUCK TYPING (Dynamic Column Finding)
+  // Instead of hardcoded indices, we look for data that "looks right"
 
-  // Find Fair Value at the end (safest way to handle variable columns)
-  let fvIdx = cells.length - 1;
-  let costIdx = cells.length - 2;
+  // 1. Find all numeric values
+  const nums = cells.map((c, i) => ({ val: cleanNumeric(c), idx: i })).filter((x) => x.val !== null);
+  if (nums.length < 2) return null;
 
-  // Backtrack if there are empty trailing cells
-  for (let i = cells.length - 1; i >= 6; i--) {
-    if (cleanNumeric(cells[i]) !== null) {
-      fvIdx = i;
-      costIdx = i - 1;
-      break;
-    }
-  }
+  // Assume Fair Value is the LAST number, Cost is 2nd to LAST
+  const fairValObj = nums[nums.length - 1];
+  const costValObj = nums[nums.length - 2];
 
-  const fv = cleanNumeric(cells[fvIdx]);
-  const cost = cleanNumeric(cells[costIdx]);
+  // 2. Find Dates (Maturity)
+  // Look for any cell that matches a date regex
+  const maturityStr = cells.find((c) => /\d{1,2}\/?\d{0,2}\/\d{4}/.test(c));
 
-  if (fv === null && cost === null) return null;
+  // 3. Find Interest Rates
+  // Look for any cell containing "%"
+  const interestStr = cells.find((c) => /%/.test(c));
 
-  // Attempt to find Par (usually before cost)
-  const par = cleanNumeric(cells[costIdx - 1]);
+  if (fairValObj.val === 0 && costValObj.val === 0) return null; // Skip empty rows
 
   return {
     company_name: company,
-    investment_type: cells[1] || null,
-    reference_rate: cells[2] || null,
-    interest_rate: cells[3] || null,
-    maturity_date: parseDate(cells[5]) || parseDate(cells[6]),
-    par_amount: toMillions(par, state.scale),
-    cost: toMillions(cost, state.scale),
-    fair_value: toMillions(fv, state.scale),
+    investment_type: cells[1] || null, // Usually col 1
+    interest_rate: interestStr || null,
+    maturity_date: parseDate(maturityStr),
+    cost: toMillions(costValObj.val, state.scale),
+    fair_value: toMillions(fairValObj.val, state.scale),
     row_number: state.rowCount++,
   };
 }
@@ -243,7 +273,6 @@ serve(async (req) => {
     const htmDocs = indexJson.directory.item.filter((d: any) => d.name.endsWith(".htm") && !d.name.includes("-index"));
     let targetDoc = htmDocs.find((d: any) => d.name.toLowerCase().includes((ticker || "").toLowerCase()));
 
-    // Fallback: Pick largest HTM file if no ticker match
     if (!targetDoc) targetDoc = htmDocs.sort((a: any, b: any) => parseInt(b.size) - parseInt(a.size))[0];
 
     if (!targetDoc) throw new Error("No suitable HTM document found");
@@ -262,60 +291,36 @@ serve(async (req) => {
 
     const chunk = await response.text();
 
+    // Default to GENERIC parser for everyone (Back to Backup)
+    const processLine = processLine_Generic;
+
     // Restore state
     const currentIndustryState = filing.current_industry_state;
     const state = {
-      inSOI: startOffset > 0, // Assume inside if resuming
+      inSOI: startOffset > 0,
       done: false,
-      scale: 0.001,
+      scale: 0.001, // Default to thousands
       scaleDetected: false,
       rowCount: 0,
       currentIndustry: currentIndustryState || null,
     };
 
-    // Detect scale
-    const lowerChunk = chunk.toLowerCase();
-    if (lowerChunk.includes("(in millions)") || lowerChunk.includes("amounts in millions")) {
-      state.scale = 1;
-      state.scaleDetected = true;
-    } else if (lowerChunk.includes("in thousands") || lowerChunk.includes("amounts in thousands")) {
-      state.scale = 0.001;
-      state.scaleDetected = true;
-    }
-
-    // Check for START of SOI
-    if (!state.inSOI && lowerChunk.includes("schedule of investments")) {
-      state.inSOI = true;
-      console.log("✅ Found Schedule of Investments");
-    }
-
-    // Check for STOP Signs (Critical for OBDC)
-    // OBDC puts Balance Sheet immediately after SOI, often causing data bleed
-    if (
-      lowerChunk.includes("notes to consolidated") ||
-      lowerChunk.includes("notes to financial") ||
-      lowerChunk.includes("consolidated statements of assets") ||
-      lowerChunk.includes("consolidated statements of operations") ||
-      lowerChunk.includes("liabilities and net assets")
-    ) {
-      state.done = true;
-      console.log("🛑 Found End of Schedule (Stop Sign)");
+    // Pre-scan chunk for scale if just starting
+    if (startOffset === 0) {
+      const lowerChunk = chunk.toLowerCase();
+      if (lowerChunk.includes("(in millions)") || lowerChunk.includes("amounts in millions")) {
+        state.scale = 1;
+        state.scaleDetected = true;
+      }
     }
 
     const batch: any[] = [];
     const rowMatches = chunk.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi);
 
     for (const match of rowMatches) {
-      if (!state.inSOI) continue;
-      // If we hit the done flag in previous chunk logic, stop parsing rows
       if (state.done) break;
-
-      const rowHtml = match[0];
-      const result = parseSingleRow(rowHtml, state);
-
-      if (result) {
-        batch.push({ ...result, filing_id: filingId });
-      }
+      const result = processLine(match[0], state);
+      if (result) batch.push({ ...result, filing_id: filingId });
     }
 
     let totalInserted = 0;
