@@ -1943,7 +1943,7 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       
       // Detect industry header row
       if (nonEmptyCells.length <= 4 && firstCellText.length > 2 && firstCellText.length < 80) {
-        const hasCompanySuffix = /(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd|S\.A\.|GmbH)/i.test(firstCellText);
+        const hasCompanySuffix = /(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd\.?|Limited|S\.A\.|GmbH|Bidco|Holdco|Midco|Topco|Buyer|Acquisition)/i.test(firstCellText);
         const isTotal = /^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(firstCellText);
         const isHeader = /^(Portfolio|Borrower|Investment|Company|Fair Value|Cost|Par|Principal|Maturity)/i.test(firstCellText);
         const isNumeric = /^[\$\(\)\-\d,.\s%]+$/.test(firstCellText);
