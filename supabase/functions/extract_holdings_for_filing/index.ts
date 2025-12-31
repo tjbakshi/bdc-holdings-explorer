@@ -12,6 +12,75 @@ const SEC_USER_AGENT = "BDCTrackerApp/1.0 (contact@bdctracker.com)";
 const MAX_BYTES_PER_RUN = 800_000; 
 
 // ======================================================================
+// STRICT BOUNCER - Blacklist for financial statement junk
+// ======================================================================
+
+const JUNK_PATTERNS = [
+  // Financial statement terms
+  /\btotal\b/i, /\bsubtotal\b/i, /\bbalance\b/i,
+  /\bnet assets\b/i, /\bnet investment\b/i,
+  // Balance sheet terms  
+  /\bcash\b/i, /\bliabilities\b/i, /\breceivable\b/i,
+  /\bprepaid\b/i, /\bpayable\b/i,
+  // Income statement terms
+  /\bdistributions\b/i, /\bincrease\b/i, /\bdecrease\b/i,
+  /\bequity\b/i, /\bcapital\b/i,
+  // Header terms that might slip through
+  /\bamortized cost\b/i, /\bfair value\b/i, 
+  /\bprincipal\b/i, /\bmaturity\b/i,
+  // Other junk
+  /\baccounts\b/i, /\baccrued\b/i, /\binterest income\b/i,
+  /\bdividend\b/i, /\bexpense\b/i, /\bfees\b/i,
+  /\bborrowings\b/i, /\bdebt\b/i, /\bnotes payable\b/i,
+  /\bcontingent\b/i, /\bcommitment\b/i
+];
+
+function isJunkRow(companyName: string): boolean {
+  if (!companyName) return true;
+  
+  const name = companyName.trim();
+  
+  // Empty or too short
+  if (name.length < 3) return true;
+  
+  // Purely numeric (like "123" or "1,234")
+  if (/^[\d,.\s-]+$/.test(name)) return true;
+  
+  // Starts with parentheses (usually a footnote or negative number)
+  if (name.startsWith('(')) return true;
+  
+  // Check against blacklist patterns
+  for (const pattern of JUNK_PATTERNS) {
+    if (pattern.test(name)) return true;
+  }
+  
+  return false;
+}
+
+// ======================================================================
+// STOP SIGN - Headers that indicate end of Schedule of Investments
+// ======================================================================
+
+const STOP_SIGN_PATTERNS = [
+  /consolidated\s+statements?\s+of\s+assets/i,
+  /consolidated\s+statements?\s+of\s+operations/i,
+  /notes\s+to\s+consolidated/i,
+  /notes\s+to\s+financial/i,
+  /liabilities\s+and\s+net\s+assets/i,
+  /the\s+accompanying\s+notes\s+are\s+an\s+integral\s+part/i,
+  /statement\s+of\s+operations/i,
+  /statements?\s+of\s+changes/i
+];
+
+function isStopSign(text: string): boolean {
+  const lower = text.toLowerCase();
+  for (const pattern of STOP_SIGN_PATTERNS) {
+    if (pattern.test(lower)) return true;
+  }
+  return false;
+}
+
+// ======================================================================
 // HELPERS
 // ======================================================================
 
@@ -47,11 +116,11 @@ function parseDate(value: string | null | undefined): string | null {
 
 function cleanCompanyName(name: string): string {
   if (!name) return "";
-  return name.replace(/<[^>]+>/g, "").replace(/(\(\d+\))+\s*$/g, "").trim();
+  return name.replace(/<[^>]+>/g, "").replace(/(\(\d+\))+\s*$/g, "").replace(/&amp;/g, "&").trim();
 }
 
 function stripTags(html: string): string {
-  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function extractCellsWithColspan(rowHtml: string): string[] {
@@ -78,42 +147,44 @@ function extractCellsWithColspan(rowHtml: string): string[] {
 // ======================================================================
 
 // 1. OBDC SPECIALIST PARSER (Blue Owl)
-// Based on image columns: [0]Company, [1]Inv, [2]RefRate, [3]Cash, [4]PIK, [5]Mat, [6]Par, [7]Cost, [8]FV
+// Columns: [0]Company, [1]Inv, [2]RefRate, [3]Cash/Interest, [4]PIK, [5]Mat, [6]Par, [7]Cost, [8]FV
 function parseRow_OBDC(cells: string[], state: any): any | null {
-  // Need at least fair value column (index 8), allows for some variation
+  // Need at least fair value column
   if (cells.length < 8) return null;
 
   const company = cleanCompanyName(cells[0]);
-  if (!company || company.length < 3 || /(total|subtotal|balance)/i.test(company)) return null;
-
-  // Use fixed indices based on the specific OBDC table format
-  // Fallback to searching from end if length varies slightly
-  let fvIdx = 8;
-  let costIdx = 7;
-  let parIdx = 6;
   
-  if (cells.length < 9) {
-    // If table structure is shifted, assume last numeric is FV
-    const nums = cells.map((c, i) => ({ val: cleanNumeric(c), idx: i })).filter(x => x.val !== null);
-    if (nums.length > 0) {
-      fvIdx = nums[nums.length - 1].idx;
-      costIdx = fvIdx - 1;
-      parIdx = fvIdx - 2;
-    }
-  }
+  // STRICT BOUNCER: Check if this is a junk row
+  if (isJunkRow(company)) return null;
 
-  const fairVal = cleanNumeric(cells[fvIdx]);
-  const costVal = cleanNumeric(cells[costIdx]);
+  // Find numeric columns from the end
+  const numericCells = cells.map((c, i) => ({ val: cleanNumeric(c), idx: i, raw: c })).filter(x => x.val !== null);
+  
+  if (numericCells.length < 2) return null;
+  
+  // Fair Value = last numeric, Cost = second to last
+  const fvObj = numericCells[numericCells.length - 1];
+  const costObj = numericCells[numericCells.length - 2];
+  const parObj = numericCells.length >= 3 ? numericCells[numericCells.length - 3] : null;
+  
+  const fairVal = fvObj.val;
+  const costVal = costObj.val;
 
   if (fairVal === null || fairVal === 0) return null;
+
+  // OBDC specific column mapping:
+  // Col 2 = Reference Rate (e.g., "S+")
+  // Col 3 = Cash/Interest Rate (e.g., "5.50%")
+  const referenceRate = cells[2] || null;
+  const interestRate = cells[3] || null;
 
   return {
     company_name: company,
     investment_type: cells[1] || null,
-    reference_rate: cells[2] || null, // Col 2 is "Ref. Rate" (S+)
-    interest_rate: cells[3] || null,  // Col 3 is "Cash" (e.g. 4.50%)
+    reference_rate: referenceRate,
+    interest_rate: interestRate,
     maturity_date: parseDate(cells[5]),
-    par_amount: toMillions(cleanNumeric(cells[parIdx]), state.scale),
+    par_amount: parObj ? toMillions(parObj.val, state.scale) : null,
     cost: toMillions(costVal, state.scale),
     fair_value: toMillions(fairVal, state.scale),
     row_number: state.rowCount++
@@ -126,7 +197,9 @@ function parseRow_Generic(cells: string[], state: any): any | null {
   if (cells.length < 3) return null;
 
   const company = cleanCompanyName(cells[0]);
-  if (!company || company.length < 3 || /(total|subtotal)/i.test(company)) return null;
+  
+  // STRICT BOUNCER: Check if this is a junk row
+  if (isJunkRow(company)) return null;
 
   const nums = cells.map((c, i) => ({ val: cleanNumeric(c), idx: i })).filter(x => x.val !== null);
   if (nums.length < 2) return null;
@@ -152,6 +225,14 @@ function parseRow_Generic(cells: string[], state: any): any | null {
 
 // 3. DISPATCHER
 function parseRow(rowHtml: string, state: any): any | null {
+  // STOP SIGN CHECK: Before parsing, check if this row signals end of SOI
+  const rowText = stripTags(rowHtml);
+  if (state.inSOI && isStopSign(rowText)) {
+    state.done = true;
+    console.log(`🛑 Stop sign detected: "${rowText.substring(0, 60)}..."`);
+    return null;
+  }
+  
   const cells = extractCellsWithColspan(rowHtml);
   const ticker = (state.ticker || "").toUpperCase();
 
@@ -255,12 +336,15 @@ serve(async (req) => {
       console.log("✅ Found Schedule of Investments");
     }
     
-    // Check for SOI end
-    if (lowerChunk.includes("notes to consolidated") || 
-        lowerChunk.includes("notes to financial") ||
-        lowerChunk.includes("the accompanying notes are an integral part")) {
-      state.done = true;
-      console.log("✅ Found end of Schedule of Investments");
+    // GLOBAL STOP SIGN CHECK on entire chunk
+    if (state.inSOI) {
+      for (const pattern of STOP_SIGN_PATTERNS) {
+        if (pattern.test(lowerChunk)) {
+          state.done = true;
+          console.log("✅ Found end of Schedule of Investments (chunk-level stop sign)");
+          break;
+        }
+      }
     }
     
     // Parse rows from chunk
@@ -268,6 +352,9 @@ serve(async (req) => {
     const rowMatches = chunk.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi);
     
     for (const match of rowMatches) {
+      // Exit early if done flag is set
+      if (state.done) break;
+      
       if (!state.inSOI) continue;
       
       const rowHtml = match[0];
@@ -300,7 +387,7 @@ serve(async (req) => {
       current_byte_offset: nextOffset,
       total_file_size: totalSize,
       current_industry_state: state.currentIndustry,
-      parsed_successfully: isComplete && totalInserted > 0,
+      parsed_successfully: isComplete && (totalInserted > 0 || startOffset > 0),
       data_source: 'edge-parser'
     }).eq("id", filingId);
     
