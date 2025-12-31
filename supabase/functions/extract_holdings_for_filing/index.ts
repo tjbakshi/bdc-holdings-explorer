@@ -3244,7 +3244,9 @@ async function parseARCCTableAndInsert(params: {
       colIndices = { ...savedColIndices };
     }
 
-    // Process data rows
+    // Process data rows - ARCC uses a multi-row structure:
+    // Row type 1: Company name row (spans most columns, contains LLC/Inc/Corp)
+    // Row type 2+: Investment detail rows (investment type + financial data)
     let currentIndustry: string | null = globalCurrentIndustry;
     let currentCompany: string | null = globalCurrentCompany;
     const dataStartRow = 1;
@@ -3267,45 +3269,61 @@ async function parseARCCTableAndInsert(params: {
         return cells[Math.min(pos, cells.length - 1)] || null;
       };
 
-      // Check for industry header row
+      // Check for industry header row (few cells, all caps or title case, no company suffix)
       if (cells.length <= 3 && rowText.length > 3 && rowText.length < 100) {
         const potentialIndustry = rowText.replace(/[:\-–—]/g, '').trim();
         if (potentialIndustry && !/^(Total|Subtotal|Net\s|Balance)/i.test(potentialIndustry)) {
-          if (/^[A-Z]/.test(potentialIndustry) && !potentialIndustry.includes('LLC') && !potentialIndustry.includes('Inc')) {
+          // Industry headers are typically title case, no company suffixes
+          if (/^[A-Z]/.test(potentialIndustry) && !hasCompanySuffix(potentialIndustry) && 
+              !/first lien|second lien|senior secured|subordinated|preferred|common|warrant/i.test(potentialIndustry)) {
             currentIndustry = potentialIndustry;
             continue;
           }
         }
       }
 
-      const companyCell = getCellAtPos(colIndices.company);
-      const rawCompanyName = companyCell?.textContent?.trim() || '';
+      // ARCC MULTI-ROW DETECTION:
+      // Check if this row is a COMPANY NAME row (has company suffix in first cell, spans multiple columns)
+      const firstCellText = cells[0]?.textContent?.trim() || '';
+      const cleanedFirstCell = cleanCompanyName(firstCellText);
+      
+      // Company name rows typically:
+      // - Have a company suffix (LLC, Inc, Corp, L.P., etc.)
+      // - Have few cells (the name spans multiple columns)
+      // - Don't have investment type keywords
+      const isCompanyNameRow = hasCompanySuffix(cleanedFirstCell) && 
+        cells.length <= 4 &&
+        !/first lien|second lien|senior secured|subordinated|revolving|term loan|delayed draw/i.test(cleanedFirstCell);
 
+      if (isCompanyNameRow && cleanedFirstCell.length >= 3) {
+        // This is a company name row - update current company and skip to next row
+        currentCompany = cleanedFirstCell;
+        continue;
+      }
+
+      // This is an investment detail row
       // Skip total/summary rows
-      if (/^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(rawCompanyName)) continue;
+      if (/^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(rowText)) continue;
 
-      const cleanedName = cleanCompanyName(rawCompanyName);
-      let effectiveCompany = cleanedName;
-      if (cleanedName && hasCompanySuffix(cleanedName)) currentCompany = cleanedName;
-      else if (currentCompany && (!cleanedName || cleanedName.length < 5)) effectiveCompany = currentCompany;
-      else if (!cleanedName || cleanedName.length < 3) { totalRowsSkipped++; continue; }
+      // For investment rows, first cell is typically the investment type
+      let investmentType: string | null = null;
+      const investmentTypeText = cleanedFirstCell;
+      if (investmentTypeText && investmentTypeText.length > 2 && investmentTypeText.length < 150 &&
+          /first lien|second lien|senior secured|subordinated|preferred|common|warrant|revolving|term loan|membership|partnership|stock|equity/i.test(investmentTypeText)) {
+        investmentType = investmentTypeText;
+      }
 
+      // Get financial values from appropriate columns
       const fairValueCell = colIndices.fairValue >= 0 ? getCellAtPos(colIndices.fairValue) : null;
       const fairValue = cleanGBDCNumeric(fairValueCell?.textContent);
       const costCell = colIndices.cost >= 0 ? getCellAtPos(colIndices.cost) : null;
       const cost = cleanGBDCNumeric(costCell?.textContent);
 
+      // Skip rows without financial data or without a current company
       if (fairValue === null && cost === null) { totalRowsSkipped++; continue; }
-      if (!effectiveCompany || effectiveCompany.length < 3) { totalRowsSkipped++; continue; }
+      if (!currentCompany || currentCompany.length < 3) { totalRowsSkipped++; continue; }
 
       // Extract other fields
-      let investmentType: string | null = null;
-      if (colIndices.investmentType >= 0) {
-        const typeCell = getCellAtPos(colIndices.investmentType);
-        const typeText = typeCell?.textContent?.trim();
-        if (typeText && typeText.length > 2 && typeText.length < 150) investmentType = typeText;
-      }
-
       let interestRate: string | null = null;
       if (colIndices.interestRate >= 0) {
         const rateCell = getCellAtPos(colIndices.interestRate);
@@ -3328,12 +3346,13 @@ async function parseARCCTableAndInsert(params: {
       const maturityCell = colIndices.maturity >= 0 ? getCellAtPos(colIndices.maturity) : null;
       const maturityDate = parseDate(maturityCell?.textContent?.trim());
 
-      const key = `${effectiveCompany}|${investmentType || ""}|${fairValue || ""}|${cost || ""}`;
+      // Use current company (from company name row) as the company_name
+      const key = `${currentCompany}|${investmentType || ""}|${fairValue || ""}|${cost || ""}`;
       if (seen.has(key)) continue;
       seen.add(key);
 
       pending.push({
-        company_name: effectiveCompany,
+        company_name: currentCompany,
         investment_type: investmentType,
         industry: currentIndustry,
         description: null,
