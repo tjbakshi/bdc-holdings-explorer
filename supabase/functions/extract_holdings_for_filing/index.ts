@@ -1863,12 +1863,9 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       hasFoundFirstTable = true;
     }
     
-    // GBDC: Don't assume industry is in column 0 - GBDC uses industry header rows
-    // Reset industry column detection since GBDC doesn't have a dedicated industry column
-    if (colIndices.industry >= 0 && colIndices.company >= 1) {
-      // Don't use column-based industry for GBDC - rely on header row detection instead
-      colIndices.industry = -1;
-    }
+    // GBDC: Don't use column-based industry detection (column 0 contains random data)
+    // Instead, rely on industry header row detection in the main loop
+    colIndices.industry = -1;
     
     // Log column indices for debugging
     console.log(`   Table ${tableIdx + 1} columns: company=${colIndices.company}, industry=${colIndices.industry}, type=${colIndices.investmentType}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
@@ -1930,47 +1927,35 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
       const companyCell = getCellAtPos(colIndices.company);
       const rawCompanyName = companyCell?.textContent?.trim() || '';
       
-      // Debug: Log first few rows of each table to understand structure
-      if (i === dataStartRow || i === dataStartRow + 1) {
-        const cellsPreview = cells.slice(0, 6).map(c => (c.textContent?.trim() || '').slice(0, 25));
-        console.log(`   Row ${i}: [${cellsPreview.join(' | ')}]`);
-      }
+      // GBDC Industry Detection: Industry header rows have these characteristics:
+      // 1. First non-empty cell contains industry name (text, not numeric, not company suffix)
+      // 2. Row has relatively few non-empty cells (typically 1-4)
+      // 3. No company suffix pattern in the first cell
       
-      // GBDC-specific: Check first cell (column 0) for industry name
-      const firstCell = cells[0];
-      const firstCellText = firstCell?.textContent?.trim() || '';
-      
-      // Check if this row might be an industry header
-      const looksLikeIndustry = firstCellText.length > 3 && firstCellText.length < 80 &&
-          !/(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd|S\.A\.|GmbH)/i.test(firstCellText) &&
-          !/^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(firstCellText) &&
-          !/^(Portfolio|Borrower|Investment|Company|Fair Value|Cost|Par|Principal)/i.test(firstCellText) &&
-          !/^[\$\(\)\-\d,.\s%]+$/.test(firstCellText) &&
-          !/^\d/.test(firstCellText);
-      
-      // Industry headers: First cell has industry, company column (col 3) is empty or matches first cell
-      const companyMatchesFirst = rawCompanyName === firstCellText;
-      const companyIsEmpty = !rawCompanyName || rawCompanyName.length < 3 || /^[-—\s]+$/.test(rawCompanyName);
-      
-      if (looksLikeIndustry && (companyIsEmpty || companyMatchesFirst)) {
-        console.log(`   📌 Industry: "${firstCellText}"`);
-        currentIndustry = firstCellText;
-        globalCurrentIndustry = firstCellText;
-        continue;
-      }
-      
-      // Alternative: Check if this is an industry header based on row structure
-      // Industry rows typically have only 1-2 non-empty cells with the industry name
       const nonEmptyCells = cells.filter(c => {
         const t = c.textContent?.trim() || '';
-        return t.length > 2 && !/^[-—$\s]*$/.test(t);
+        return t.length > 1 && !/^[-—$\s]*$/.test(t);
       });
       
-      if (nonEmptyCells.length <= 2 && looksLikeIndustry) {
-        console.log(`   📌 Industry (sparse row): "${firstCellText}"`);
-        currentIndustry = firstCellText;
-        globalCurrentIndustry = firstCellText;
-        continue;
+      // Get first non-empty cell content
+      const firstNonEmptyCell = nonEmptyCells[0];
+      const firstCellText = firstNonEmptyCell?.textContent?.trim() || '';
+      
+      // Detect industry header row
+      if (nonEmptyCells.length <= 4 && firstCellText.length > 2 && firstCellText.length < 80) {
+        const hasCompanySuffix = /(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd|S\.A\.|GmbH)/i.test(firstCellText);
+        const isTotal = /^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(firstCellText);
+        const isHeader = /^(Portfolio|Borrower|Investment|Company|Fair Value|Cost|Par|Principal|Maturity)/i.test(firstCellText);
+        const isNumeric = /^[\$\(\)\-\d,.\s%]+$/.test(firstCellText);
+        const startsWithDigit = /^\d/.test(firstCellText);
+        
+        if (!hasCompanySuffix && !isTotal && !isHeader && !isNumeric && !startsWithDigit) {
+          // This looks like an industry header row
+          console.log(`   📌 Industry: "${firstCellText}" (cells: ${nonEmptyCells.length})`);
+          currentIndustry = firstCellText;
+          globalCurrentIndustry = firstCellText;
+          continue;
+        }
       }
       
       // Skip total/summary rows
