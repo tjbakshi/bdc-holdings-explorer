@@ -2065,10 +2065,34 @@ serve(async (req) => {
           const html = await fetchSecFile(docUrl);
           console.log(`   Size: ${(html.length / 1024).toFixed(0)} KB`);
           
-          // For very large documents (>5MB), extract just the SOI section to avoid memory issues
+          // For very large documents (>5MB), handle based on BDC parser type
           let textToParse = html;
           if (html.length > 5_000_000) {
-            console.log(`   📦 Large document (${(html.length / 1024 / 1024).toFixed(1)} MB), extracting SOI section...`);
+            console.log(`   📦 Large document (${(html.length / 1024 / 1024).toFixed(1)} MB)`);
+            
+            // For GBDC, use the specialist parser which handles large files differently
+            if (parserType === 'GBDC') {
+              console.log(`   🔀 GBDC detected - using specialist parser for large file`);
+              
+              // GBDC specialist parser has its own pre-processing and chunking
+              const gbdcResult = parseGBDCTable(html, debugMode);
+              holdings = gbdcResult.holdings;
+              scaleResult = gbdcResult.scaleResult;
+              
+              console.log(`   Result: ${holdings.length} holdings found (method: gbdc-specialist)`);
+              
+              if (holdings.length > 0) {
+                console.log(`✅ Successfully extracted ${holdings.length} holdings from ${doc.name} using gbdc-specialist`);
+                break;
+              } else {
+                // If GBDC parser didn't find holdings, continue to next document
+                console.log(`   ⚠️ GBDC specialist parser found no holdings, trying next document...`);
+                continue;
+              }
+            }
+            
+            // For ARCC and other BDCs, use the existing segmented-DOM approach
+            console.log(`   🔀 Using ARCC-style segmented parsing for large file`);
             
             // Find the boundaries of the Schedule of Investments section
             const lower = html.toLowerCase();
