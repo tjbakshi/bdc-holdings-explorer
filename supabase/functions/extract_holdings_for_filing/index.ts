@@ -1978,12 +1978,19 @@ function parseGBDCTable(html: string, debugMode = false): { holdings: Holding[];
           ind.includes(firstCellLower) || firstCellLower.includes(ind.split(' ')[0])
         );
       
-      if ((isExactGicsIndustry || isPartialGicsMatch) && firstPhysicalCellText.length < 80) {
+      // Additional check: Industry header rows have no financial data
+      const earlyFairValueCell = colIndices.fairValue >= 0 ? getCellAtPos(colIndices.fairValue) : null;
+      const earlyCostCell = colIndices.cost >= 0 ? getCellAtPos(colIndices.cost) : null;
+      const earlyFairValueText = earlyFairValueCell?.textContent?.trim() || '';
+      const earlyCostText = earlyCostCell?.textContent?.trim() || '';
+      const hasFinancialData = /[\d]/.test(earlyFairValueText) || /[\d]/.test(earlyCostText);
+      
+      if ((isExactGicsIndustry || isPartialGicsMatch) && firstPhysicalCellText.length < 80 && !hasFinancialData) {
         // Verify this isn't a company name that happens to contain industry keywords
         const hasCompanyPattern = /(LLC|Inc\.|Corp|Ltd|Limited|L\.P\.|Holdings|Partners|Buyer|Bidco|\+|\*|\(\d)/i.test(firstPhysicalCellText);
         
         if (!hasCompanyPattern) {
-          console.log(`   📌 Industry: "${firstPhysicalCellText}" (GICS match)`);
+          console.log(`   📌 Industry: "${firstPhysicalCellText}" (GICS match, no financial data)`);
           currentIndustry = firstPhysicalCellText;
           globalCurrentIndustry = firstPhysicalCellText;
           continue;
