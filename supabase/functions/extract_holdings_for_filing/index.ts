@@ -680,9 +680,11 @@ function isRealHolding(companyName: string, fairValue: number | null, cost: numb
     return { valid: false, reason: "Investment type label" };
   }
   
-  // Skip if matches any skip keywords
+  // Skip if matches any skip keywords (use word boundary matching to avoid false positives like "net" in "Benetech")
   for (const keyword of SKIP_KEYWORDS) {
-    if (lowerName.includes(keyword)) {
+    // Create a word boundary regex to match whole words only
+    const wordBoundaryRegex = new RegExp(`(^|\\s|[^a-z])${keyword}($|\\s|[^a-z])`, 'i');
+    if (wordBoundaryRegex.test(lowerName)) {
       return { valid: false, reason: `Contains skip keyword: "${keyword}"` };
     }
   }
