@@ -704,7 +704,7 @@ const BdcDetail = () => {
                       {/* Industry Breakdown */}
                       {industrySummary.length > 0 && (
                         <>
-                          <h4 className="text-sm font-semibold mb-3 text-muted-foreground uppercase tracking-wide">By Industry</h4>
+                          <h4 className="text-sm font-semibold mb-3 text-muted-foreground uppercase tracking-wide">Industry Breakdown</h4>
                           <div className="rounded-md border overflow-x-auto">
                             <Table>
                               <TableHeader>
