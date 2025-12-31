@@ -92,29 +92,44 @@ const BdcDetail = () => {
   const { data: holdings, isLoading: holdingsLoading } = useQuery({
     queryKey: ["holdings", selectedFilingId],
     queryFn: async () => {
-      const { data, error } = await supabase
-        .from("holdings")
-        .select("*")
-        .eq("filing_id", selectedFilingId);
-      
-      if (error) throw error;
-      
+      if (!selectedFilingId) return [];
+
+      // PostgREST has a default max of 1000 rows per request.
+      // Fetch in pages to ensure we pull the full Schedule of Investments.
+      const pageSize = 1000;
+      const all: any[] = [];
+      let from = 0;
+
+      while (true) {
+        const to = from + pageSize - 1;
+        const { data, error } = await supabase
+          .from("holdings")
+          .select("*")
+          .eq("filing_id", selectedFilingId)
+          .range(from, to);
+
+        if (error) throw error;
+        const rows = data ?? [];
+        all.push(...rows);
+
+        if (rows.length < pageSize) break;
+        from += pageSize;
+      }
+
       // Sort client-side: by industry (alphabetically), then by company name within each industry
       // This ensures consistent visual ordering regardless of HTML source position
-      if (data) {
-        data.sort((a, b) => {
-          // First sort by industry (nulls/unknown last)
-          const industryA = a.industry || 'zzz_Unknown';
-          const industryB = b.industry || 'zzz_Unknown';
-          const industryCompare = industryA.localeCompare(industryB);
-          if (industryCompare !== 0) return industryCompare;
-          
-          // Within same industry, sort alphabetically by company name
-          return a.company_name.localeCompare(b.company_name);
-        });
-      }
-      
-      return data;
+      all.sort((a, b) => {
+        // First sort by industry (nulls/unknown last)
+        const industryA = a.industry || "zzz_Unknown";
+        const industryB = b.industry || "zzz_Unknown";
+        const industryCompare = industryA.localeCompare(industryB);
+        if (industryCompare !== 0) return industryCompare;
+
+        // Within same industry, sort alphabetically by company name
+        return a.company_name.localeCompare(b.company_name);
+      });
+
+      return all;
     },
     enabled: !!selectedFilingId,
   });
