@@ -114,6 +114,7 @@ export type Database = {
           investment_type: string | null
           maturity_date: string | null
           par_amount: number | null
+          period_date: string | null
           reference_rate: string | null
           row_number: number | null
           source_pos: number | null
@@ -131,6 +132,7 @@ export type Database = {
           investment_type?: string | null
           maturity_date?: string | null
           par_amount?: number | null
+          period_date?: string | null
           reference_rate?: string | null
           row_number?: number | null
           source_pos?: number | null
@@ -148,6 +150,7 @@ export type Database = {
           investment_type?: string | null
           maturity_date?: string | null
           par_amount?: number | null
+          period_date?: string | null
           reference_rate?: string | null
           row_number?: number | null
           source_pos?: number | null

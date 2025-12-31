@@ -21,6 +21,7 @@ interface Holding {
   cost?: number | null;
   fair_value?: number | null;
   source_pos?: number; // Approximate character position in original HTML
+  period_date?: string | null; // The period date from the SOI header (e.g., "2025-09-30")
 }
 
 interface ScaleDetectionResult {
@@ -2293,10 +2294,18 @@ async function parseBXSLTableAndInsert(params: {
   const soiHeaderSection = html.slice(soiStart, Math.min(soiStart + 2000, html.length));
   const datePattern = /(?:as\s+of\s+)?(\w+\s+\d{1,2},?\s+\d{4})/i;
   const dateMatch = datePattern.exec(soiHeaderSection);
-  const targetPeriodDate = dateMatch?.[1]?.trim() || null;
+  const targetPeriodDateText = dateMatch?.[1]?.trim() || null;
   
-  if (targetPeriodDate) {
-    console.log(`🔧 BXSL: Extraction target confirmed for period: ${targetPeriodDate}`);
+  // Convert text date to ISO format for database storage
+  let periodDateISO: string | null = null;
+  if (targetPeriodDateText) {
+    console.log(`🔧 BXSL: Extraction target confirmed for period: ${targetPeriodDateText}`);
+    // Parse "September 30, 2025" to "2025-09-30"
+    const parsed = new Date(targetPeriodDateText);
+    if (!isNaN(parsed.getTime())) {
+      periodDateISO = parsed.toISOString().split('T')[0];
+      console.log(`   📅 Period date parsed: ${periodDateISO}`);
+    }
   } else {
     console.log(`⚠️ BXSL: Could not extract period date from SOI header`);
   }
@@ -2373,6 +2382,7 @@ async function parseBXSLTableAndInsert(params: {
       fair_value: toMillions(h.fair_value, scaleResult.scale),
       row_number: insertedCount + idx + 1,
       source_pos: h.source_pos ?? null,
+      period_date: periodDateISO,
     }));
 
     const { error: insertError } = await supabaseClient.from("holdings").insert(rows as any);
@@ -2675,7 +2685,7 @@ async function parseBXSLTableAndInsert(params: {
   console.log(`\n🟣 BXSL STREAMING: Completed - inserted ${insertedCount} holdings from ${holdingsTableCount} tables (${totalProcessedRows} processed, ${totalRowsSkipped} skipped)`);
 
   // Fallback warning if no current period data was found
-  if (insertedCount === 0 && targetPeriodDate) {
+  if (insertedCount === 0 && targetPeriodDateText) {
     console.log(`⚠️ BXSL: Current period table not found; check for date formatting variations.`);
   }
 
