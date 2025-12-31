@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { DOMParser, Element } from "https://deno.land/x/deno_dom@v0.1.38/deno-dom-wasm.ts";
+// 🟢 LIGHTWEIGHT DOM PARSER (Fixes Error 546)
+import { parseHTML } from "https://esm.sh/linkedom";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -18,15 +19,17 @@ function detectScale(html: string): number {
   if (/\(in millions\)/.test(headerText) || /amounts?\s+in\s+millions/.test(headerText)) {
     return 1;
   }
-  return 0.001; // Default to thousands
+  return 0.001;
 }
 
 function cleanNumeric(value: string | null | undefined): number | null {
   if (!value) return null;
   let cleaned = value.replace(/[$,\s]/g, '').trim();
   if (!cleaned || cleaned === '-' || cleaned === '—' || cleaned === '') return null;
+  
   const isNegative = cleaned.startsWith('(') && cleaned.endsWith(')');
   if (isNegative) cleaned = cleaned.slice(1, -1);
+  
   const parsed = parseFloat(cleaned);
   return isNaN(parsed) ? null : (isNegative ? -parsed : parsed);
 }
@@ -51,7 +54,8 @@ function parseDate(value: string | null | undefined): string | null {
 
 function cleanCompanyName(name: string): string {
   if (!name) return "";
-  return name.replace(/(\(\d+\))+\s*$/g, "").trim();
+  // Strip tags manually just in case LinkeDOM leaves some
+  return name.replace(/<[^>]+>/g, "").replace(/(\(\d+\))+\s*$/g, "").trim();
 }
 
 function hasCompanySuffix(name: string): boolean {
@@ -59,15 +63,59 @@ function hasCompanySuffix(name: string): boolean {
 }
 
 // ======================================================================
-// 1. GBDC SPECIFIC PARSER (Chunked DOM)
-// Preserves GBDC-specific column mapping logic
+// UNIVERSAL SCOPING LOGIC ("The Date Gate")
+// ======================================================================
+
+function getTargetContentSlice(html: string): string {
+  const lower = html.toLowerCase();
+  
+  // 1. FIND START: First "Schedule of Investments" (skip TOC)
+  const startSearchPos = Math.floor(html.length * 0.05); 
+  const startIdx = lower.indexOf("schedule of investments", startSearchPos);
+  
+  if (startIdx === -1) {
+    console.log("❌ Could not find 'Schedule of Investments' header.");
+    return "";
+  }
+
+  // 2. FIND END: The START of the Prior Period or Notes
+  let endIdx = lower.length;
+  
+  const endMarkers = [
+    "notes to consolidated financial statements",
+    "notes to financial statements",
+    "consolidated statements of operations"
+  ];
+  
+  for (const marker of endMarkers) {
+    const markerPos = lower.indexOf(marker, startIdx + 5000); 
+    if (markerPos !== -1 && markerPos < endIdx) {
+      endIdx = markerPos;
+    }
+  }
+
+  // STOP before the Prior Period (e.g. 12/31/2024)
+  // Scan for the *next* "Schedule of Investments" header
+  const nextSoiIdx = lower.indexOf("schedule of investments", startIdx + 50000);
+  if (nextSoiIdx !== -1 && nextSoiIdx < endIdx) {
+    console.log("✂️ Cutting off Prior Period data at index " + nextSoiIdx);
+    endIdx = nextSoiIdx;
+  }
+
+  console.log(`✅ Scoped: Extracted ${(endIdx - startIdx) / 1024} KB of Current Quarter data.`);
+  return html.slice(startIdx, endIdx);
+}
+
+// ======================================================================
+// 1. GBDC PARSER (DOM - LinkeDOM)
 // ======================================================================
 async function parseGBDC(html: string, filingId: string, supabaseClient: any, scale: number) {
-  console.log("📘 Running GBDC Specific Parser...");
+  console.log("📘 Running GBDC Parser (LinkeDOM)...");
   
-  const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(html);
-  if (!soiMatch) return 0;
-  const content = html.slice(soiMatch.index);
+  const content = getTargetContentSlice(html);
+  if (!content) return 0;
+
+  // Regex to find table boundaries (Cheap)
   const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
   
   await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
@@ -80,15 +128,15 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
   while ((tableMatch = tableRe.exec(content)) !== null) {
     const tableHtml = tableMatch[0];
     
-    // GBDC Filter: Must have typical GBDC keywords or company suffixes
-    if (!/(llc|inc\.|corp\.|l\.p\.|limited|\$|fair value)/i.test(tableHtml)) continue;
+    // Valid table check
+    if (!/\$/.test(tableHtml)) continue;
 
-    const doc = new DOMParser().parseFromString(tableHtml, "text/html");
-    if (!doc) continue;
-    const rows = Array.from(doc.querySelectorAll("tr"));
+    // DOM PARSING (Lightweight)
+    const { document } = parseHTML(tableHtml);
+    const rows = Array.from(document.querySelectorAll("tr"));
     if (rows.length < 3) continue;
 
-    // --- GBDC LOGIC START ---
+    // GBDC Column Mapping
     let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
     let dataStart = 0;
 
@@ -96,15 +144,14 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
       const cells = Array.from(rows[i].querySelectorAll("td, th"));
       let cIdx = 0;
       for (const cell of cells) {
-        const txt = cell.textContent.toLowerCase();
+        const txt = (cell.textContent || "").toLowerCase();
         const span = parseInt(cell.getAttribute("colspan") || "1");
         
-        // GBDC Specific Headers
         if (txt.includes('company') && !txt.includes('type') && col.company === -1) col.company = cIdx;
         if (txt.includes('type') && col.type === -1) col.type = cIdx;
         if (txt.includes('industry') && col.industry === -1) col.industry = cIdx;
         if (txt.includes('interest') && col.interest === -1) col.interest = cIdx;
-        if ((txt.includes('spread') || txt.includes('floor')) && col.interest === -1) col.interest = cIdx; // GBDC often puts spread next to rate
+        if ((txt.includes('spread') || txt.includes('floor')) && col.interest === -1) col.interest = cIdx;
         if (txt.includes('maturity') && col.maturity === -1) col.maturity = cIdx;
         if ((txt.includes('principal') || txt.includes('par')) && col.par === -1) col.par = cIdx;
         if (txt.includes('cost') && col.cost === -1) col.cost = cIdx;
@@ -112,20 +159,23 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
         
         cIdx += span;
       }
-      if (col.company > -1 || col.fair > -1) { dataStart = i + 1; if (col.fair > -1) break; }
+      if (col.company > -1 || col.fair > -1) { 
+        dataStart = i + 1; 
+        if (col.fair > -1) break; 
+      }
     }
     
-    // GBDC Fallback
     if (col.company === -1) col.company = 0;
-
     let currentCompany = null;
     let currentIndustry = null;
 
     for (let i = dataStart; i < rows.length; i++) {
       const cells = Array.from(rows[i].querySelectorAll("td, th"));
+      
+      // Flatten colspans
       const flatCells: string[] = [];
       cells.forEach(c => {
-          const txt = c.textContent.trim();
+          const txt = c.textContent?.trim() || "";
           const span = parseInt(c.getAttribute("colspan") || "1");
           flatCells.push(txt);
           for(let k=1; k<span; k++) flatCells.push("");
@@ -142,7 +192,6 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
       else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
       else if (!comp) continue;
 
-      // GBDC sometimes lists industry in a column
       if (col.industry > -1 && flatCells[col.industry] && flatCells[col.industry].length > 3) currentIndustry = flatCells[col.industry];
 
       const fairVal = col.fair > -1 ? cleanNumeric(flatCells[col.fair]) : cleanNumeric(flatCells[flatCells.length - 1]);
@@ -166,12 +215,11 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
         fair_value: toMillions(fairVal, scale),
         row_number: insertedCount + pendingRows.length + 1
       });
-    }
-    // --- GBDC LOGIC END ---
 
-    if (pendingRows.length >= 200) {
-      await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
-      insertedCount += 200;
+      if (pendingRows.length >= 200) {
+        await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
+        insertedCount += 200;
+      }
     }
   }
   if (pendingRows.length > 0) {
@@ -182,17 +230,16 @@ async function parseGBDC(html: string, filingId: string, supabaseClient: any, sc
 }
 
 // ======================================================================
-// 2. BXSL SPECIFIC PARSER (Chunked DOM)
-// Preserves BXSL-specific headers (Reference Rate, Spread)
+// 2. BXSL PARSER (DOM - LinkeDOM)
 // ======================================================================
 async function parseBXSL(html: string, filingId: string, supabaseClient: any, scale: number) {
-  console.log("🟣 Running BXSL Specific Parser...");
+  console.log("🟣 Running BXSL Parser (LinkeDOM)...");
+  
+  const content = getTargetContentSlice(html);
+  if (!content) return 0;
 
-  const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(html);
-  if (!soiMatch) return 0;
-  const content = html.slice(soiMatch.index);
   const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
-
+  
   await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
 
   let insertedCount = 0;
@@ -202,13 +249,11 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
 
   while ((tableMatch = tableRe.exec(content)) !== null) {
     const tableHtml = tableMatch[0];
-    if (!/(llc|inc\.|corp\.|limited|\$|fair value)/i.test(tableHtml)) continue;
+    if (!/\$/.test(tableHtml)) continue;
 
-    const doc = new DOMParser().parseFromString(tableHtml, "text/html");
-    if (!doc) continue;
-    const rows = Array.from(doc.querySelectorAll("tr"));
+    const { document } = parseHTML(tableHtml);
+    const rows = Array.from(document.querySelectorAll("tr"));
     
-    // --- BXSL LOGIC START ---
     let col = { company: -1, industry: -1, type: -1, interest: -1, spread: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
     let dataStart = 0;
 
@@ -216,10 +261,9 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
       const cells = Array.from(rows[i].querySelectorAll("td, th"));
       let cIdx = 0;
       for (const cell of cells) {
-        const txt = cell.textContent.toLowerCase();
+        const txt = (cell.textContent || "").toLowerCase();
         const span = parseInt(cell.getAttribute("colspan") || "1");
 
-        // BXSL Specific Headers
         if ((txt.includes('company') || txt.includes('investments')) && !txt.includes('type') && col.company === -1) col.company = cIdx;
         if ((txt.includes('industry') || txt.includes('sector')) && col.industry === -1) col.industry = cIdx;
         if (txt.includes('type') && col.type === -1) col.type = cIdx;
@@ -231,7 +275,7 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
         if (txt.includes('fair') && col.fair === -1) col.fair = cIdx;
         cIdx += span;
       }
-      if (col.company > -1 || col.fair > -1) { dataStart = i + 1; if (col.fair > -1) break; }
+      if (col.company > -1) { dataStart = i + 1; break; }
     }
     
     if (col.company === -1) col.company = 0;
@@ -242,7 +286,7 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
       const cells = Array.from(rows[i].querySelectorAll("td, th"));
       const flatCells: string[] = [];
       cells.forEach(c => {
-          const txt = c.textContent.trim();
+          const txt = c.textContent?.trim() || "";
           const span = parseInt(c.getAttribute("colspan") || "1");
           flatCells.push(txt);
           for(let k=1; k<span; k++) flatCells.push("");
@@ -259,7 +303,6 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
       else if (currentCompany && (!comp || comp.length < 5)) effectiveComp = currentCompany;
       else if (!comp) continue;
 
-      // BXSL: Industry is usually a dedicated column
       if (col.industry > -1 && flatCells[col.industry] && flatCells[col.industry].length > 3) currentIndustry = flatCells[col.industry];
 
       const fairVal = col.fair > -1 ? cleanNumeric(flatCells[col.fair]) : cleanNumeric(flatCells[flatCells.length - 1]);
@@ -278,7 +321,7 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
         filing_id: filingId,
         company_name: effectiveComp,
         investment_type: col.type > -1 ? flatCells[col.type] : null,
-        industry: currentIndustry,
+        industry: col.industry > -1 ? flatCells[col.industry] : currentIndustry,
         interest_rate: col.interest > -1 ? flatCells[col.interest] : null,
         reference_rate: refRate,
         maturity_date: col.maturity > -1 ? parseDate(flatCells[col.maturity]) : null,
@@ -287,12 +330,11 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
         fair_value: toMillions(fairVal, scale),
         row_number: insertedCount + pendingRows.length + 1
       });
-    }
-    // --- BXSL LOGIC END ---
 
-    if (pendingRows.length >= 200) {
-      await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
-      insertedCount += 200;
+      if (pendingRows.length >= 200) {
+        await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
+        insertedCount += 200;
+      }
     }
   }
 
@@ -304,15 +346,14 @@ async function parseBXSL(html: string, filingId: string, supabaseClient: any, sc
 }
 
 // ======================================================================
-// 3. ARCC / GENERIC PARSER (Chunked DOM)
-// Handles ARCC's "Industry Header Rows" logic
+// 3. ARCC PARSER (DOM - LinkeDOM)
 // ======================================================================
 async function parseARCC(html: string, filingId: string, supabaseClient: any, scale: number) {
-  console.log("📘 Running ARCC Specific Parser...");
+  console.log("📘 Running ARCC Parser (LinkeDOM)...");
   
-  const soiMatch = /(consolidated schedule of investments|schedule of investments)/i.exec(html);
-  if (!soiMatch) return 0;
-  const content = html.slice(soiMatch.index);
+  const content = getTargetContentSlice(html);
+  if (!content) return 0;
+
   const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
 
   await supabaseClient.from("holdings").delete().eq("filing_id", filingId);
@@ -324,11 +365,10 @@ async function parseARCC(html: string, filingId: string, supabaseClient: any, sc
 
   while ((tableMatch = tableRe.exec(content)) !== null) {
     const tableHtml = tableMatch[0];
-    if (!/(llc|inc|corp|l\.p\.|limited|\$|fair value)/i.test(tableHtml)) continue;
+    if (!/(\$|fair value)/i.test(tableHtml)) continue;
 
-    const doc = new DOMParser().parseFromString(tableHtml, "text/html");
-    if (!doc) continue;
-    const rows = Array.from(doc.querySelectorAll("tr"));
+    const { document } = parseHTML(tableHtml);
+    const rows = Array.from(document.querySelectorAll("tr"));
 
     // --- ARCC LOGIC START ---
     let col = { company: -1, type: -1, industry: -1, interest: -1, maturity: -1, par: -1, cost: -1, fair: -1 };
@@ -338,7 +378,7 @@ async function parseARCC(html: string, filingId: string, supabaseClient: any, sc
       const cells = Array.from(rows[i].querySelectorAll("td, th"));
       let cIdx = 0;
       for (const cell of cells) {
-        const txt = cell.textContent.toLowerCase();
+        const txt = (cell.textContent || "").toLowerCase();
         const span = parseInt(cell.getAttribute("colspan") || "1");
         
         if ((txt.includes('company') || txt.includes('issuer')) && !txt.includes('type') && col.company === -1) col.company = cIdx;
@@ -351,7 +391,7 @@ async function parseARCC(html: string, filingId: string, supabaseClient: any, sc
         if (txt.includes('fair') && col.fair === -1) col.fair = cIdx;
         cIdx += span;
       }
-      if (col.company > -1 || col.fair > -1) { dataStart = i + 1; if (col.fair > -1) break; }
+      if (col.company > -1 || col.fair > -1) { dataStart = i + 1; break; }
     }
     
     if (col.company === -1) col.company = 0;
@@ -362,7 +402,7 @@ async function parseARCC(html: string, filingId: string, supabaseClient: any, sc
       const cells = Array.from(rows[i].querySelectorAll("td, th"));
       const flatCells: string[] = [];
       cells.forEach(c => {
-          const txt = c.textContent.trim();
+          const txt = c.textContent?.trim() || "";
           const span = parseInt(c.getAttribute("colspan") || "1");
           flatCells.push(txt);
           for(let k=1; k<span; k++) flatCells.push("");
@@ -370,12 +410,12 @@ async function parseARCC(html: string, filingId: string, supabaseClient: any, sc
 
       if (flatCells.length < 3) continue;
 
-      // ARCC Specific: Industry is often a row header
-      if (cells.length === 1 || (flatCells[0] && flatCells.slice(1).every(x => !x))) {
-          const header = flatCells[0];
-          if (header.length > 3 && !hasCompanySuffix(header) && !/(total|subtotal)/i.test(header)) {
-              currentIndustry = header;
-              continue;
+      const firstText = flatCells[0];
+      const hasNumbers = flatCells.slice(1).some(x => /\d/.test(x));
+      if (firstText && firstText.length > 3 && !hasNumbers && !/(company|issuer|total)/i.test(firstText)) {
+          if (!hasCompanySuffix(firstText)) {
+             currentIndustry = firstText;
+             continue;
           }
       }
 
@@ -409,12 +449,11 @@ async function parseARCC(html: string, filingId: string, supabaseClient: any, sc
         fair_value: toMillions(fairVal, scale),
         row_number: insertedCount + pendingRows.length + 1
       });
-    }
-    // --- ARCC LOGIC END ---
 
-    if (pendingRows.length >= 200) {
-      await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
-      insertedCount += 200;
+      if (pendingRows.length >= 200) {
+        await supabaseClient.from("holdings").insert(pendingRows.splice(0, pendingRows.length));
+        insertedCount += 200;
+      }
     }
   }
   if (pendingRows.length > 0) {
@@ -477,7 +516,7 @@ serve(async (req) => {
     const htmDocs = docs.filter((d: any) => d.name.endsWith(".htm") || d.name.endsWith(".html"));
     if (htmDocs.length === 0) throw new Error("No HTML found");
 
-    // Process largest file (most likely to contain schedule)
+    // Process largest file
     const targetDoc = htmDocs.sort((a: any, b: any) => parseInt(b.size) - parseInt(a.size))[0];
     const docUrl = `https://www.sec.gov/Archives/edgar/data/${paddedCik}/${accNoClean}/${targetDoc.name}`;
     
