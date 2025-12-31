@@ -1,6 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { TextLineStream } from "https://deno.land/std@0.168.0/streams/mod.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -50,16 +49,20 @@ function isJunkRow(text: string): boolean {
 
 function cleanNumeric(value: string | null | undefined): number | null {
   if (!value) return null;
-  let cleaned = value.replace(/[$,\s]/g, '').trim();
-  cleaned = cleaned.replace(/&nbsp;/g, '').replace(/&#160;/g, '');
-  
-  if (!cleaned || cleaned === '-' || cleaned === '—' || cleaned === '') return null;
-  
-  const isNegative = cleaned.startsWith('(') && cleaned.endsWith(')');
+
+  // Avoid parsing percentages (interest rates) as numeric amounts.
+  if (/%/.test(value)) return null;
+
+  let cleaned = value.replace(/[$,\s]/g, "").trim();
+  if (!cleaned || cleaned === "-" || cleaned === "—") return null;
+
+  const isNegative = cleaned.startsWith("(") && cleaned.endsWith(")");
   if (isNegative) cleaned = cleaned.slice(1, -1);
-  
-  const parsed = parseFloat(cleaned);
-  return isNaN(parsed) ? null : (isNegative ? -parsed : parsed);
+
+  if (!cleaned || /^(n\/?a|null)$/i.test(cleaned)) return null;
+
+  const parsed = Number.parseFloat(cleaned);
+  return Number.isNaN(parsed) ? null : isNegative ? -parsed : parsed;
 }
 
 function toMillions(value: number | null | undefined, scale: number): number | null {
@@ -373,19 +376,34 @@ serve(async (req) => {
     const chunk = await response.text();
     const processLine = getProcessor(ticker, bdc_name);
     
-    // Restore state
-    const state = { 
-      inSOI: startOffset > 0, 
-      done: false, 
-      scale: 0.001, 
-      scaleDetected: false, 
-      rowCount: 0,
-      ticker: ticker // Pass for switching if needed
+    // Restore state (persisted between chunk calls in filings.current_industry_state)
+    let prev: any = null;
+    try {
+      const raw = (filing.current_industry_state ?? "").trim();
+      if (raw.startsWith("{")) prev = JSON.parse(raw);
+    } catch {
+      prev = null;
+    }
+
+    const state: any = {
+      inSOI: prev?.inSOI ?? false,
+      done: false,
+      scale: prev?.scale ?? 0.001,
+      scaleDetected: prev?.scaleDetected ?? false,
+      rowCount: prev?.rowCount ?? 0,
+      inRow: false,
+      currentRow: "",
+      carry: prev?.carry ?? "",
     };
-    
+    // Combine with any carryover from a previous chunk so we don't lose rows split across boundaries
+    const combinedHtml = state.carry + chunk;
+    const lastClose = combinedHtml.lastIndexOf("</tr>");
+    const parseHtml = lastClose >= 0 ? combinedHtml.slice(0, lastClose + 5) : "";
+    state.carry = lastClose >= 0 ? combinedHtml.slice(lastClose + 5) : combinedHtml;
+
     const batch: any[] = [];
-    const rowMatches = chunk.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi);
-    
+    const rowMatches = parseHtml.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi);
+
     for (const match of rowMatches) {
       if (state.done) break;
       const result = processLine(match[0], state);
@@ -402,9 +420,21 @@ serve(async (req) => {
     const isComplete = state.done || endOffset >= totalSize;
     const nextOffset = isComplete ? 0 : endOffset;
     
+    const persistedState = isComplete
+      ? null
+      : JSON.stringify({
+          inSOI: state.inSOI,
+          scale: state.scale,
+          scaleDetected: state.scaleDetected,
+          rowCount: state.rowCount,
+          carry: state.carry,
+        });
+
     await supabaseClient.from("filings").update({ 
       current_byte_offset: nextOffset,
-      parsed_successfully: isComplete && totalInserted > 0
+      total_file_size: totalSize,
+      current_industry_state: persistedState,
+      parsed_successfully: isComplete && totalInserted > 0,
     }).eq("id", filingId);
     
     return new Response(JSON.stringify({ 
@@ -415,6 +445,11 @@ serve(async (req) => {
     }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
 
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: corsHeaders });
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("Parse error:", message);
+    return new Response(JSON.stringify({ error: message }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 });
