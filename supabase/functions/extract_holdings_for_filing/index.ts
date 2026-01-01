@@ -4131,9 +4131,24 @@ serve(async (req) => {
       // IMPORTANT: First priority should be docs matching the ticker name (e.g., obdc-20250930.htm for OBDC)
       const tickerLower = ticker?.toLowerCase() || '';
       
+      // CGBD special case: main filing uses "csl" (Carlyle Secured Lending) prefix, not "cgbd"
+      const bdcNameLower = bdcName?.toLowerCase() || '';
+      const isCGBD = tickerLower === 'cgbd' || bdcNameLower.includes('carlyle');
+      
       const prioritizedDocs = [...htmDocs].sort((a: any, b: any) => {
         const aName = a.name.toLowerCase();
         const bName = b.name.toLowerCase();
+        const aSize = parseInt(a.size) || 0;
+        const bSize = parseInt(b.size) || 0;
+        
+        // CGBD: Main filing document is csl-YYYYMMDD.htm (e.g., csl-20250930.htm)
+        // This should be highest priority for CGBD
+        if (isCGBD) {
+          const aIsCslMain = /^csl-\d{8}\.htm$/i.test(aName);
+          const bIsCslMain = /^csl-\d{8}\.htm$/i.test(bName);
+          if (aIsCslMain && !bIsCslMain) return -1;
+          if (!aIsCslMain && bIsCslMain) return 1;
+        }
         
         // HIGHEST priority: documents starting with the ticker (e.g., obdc-20250930.htm for OBDC)
         // This is the main filing document and should be tried first
@@ -4152,6 +4167,14 @@ serve(async (req) => {
         if (a.type === "primary" && b.type !== "primary") return -1;
         if (a.type !== "primary" && b.type === "primary") return 1;
         
+        // Deprioritize exhibit documents for CGBD (cgbd_* files are usually exhibits)
+        if (isCGBD) {
+          const aIsExhibit = aName.startsWith('cgbd_') && aName.includes('ex');
+          const bIsExhibit = bName.startsWith('cgbd_') && bName.includes('ex');
+          if (!aIsExhibit && bIsExhibit) return -1;
+          if (aIsExhibit && !bIsExhibit) return 1;
+        }
+        
         // Deprioritize subsidiary documents (often contain LLC, Holdings, etc. in name)
         const aIsSubsidiary = aName.includes("llc") || aName.includes("holdings") || aName.includes("credit");
         const bIsSubsidiary = bName.includes("llc") || bName.includes("holdings") || bName.includes("credit");
@@ -4165,8 +4188,6 @@ serve(async (req) => {
         if (aHasUnderscore && !bHasUnderscore) return 1;
         
         // Prefer larger documents (more likely to contain full SOI)
-        const aSize = parseInt(a.size) || 0;
-        const bSize = parseInt(b.size) || 0;
         if (aSize > bSize) return -1;
         if (aSize < bSize) return 1;
         
