@@ -3193,6 +3193,10 @@ async function parseCGBDTableAndInsert(params: {
   const seen = new Set<string>();
   const pending: Holding[] = [];
   let globalCurrentIndustry: string | null = null;
+  
+  // STATE-AWARE PARSER: Investment Type is stored in section headers that span multiple columns
+  // We detect headers like "First Lien Debt", "Second Lien Debt", "Equity" and apply to subsequent rows
+  let globalCurrentInvestmentType: string | null = null;
 
   // CGBD-specific column indices
   let savedColIndices = {
@@ -3418,8 +3422,76 @@ async function parseCGBDTableAndInsert(params: {
 
     let currentIndustry: string | null = globalCurrentIndustry;
     let currentCompany: string | null = null;
+    let currentInvestmentType: string | null = globalCurrentInvestmentType;
 
-    for (let i = dataStartRow; i < rows.length && insertedCount + pending.length < MAX_HOLDINGS; i++) {
+    // ============================================================================
+    // STATE-AWARE INVESTMENT TYPE DETECTION
+    // CGBD uses section headers like "First Lien Debt" that span multiple columns
+    // These headers apply to ALL subsequent data rows until a new header is found
+    // ============================================================================
+    const investmentTypePatterns = [
+      { pattern: /first\s*lien\s*(senior\s*)?(secured\s*)?debt/i, type: "First Lien Debt" },
+      { pattern: /second\s*lien\s*(secured\s*)?debt/i, type: "Second Lien Debt" },
+      { pattern: /third\s*lien\s*debt/i, type: "Third Lien Debt" },
+      { pattern: /senior\s*secured\s*(first\s*lien\s*)?debt/i, type: "First Lien Debt" },
+      { pattern: /senior\s*secured\s*second\s*lien/i, type: "Second Lien Debt" },
+      { pattern: /subordinated\s*debt/i, type: "Subordinated Debt" },
+      { pattern: /mezzanine\s*debt/i, type: "Mezzanine Debt" },
+      { pattern: /unsecured\s*debt/i, type: "Unsecured Debt" },
+      { pattern: /equity\s*investments?/i, type: "Equity" },
+      { pattern: /preferred\s*(stock|equity)/i, type: "Preferred Equity" },
+      { pattern: /common\s*(stock|equity)/i, type: "Common Equity" },
+      { pattern: /warrant/i, type: "Warrants" },
+      { pattern: /unfunded\s*(commitments|delayed\s*draw)/i, type: "Unfunded Commitments" },
+      { pattern: /revolving\s*(credit|loan|facility)/i, type: "Revolving Credit" },
+      { pattern: /delayed\s*draw/i, type: "Delayed Draw" },
+      { pattern: /unitranche/i, type: "Unitranche" },
+    ];
+
+    // Helper to detect if a row is an investment type section header
+    const detectInvestmentTypeHeader = (row: Element, cells: Element[]): string | null => {
+      // Investment type headers typically:
+      // 1. Have a cell with colspan > 1 (spanning multiple columns)
+      // 2. Contain keywords like "First Lien Debt", "Equity", etc.
+      // 3. Have mostly empty remaining cells OR only have 1-2 cells total
+
+      for (const cell of cells) {
+        const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+        const cellText = cell.textContent?.trim() || "";
+        
+        // Look for cells with colspan (spanning header) OR bold/strong text
+        const hasSpan = colspan >= 2;
+        const hasBold = cell.querySelector("b, strong") !== null;
+        const isLikelyHeader = hasSpan || hasBold || cells.length <= 3;
+        
+        if (isLikelyHeader && cellText.length > 5 && cellText.length < 200) {
+          for (const { pattern, type } of investmentTypePatterns) {
+            if (pattern.test(cellText)) {
+              return type;
+            }
+          }
+        }
+      }
+      
+      // Also check full row text for investment type keywords (some filings don't use colspan)
+      const rowText = row.textContent?.trim() || "";
+      if (rowText.length > 5 && rowText.length < 200) {
+        for (const { pattern, type } of investmentTypePatterns) {
+          if (pattern.test(rowText)) {
+            // Make sure this doesn't look like a data row (no numeric financial data)
+            const hasFinancialData = /\$\s*[\d,]+/.test(rowText) || /[\d,]+\.\d{2}/.test(rowText);
+            const hasCompanySuffix = /(LLC|Inc\.|Corp\.|L\.P\.|LP|Ltd\.)/i.test(rowText);
+            if (!hasFinancialData && !hasCompanySuffix) {
+              return type;
+            }
+          }
+        }
+      }
+      
+      return null;
+    };
+
+    for (let i = 0; i < rows.length && insertedCount + pending.length < MAX_HOLDINGS; i++) {
       const row = rows[i];
       const cells = Array.from(row.querySelectorAll("td, th")) as Element[];
 
@@ -3429,6 +3501,20 @@ async function parseCGBDTableAndInsert(params: {
         continue;
       }
 
+      // ============================================================================
+      // STEP 1: Check if this row is an INVESTMENT TYPE SECTION HEADER
+      // If so, update the state and skip to next row (don't process as data)
+      // ============================================================================
+      const detectedType = detectInvestmentTypeHeader(row, cells);
+      if (detectedType) {
+        if (detectedType !== currentInvestmentType) {
+          console.log(`   📂 Investment Type Header: "${detectedType}" (row ${i})`);
+          currentInvestmentType = detectedType;
+        }
+        totalRowsSkipped++;
+        continue; // This is a header row, not a data row
+      }
+
       // STRICT filter: Skip summary/total rows early (check full row text)
       const rowTextLower = rowText.toLowerCase();
       if (/^(total|subtotal|net\s|balance|weighted|less:|plus:)/i.test(rowText) ||
@@ -3436,6 +3522,12 @@ async function parseCGBDTableAndInsert(params: {
           rowTextLower.includes('total fair value') ||
           rowTextLower.includes('net assets') ||
           rowTextLower.includes('total cost')) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      // Skip if this is a header row (before data starts)
+      if (i < dataStartRow) {
         totalRowsSkipped++;
         continue;
       }
@@ -3515,14 +3607,22 @@ async function parseCGBDTableAndInsert(params: {
       
       // Log first few captured rows for debugging
       if (holdingsTableCount === 1 && pending.length < 5) {
-        console.log(`   ✓ Captured row ${i}: "${effectiveCompany.substring(0, 40)}", fv=${fairValue}, cost=${cost}`);
+        console.log(`   ✓ Captured row ${i}: "${effectiveCompany.substring(0, 40)}", type="${currentInvestmentType || 'null'}", fv=${fairValue}`);
       }
 
-      let investmentType: string | null = null;
+      // ============================================================================
+      // INVESTMENT TYPE: Use carried-forward state from section headers
+      // The investment type applies to ALL rows under that section header
+      // ============================================================================
+      let investmentType: string | null = currentInvestmentType;
+      
+      // Also check for explicit investment type column (some tables have inline type)
       if (colIndices.investmentType >= 0) {
         const typeCell = getCellAtPos(colIndices.investmentType);
         const typeText = typeCell?.textContent?.trim();
-        if (typeText && typeText.length > 2 && typeText.length < 150) investmentType = typeText;
+        if (typeText && typeText.length > 2 && typeText.length < 150) {
+          investmentType = typeText;
+        }
       }
 
       // CGBD: Combine Reference Rate + Spread into reference_rate field (e.g., "SOFR + 5.50%")
@@ -3593,6 +3693,7 @@ async function parseCGBDTableAndInsert(params: {
     }
 
     globalCurrentIndustry = currentIndustry;
+    globalCurrentInvestmentType = currentInvestmentType;
 
     if (debugMode && holdingsTableCount >= 2) {
       console.log(`   (debug) stopping early after 2 holdings tables`);
