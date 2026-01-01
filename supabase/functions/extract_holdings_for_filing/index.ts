@@ -752,6 +752,11 @@ function isInvestmentTypeLabel(text: string): boolean {
 function hasCompanySuffix(name: string): boolean {
   const lowerName = name.toLowerCase();
   
+  // Quick check for ", LP" or ", L.P." pattern (common in private equity names like "Payco, LP")
+  if (/,\s*(lp|l\.p\.)$/i.test(name)) {
+    return true;
+  }
+  
   // Check for company suffix - handle both word boundaries and end-of-string
   // The word boundary \b doesn't work well after periods (e.g., "L.P." at end of string)
   const hasSuffix = COMPANY_SUFFIXES.some(suffix => {
@@ -3358,15 +3363,44 @@ async function parseCGBDTableAndInsert(params: {
       console.log(`   📋 CGBD Column indices: company=${colIndices.company}, industry=${colIndices.industry}, referenceRate=${colIndices.referenceRate}, spread=${colIndices.spread}, interestRate=${colIndices.interestRate}, maturity=${colIndices.maturity}, par=${colIndices.par}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
     }
 
-    // Find data start row using company suffixes
+    // Find data start row - look for rows that have company suffix AND numeric data (fair value/cost)
+    // CGBD tables have company names with suffixes like LLC, Inc., Corp., L.P., LP, Ltd.
+    // But also watch for ", LP" (comma space LP) pattern like "Payco, LP"
     let dataStartRow = -1;
+    const companySuffixRe = /(LLC|Inc\.|Inc|Corp\.|Corp|Co\.|L\.P\.|LP|Ltd\.|Ltd|,\s*LP|,\s*L\.P\.)/i;
+    
     for (let i = 0; i < rows.length; i++) {
       const rowText = rows[i].textContent || "";
-      if (/(LLC|Inc\.|Corp\.|Co\.|L\.P\.|LP|Ltd\.)/i.test(rowText)) {
+      
+      // Skip header rows (typically short or contain only column names)
+      if (rowText.length < 30) continue;
+      
+      // Skip if this looks like a header (contains "Fair Value" as column header)
+      if (/fair\s+value\s*\(/i.test(rowText) && /industry/i.test(rowText)) continue;
+      
+      // Check for company suffix AND numeric data in same row
+      const hasCompanySuffix = companySuffixRe.test(rowText);
+      const hasNumericData = /\$?\s*[\d,]+\.?\d*\s*$/.test(rowText) || /[\d,]+\.\d{2}/.test(rowText);
+      
+      if (hasCompanySuffix && hasNumericData) {
         dataStartRow = i;
+        console.log(`   📍 CGBD data starts at row ${i}: "${rowText.substring(0, 80)}..."`);
         break;
       }
     }
+    
+    // Fallback: if no row with both suffix and data, just look for any company suffix
+    if (dataStartRow === -1) {
+      for (let i = 0; i < rows.length; i++) {
+        const rowText = rows[i].textContent || "";
+        if (rowText.length >= 30 && companySuffixRe.test(rowText)) {
+          dataStartRow = i;
+          console.log(`   📍 CGBD fallback data start at row ${i}: "${rowText.substring(0, 80)}..."`);
+          break;
+        }
+      }
+    }
+    
     if (dataStartRow === -1) continue;
 
     let currentIndustry: string | null = globalCurrentIndustry;
@@ -3458,8 +3492,17 @@ async function parseCGBDTableAndInsert(params: {
 
       // Skip rows without financial data OR without a valid company
       if ((fairValue === null && cost === null) || !effectiveCompany) {
+        // Log first few skipped rows for debugging
+        if (holdingsTableCount === 1 && i < dataStartRow + 10) {
+          console.log(`   ⏭️ Skipped row ${i}: company="${rawCompanyName.substring(0, 40)}", effective="${effectiveCompany || 'null'}", fv=${fairValue}, cost=${cost}`);
+        }
         totalRowsSkipped++;
         continue;
+      }
+      
+      // Log first few captured rows for debugging
+      if (holdingsTableCount === 1 && pending.length < 5) {
+        console.log(`   ✓ Captured row ${i}: "${effectiveCompany.substring(0, 40)}", fv=${fairValue}, cost=${cost}`);
       }
 
       let investmentType: string | null = null;
