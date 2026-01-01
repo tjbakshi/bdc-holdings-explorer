@@ -1967,14 +1967,22 @@ function findGBDCColumnIndices(headerRow: Element): GBDCColumnIndices {
  */
 
 /**
- * Clean numeric value for GBDC: strips $, commas, and handles parentheses as negatives
+ * Clean numeric value for GBDC: strips $, commas, handles parentheses as negatives,
+ * and removes trailing footnotes like "(2)" or "(3)(4)"
  */
 function cleanGBDCNumeric(value: string | null | undefined): number | null {
   if (!value) return null;
   let cleaned = value.replace(/[$,\s]/g, '').trim();
   if (!cleaned || cleaned === '-' || cleaned === '—' || cleaned === '') return null;
-  const isNegative = cleaned.startsWith('(') && cleaned.endsWith(')');
+  
+  // Handle negative values in parentheses FIRST (e.g., "(1,234)")
+  const isNegative = /^\([\d.,]+\)$/.test(cleaned);
   if (isNegative) cleaned = cleaned.slice(1, -1);
+  
+  // Remove trailing footnote markers like "(2)", "(3)(4)", "(1,2)" at the end of the number
+  // These are superscript references, not part of the number
+  cleaned = cleaned.replace(/\([\d,]+\)+$/g, '');
+  
   const parsed = parseFloat(cleaned);
   if (isNaN(parsed)) return null;
   return isNegative ? -parsed : parsed;
@@ -3374,6 +3382,17 @@ async function parseCGBDTableAndInsert(params: {
         continue;
       }
 
+      // STRICT filter: Skip summary/total rows early (check full row text)
+      const rowTextLower = rowText.toLowerCase();
+      if (/^(total|subtotal|net\s|balance|weighted|less:|plus:)/i.test(rowText) ||
+          rowTextLower.includes('total investments') ||
+          rowTextLower.includes('total fair value') ||
+          rowTextLower.includes('net assets') ||
+          rowTextLower.includes('total cost')) {
+        totalRowsSkipped++;
+        continue;
+      }
+
       const getCellAtPos = (pos: number): Element | null => {
         if (pos < 0) return null;
         let currentPos = 0;
@@ -3387,22 +3406,47 @@ async function parseCGBDTableAndInsert(params: {
 
       const companyCell = getCellAtPos(colIndices.company);
       const rawCompanyName = companyCell?.textContent?.trim() || "";
-      if (/^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(rawCompanyName)) continue;
-
-      const cleanedName = cleanCompanyName(rawCompanyName);
-      let effectiveCompany = cleanedName;
-      if (cleanedName && hasCompanySuffix(cleanedName)) currentCompany = cleanedName;
-      else if (currentCompany && (!cleanedName || cleanedName.length < 5)) effectiveCompany = currentCompany;
-      else if (!cleanedName || cleanedName.length < 3) {
+      
+      // Skip summary rows based on company cell content
+      if (/^(Total|Subtotal|Net\s|Balance|Weighted|Less:|Plus:)/i.test(rawCompanyName)) {
         totalRowsSkipped++;
         continue;
       }
 
-      // Check for industry in this row (CGBD has explicit Industry column)
+      const cleanedName = cleanCompanyName(rawCompanyName);
+      
+      // COMPANY CARRY-FORWARD LOGIC:
+      // 1. If this row has a valid company name with suffix, update currentCompany
+      // 2. If company cell is empty but row has financial data, use currentCompany
+      let effectiveCompany: string | null = null;
+      
+      if (cleanedName && hasCompanySuffix(cleanedName)) {
+        // Valid company name found - update carry-forward and use it
+        currentCompany = cleanedName;
+        effectiveCompany = cleanedName;
+      } else if (cleanedName && cleanedName.length >= 5) {
+        // Has text but no suffix - might be a sub-row or continuation
+        // Check if it looks like investment type (First Lien, Second Lien, etc.)
+        const looksLikeInvestmentType = /^(first|second|third|senior|junior|subordinated|mezzanine|equity|preferred|common|warrant|delayed)/i.test(cleanedName);
+        if (looksLikeInvestmentType && currentCompany) {
+          effectiveCompany = currentCompany;
+        } else {
+          // Treat as potential new company without suffix
+          effectiveCompany = cleanedName;
+        }
+      } else if (currentCompany) {
+        // Empty or very short company cell - use carry-forward if we have financial data
+        effectiveCompany = currentCompany;
+      }
+
+      // INDUSTRY CARRY-FORWARD LOGIC:
+      // Industry cells are often merged, so carry forward from previous row
       if (colIndices.industry >= 0) {
         const industryCell = getCellAtPos(colIndices.industry);
         const industryText = industryCell?.textContent?.trim();
-        if (industryText && industryText.length > 3 && industryText.length < 100) {
+        // Only update if we have a valid, new industry value
+        if (industryText && industryText.length > 3 && industryText.length < 100 &&
+            !/^[-—\s]*$/.test(industryText) && industryText !== currentIndustry) {
           currentIndustry = industryText;
         }
       }
@@ -3412,7 +3456,8 @@ async function parseCGBDTableAndInsert(params: {
       const costCell = colIndices.cost >= 0 ? getCellAtPos(colIndices.cost) : null;
       const cost = cleanGBDCNumeric(costCell?.textContent);
 
-      if (fairValue === null && cost === null) {
+      // Skip rows without financial data OR without a valid company
+      if ((fairValue === null && cost === null) || !effectiveCompany) {
         totalRowsSkipped++;
         continue;
       }
