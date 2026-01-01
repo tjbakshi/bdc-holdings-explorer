@@ -1781,7 +1781,7 @@ function parseLargeFilingSegment(htmlSegment: string): Holding[] {
 // ======================================================================
 // Switchboard pattern: route to specialized parsers based on BDC ticker
 
-type ParserType = 'ARCC' | 'GBDC' | 'BXSL' | 'OBDC' | 'GENERIC';
+type ParserType = 'ARCC' | 'GBDC' | 'BXSL' | 'OBDC' | 'CGBD' | 'GENERIC';
 
 interface ParseResult {
   holdings: Holding[];
@@ -1812,8 +1812,12 @@ function determineParserType(ticker: string | null, bdcName: string): ParserType
     return 'OBDC';
   }
 
-  // Default to generic parser for unknown BDCs
-  return 'GENERIC';
+  if (tickerUpper === 'CGBD' || nameUpper.includes('CARLYLE')) {
+    return 'CGBD';
+  }
+
+  // Default to BXSL parser for unknown BDCs (better than GENERIC)
+  return 'BXSL';
 }
 
 /**
@@ -3055,6 +3059,466 @@ async function parseBXSLTableAndInsert(params: {
 
 /**
  * ============================================================================
+ * CGBD STREAMING PARSER - Optimized for Carlyle Secured Lending filings
+ * ============================================================================
+ * 
+ * Based on BXSL slicing method - processes tables one at a time and inserts
+ * holdings in batches to avoid memory limits.
+ * 
+ * CGBD-specific adjustments:
+ * - Company column: 'Investments' or 'Portfolio Company'
+ * - Industry column: explicit 'Industry' header
+ * - Reference Rate: separate 'Reference Rate' column
+ * - Spread: separate 'Spread' column  
+ * - Interest Rate: 'Interest Rate' column
+ * - Maturity: 'Maturity Date' column
+ * - Principal: 'Principal' or 'Par' column
+ * - Cost: 'Amortized Cost' column
+ * - Fair Value: 'Fair Value' column
+ * 
+ * Special: Combines Reference Rate + Spread into reference_rate field (e.g., "SOFR + 5.50%")
+ */
+async function parseCGBDTableAndInsert(params: {
+  html: string;
+  filingId: string;
+  supabaseClient: any;
+  debugMode?: boolean;
+}): Promise<{ insertedCount: number; scaleResult: ScaleDetectionResult }> {
+  const { html, filingId, supabaseClient } = params;
+  const debugMode = params.debugMode ?? false;
+
+  console.log(`\n🔷 CGBD STREAMING PARSER: Starting (input size: ${(html.length / 1024 / 1024).toFixed(2)} MB)`);
+  console.log(`🔧 CGBD: Using Slicing Method for ${(html.length / 1024 / 1024).toFixed(0)}MB file.`);
+
+  console.log(`🔍 STEP 1: Detecting value scale...`);
+  const scaleResult = detectScale(html);
+  console.log(`   Scale: ${scaleResult.detected} (confidence: ${scaleResult.confidence})`);
+
+  console.log(`🔍 STEP 2: Searching for 'Schedule of Investments' section...`);
+  const soiRe = /(consolidated schedule of investments|schedule of investments)/i;
+  const soiMatch = soiRe.exec(html);
+  const soiStart = soiMatch?.index ?? -1;
+
+  if (soiStart === -1) {
+    console.log(`   ❌ No SOI section found`);
+    return { insertedCount: 0, scaleResult };
+  }
+  console.log(`   ✅ Found SOI at position ${soiStart} (match: "${soiMatch?.[0]}")`);
+
+  // Extract default period date from SOI header
+  const soiHeaderSection = html.slice(soiStart, Math.min(soiStart + 3000, html.length));
+  const sanitizeToText = (rawText: string) =>
+    rawText
+      .replace(/<[^>]*>?/gm, " ")
+      .replace(/&nbsp;|&#160;|&#xA0;/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const extractPeriodDateISO = (rawText: string): string | null => {
+    const cleanText = sanitizeToText(rawText);
+    const dateRe = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\s*,\s*\d{4}/gi;
+    const matches = Array.from(cleanText.matchAll(dateRe));
+    if (matches.length === 0) return null;
+
+    const dateText = matches[matches.length - 1][0];
+    const m = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\s*,\s*(\d{4})$/i.exec(dateText);
+    if (!m) return null;
+
+    const monthName = m[1].toLowerCase();
+    const day = Number(m[2]);
+    const year = Number(m[3]);
+
+    const monthMap: Record<string, number> = {
+      january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+      july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+    };
+
+    const month = monthMap[monthName];
+    if (!month || !Number.isFinite(day) || !Number.isFinite(year)) return null;
+
+    const mm = String(month).padStart(2, "0");
+    const dd = String(day).padStart(2, "0");
+    return `${year}-${mm}-${dd}`;
+  };
+
+  const defaultPeriodDateISO = extractPeriodDateISO(soiHeaderSection);
+  if (defaultPeriodDateISO) {
+    console.log(`🔧 CGBD: Default Period Date (SOI header) = ${defaultPeriodDateISO}`);
+  } else {
+    console.log(`⚠️ CGBD: Could not detect default period date from SOI header.`);
+  }
+
+  console.log(`🔍 STEP 3: Extracting post-SOI section...`);
+  const MAX_SEARCH = 10_000_000;
+  const afterSoi = html.slice(soiStart, Math.min(soiStart + MAX_SEARCH, html.length));
+  console.log(`   Extracted ${(afterSoi.length / 1024).toFixed(0)} KB after SOI header`);
+
+  console.log(`🔍 STEP 4: Scanning and processing holdings tables (streaming inserts)...`);
+  const tableStartRe = /<table\b[^>]*>/ig;
+  const tableEndRe = /<\/table\s*>/ig;
+
+  const MAX_TABLES = 150;
+  const MAX_HOLDINGS = 2500;
+  const INSERT_BATCH = 250;
+
+  // Clear existing holdings for this filing
+  const { error: deleteError } = await supabaseClient
+    .from("holdings")
+    .delete()
+    .eq("filing_id", filingId);
+  if (deleteError) {
+    console.error(`   ⚠️ Error clearing existing holdings:`, deleteError);
+  }
+
+  let searchPos = 0;
+  let tableCount = 0;
+  let holdingsTableCount = 0;
+  let insertedCount = 0;
+  let totalProcessedRows = 0;
+  let totalRowsSkipped = 0;
+
+  const seen = new Set<string>();
+  const pending: Holding[] = [];
+  let globalCurrentIndustry: string | null = null;
+
+  // CGBD-specific column indices
+  let savedColIndices = {
+    company: 0,
+    investmentType: -1,
+    industry: -1,
+    referenceRate: -1,  // CGBD: separate 'Reference Rate' column
+    spread: -1,         // CGBD: separate 'Spread' column
+    interestRate: -1,   // CGBD: 'Interest Rate' column
+    maturity: -1,
+    par: -1,
+    cost: -1,
+    fairValue: -1,
+  };
+  let hasFoundFirstTable = false;
+
+  const flush = async () => {
+    if (pending.length === 0) return;
+
+    const rows = pending.splice(0, pending.length).map((h, idx) => ({
+      filing_id: filingId,
+      company_name: h.company_name,
+      investment_type: h.investment_type,
+      industry: h.industry,
+      description: h.description,
+      interest_rate: h.interest_rate,
+      reference_rate: h.reference_rate,
+      maturity_date: h.maturity_date,
+      par_amount: toMillions(h.par_amount, scaleResult.scale),
+      cost: toMillions(h.cost, scaleResult.scale),
+      fair_value: toMillions(h.fair_value, scaleResult.scale),
+      row_number: insertedCount + idx + 1,
+      source_pos: h.source_pos ?? null,
+      period_date: h.period_date ?? defaultPeriodDateISO,
+    }));
+
+    const { error: insertError } = await supabaseClient.from("holdings").insert(rows as any);
+    if (insertError) {
+      console.error(`   ❌ Insert error (batch size ${rows.length}):`, insertError);
+      return;
+    }
+
+    insertedCount += rows.length;
+    if (insertedCount % 500 === 0) {
+      console.log(`   Progress: inserted ${insertedCount} holdings...`);
+    }
+  };
+
+  while (searchPos < afterSoi.length && tableCount < MAX_TABLES && insertedCount < MAX_HOLDINGS) {
+    tableStartRe.lastIndex = searchPos;
+    const startMatch = tableStartRe.exec(afterSoi);
+    if (!startMatch) break;
+    const tableStartIdx = startMatch.index;
+
+    tableEndRe.lastIndex = tableStartIdx;
+    const endMatch = tableEndRe.exec(afterSoi);
+    if (!endMatch) break;
+
+    const tableEndIdx = endMatch.index;
+    const tableEndLen = endMatch[0].length;
+
+    tableCount++;
+    const tableHtml = afterSoi.slice(tableStartIdx, tableEndIdx + tableEndLen);
+    const tableLower = tableHtml.toLowerCase();
+    const tableSizeKB = tableHtml.length / 1024;
+    searchPos = tableEndIdx + tableEndLen;
+
+    if (tableCount <= 5 || tableCount % 20 === 0) {
+      console.log(`   Table ${tableCount}: ${tableSizeKB.toFixed(0)} KB`);
+    }
+
+    if (tableHtml.length < 15_000) continue;
+
+    // Determine period date for this table
+    const localHeaderRaw = afterSoi.slice(Math.max(0, tableStartIdx - 2000), tableStartIdx);
+    const tablePeriodDateISO = extractPeriodDateISO(localHeaderRaw) ?? defaultPeriodDateISO;
+
+    // Skip financial summary tables
+    if (
+      tableLower.includes("total liabilities") ||
+      tableLower.includes("total assets") ||
+      tableLower.includes("stockholders") ||
+      tableLower.includes("shareholders") ||
+      tableLower.includes("statements of operations") ||
+      tableLower.includes("statements of changes") ||
+      (tableLower.includes("liabilities") && tableLower.includes("assets") && !tableLower.includes("portfolio"))
+    ) {
+      continue;
+    }
+
+    // Count company suffixes to identify holdings tables
+    const companyMatches = tableLower.match(/(?:llc|inc\.|corp\.|l\.p\.|, lp|ltd\.)/gi) || [];
+    const companyCount = companyMatches.length;
+    const hasCompanies = companyCount >= 5;
+    const hasFairValue = tableLower.includes("fair value") || tableLower.includes("fair");
+    const hasCost = tableLower.includes("cost") || tableLower.includes("amortized");
+
+    if (!hasCompanies || (!hasFairValue && !hasCost)) continue;
+
+    holdingsTableCount++;
+    console.log(`   ✅ HOLDINGS TABLE ${holdingsTableCount} at index ${tableCount} (${tableSizeKB.toFixed(0)} KB, ${companyCount} companies)`);
+
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(`<html><body>${tableHtml}</body></html>`, "text/html");
+    } catch {
+      continue;
+    }
+    if (!doc) continue;
+
+    const table = doc.querySelector("table") as Element;
+    if (!table) continue;
+
+    const rows = Array.from(table.querySelectorAll("tr")) as Element[];
+
+    // CGBD-specific column detection
+    let colIndices = { ...savedColIndices };
+    if (!hasFoundFirstTable) {
+      for (let i = 0; i < Math.min(5, rows.length); i++) {
+        const cells = Array.from(rows[i].querySelectorAll("th, td")) as Element[];
+        let position = 0;
+        for (const cell of cells) {
+          const text = (cell.textContent?.toLowerCase() || "").replace(/\s+/g, " ").trim();
+          const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+          
+          // CGBD: 'Investments' or 'Portfolio Company' for company column
+          if ((text.includes("investments") || text.includes("portfolio company") || text.includes("borrower")) && !text.includes("type") && colIndices.company === 0) {
+            colIndices.company = position;
+          }
+          // CGBD: explicit 'Industry' column
+          else if (text.includes("industry") && colIndices.industry === -1) {
+            colIndices.industry = position;
+          }
+          // CGBD: 'Reference Rate' column
+          else if (text.includes("reference rate") && colIndices.referenceRate === -1) {
+            colIndices.referenceRate = position;
+          }
+          // CGBD: 'Spread' column
+          else if (text.includes("spread") && colIndices.spread === -1) {
+            colIndices.spread = position;
+          }
+          // CGBD: 'Interest Rate' column
+          else if (text.includes("interest rate") && !text.includes("reference") && colIndices.interestRate === -1) {
+            colIndices.interestRate = position;
+          }
+          // Maturity Date
+          else if (text.includes("maturity") && colIndices.maturity === -1) {
+            colIndices.maturity = position;
+          }
+          // Principal or Par
+          else if ((text.includes("principal") || text.includes("par")) && colIndices.par === -1) {
+            colIndices.par = position;
+          }
+          // Amortized Cost
+          else if ((text.includes("cost") || text.includes("amortized")) && colIndices.cost === -1) {
+            colIndices.cost = position;
+          }
+          // Fair Value
+          else if ((text.includes("fair value") || (text.includes("fair") && !text.includes("unfair"))) && colIndices.fairValue === -1) {
+            colIndices.fairValue = position;
+          }
+          position += colspan;
+        }
+      }
+      if (colIndices.fairValue === -1 && colIndices.cost >= 0) colIndices.fairValue = colIndices.cost + 1;
+      savedColIndices = { ...colIndices };
+      hasFoundFirstTable = true;
+      console.log(`   📋 CGBD Column indices: company=${colIndices.company}, industry=${colIndices.industry}, referenceRate=${colIndices.referenceRate}, spread=${colIndices.spread}, interestRate=${colIndices.interestRate}, maturity=${colIndices.maturity}, par=${colIndices.par}, cost=${colIndices.cost}, fairValue=${colIndices.fairValue}`);
+    }
+
+    // Find data start row using company suffixes
+    let dataStartRow = -1;
+    for (let i = 0; i < rows.length; i++) {
+      const rowText = rows[i].textContent || "";
+      if (/(LLC|Inc\.|Corp\.|Co\.|L\.P\.|LP|Ltd\.)/i.test(rowText)) {
+        dataStartRow = i;
+        break;
+      }
+    }
+    if (dataStartRow === -1) continue;
+
+    let currentIndustry: string | null = globalCurrentIndustry;
+    let currentCompany: string | null = null;
+
+    for (let i = dataStartRow; i < rows.length && insertedCount + pending.length < MAX_HOLDINGS; i++) {
+      const row = rows[i];
+      const cells = Array.from(row.querySelectorAll("td, th")) as Element[];
+
+      const rowText = row.textContent?.trim() || "";
+      if (!rowText || /^[-—\s]*$/.test(rowText)) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      const getCellAtPos = (pos: number): Element | null => {
+        if (pos < 0) return null;
+        let currentPos = 0;
+        for (const cell of cells) {
+          const colspan = parseInt(cell.getAttribute("colspan") || "1", 10);
+          if (currentPos <= pos && pos < currentPos + colspan) return cell;
+          currentPos += colspan;
+        }
+        return cells[Math.min(pos, cells.length - 1)] || null;
+      };
+
+      const companyCell = getCellAtPos(colIndices.company);
+      const rawCompanyName = companyCell?.textContent?.trim() || "";
+      if (/^(Total|Subtotal|Net\s|Balance|Weighted)/i.test(rawCompanyName)) continue;
+
+      const cleanedName = cleanCompanyName(rawCompanyName);
+      let effectiveCompany = cleanedName;
+      if (cleanedName && hasCompanySuffix(cleanedName)) currentCompany = cleanedName;
+      else if (currentCompany && (!cleanedName || cleanedName.length < 5)) effectiveCompany = currentCompany;
+      else if (!cleanedName || cleanedName.length < 3) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      // Check for industry in this row (CGBD has explicit Industry column)
+      if (colIndices.industry >= 0) {
+        const industryCell = getCellAtPos(colIndices.industry);
+        const industryText = industryCell?.textContent?.trim();
+        if (industryText && industryText.length > 3 && industryText.length < 100) {
+          currentIndustry = industryText;
+        }
+      }
+
+      const fairValueCell = colIndices.fairValue >= 0 ? getCellAtPos(colIndices.fairValue) : null;
+      const fairValue = cleanGBDCNumeric(fairValueCell?.textContent);
+      const costCell = colIndices.cost >= 0 ? getCellAtPos(colIndices.cost) : null;
+      const cost = cleanGBDCNumeric(costCell?.textContent);
+
+      if (fairValue === null && cost === null) {
+        totalRowsSkipped++;
+        continue;
+      }
+
+      let investmentType: string | null = null;
+      if (colIndices.investmentType >= 0) {
+        const typeCell = getCellAtPos(colIndices.investmentType);
+        const typeText = typeCell?.textContent?.trim();
+        if (typeText && typeText.length > 2 && typeText.length < 150) investmentType = typeText;
+      }
+
+      // CGBD: Combine Reference Rate + Spread into reference_rate field (e.g., "SOFR + 5.50%")
+      let referenceRate: string | null = null;
+      let interestRate: string | null = null;
+
+      const refRateParts: string[] = [];
+      
+      if (colIndices.referenceRate >= 0) {
+        const refCell = getCellAtPos(colIndices.referenceRate);
+        const refText = refCell?.textContent?.trim();
+        if (refText && refText.length > 0 && !/^[-—\s]*$/.test(refText) && refText !== 'N/A') {
+          refRateParts.push(refText);
+        }
+      }
+
+      if (colIndices.spread >= 0) {
+        const spreadCell = getCellAtPos(colIndices.spread);
+        const spreadText = spreadCell?.textContent?.trim();
+        if (spreadText && spreadText.length > 0 && !/^[-—\s]*$/.test(spreadText) && spreadText !== 'N/A') {
+          // Format as "SOFR + 5.50%" style
+          refRateParts.push(`+ ${spreadText}`);
+        }
+      }
+
+      if (refRateParts.length > 0) {
+        referenceRate = refRateParts.join(' ');
+      }
+
+      // Also capture standalone Interest Rate column
+      if (colIndices.interestRate >= 0) {
+        const rateCell = getCellAtPos(colIndices.interestRate);
+        const rateText = rateCell?.textContent?.trim();
+        if (rateText && rateText.length > 0 && !/^[-—\s]*$/.test(rateText) && rateText !== 'N/A') {
+          interestRate = rateText;
+        }
+      }
+
+      const parCell = colIndices.par >= 0 ? getCellAtPos(colIndices.par) : null;
+      const parAmount = cleanGBDCNumeric(parCell?.textContent);
+
+      const maturityCell = colIndices.maturity >= 0 ? getCellAtPos(colIndices.maturity) : null;
+      const maturityDate = parseDate(maturityCell?.textContent?.trim());
+
+      const key = `${effectiveCompany}|${investmentType || ""}|${fairValue || ""}|${cost || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      pending.push({
+        company_name: effectiveCompany,
+        investment_type: investmentType,
+        industry: currentIndustry,
+        description: null,
+        interest_rate: interestRate,
+        reference_rate: referenceRate,
+        maturity_date: maturityDate,
+        par_amount: parAmount,
+        cost,
+        fair_value: fairValue,
+        source_pos: soiStart + tableStartIdx + i,
+        period_date: tablePeriodDateISO,
+      });
+      totalProcessedRows++;
+
+      if (pending.length >= INSERT_BATCH) {
+        await flush();
+      }
+    }
+
+    globalCurrentIndustry = currentIndustry;
+
+    if (debugMode && holdingsTableCount >= 2) {
+      console.log(`   (debug) stopping early after 2 holdings tables`);
+      break;
+    }
+  }
+
+  await flush();
+
+  console.log(`\n🔷 CGBD STREAMING: Completed - inserted ${insertedCount} holdings from ${holdingsTableCount} tables (${totalProcessedRows} processed, ${totalRowsSkipped} skipped)`);
+
+  if (insertedCount === 0) {
+    console.log(`⚠️ CGBD: No holdings inserted; check table detection/column mapping logs above.`);
+  }
+
+  if (insertedCount > 100) {
+    await supabaseClient
+      .from("filings")
+      .update({ parsed_successfully: true, value_scale: scaleResult.detected } as any)
+      .eq("id", filingId);
+  }
+
+  return { insertedCount, scaleResult };
+}
+
+/**
+ * ============================================================================
  * OBDC STREAMING PARSER - Optimized for Blue Owl Capital Corporation filings
  * ============================================================================
  *
@@ -3786,6 +4250,35 @@ serve(async (req) => {
               }
 
               console.log(`   ⚠️ BXSL streaming parser found no holdings, trying next document...`);
+              continue;
+            }
+
+            // For CGBD, use streaming parser (same approach as BXSL)
+            if (parserType === 'CGBD') {
+              console.log(`   🔀 CGBD detected - using STREAMING insert parser for large file`);
+
+              const { insertedCount, scaleResult: cgbdScale } = await parseCGBDTableAndInsert({
+                html,
+                filingId,
+                supabaseClient,
+                debugMode,
+              });
+
+              if (insertedCount > 0) {
+                // Return immediately; data is already in DB
+                return new Response(
+                  JSON.stringify({
+                    filingId,
+                    holdingsInserted: insertedCount,
+                    valueScale: cgbdScale.detected,
+                    scaleConfidence: cgbdScale.confidence,
+                    method: 'cgbd-streaming',
+                  }),
+                  { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+                );
+              }
+
+              console.log(`   ⚠️ CGBD streaming parser found no holdings, trying next document...`);
               continue;
             }
 
