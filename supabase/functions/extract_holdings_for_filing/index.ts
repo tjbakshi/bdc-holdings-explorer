@@ -3264,7 +3264,9 @@ async function parseCGBDTableAndInsert(params: {
       console.log(`   Table ${tableCount}: ${tableSizeKB.toFixed(0)} KB`);
     }
 
-    if (tableHtml.length < 15_000) continue;
+    // CGBD filings can have some smaller holdings tables (e.g., short sections or continued pages)
+    // so we use a lighter size threshold and a more robust "looks like holdings" check.
+    if (tableHtml.length < 8_000) continue;
 
     // Determine period date for this table
     const localHeaderRaw = afterSoi.slice(Math.max(0, tableStartIdx - 2000), tableStartIdx);
@@ -3283,14 +3285,25 @@ async function parseCGBDTableAndInsert(params: {
       continue;
     }
 
-    // Count company suffixes to identify holdings tables
-    const companyMatches = tableLower.match(/(?:llc|inc\.|corp\.|l\.p\.|, lp|ltd\.)/gi) || [];
+    // Identify CGBD holdings tables.
+    // Prior logic relied heavily on counting company suffixes; some valid tables have fewer matches
+    // (or suffixes without periods like "Inc" or "LP"), so broaden suffix detection and allow header-based acceptance.
+    const companyMatches =
+      tableLower.match(/\b(llc|inc\.?|corp\.?|co\.?|l\.p\.?|lp|ltd\.?)\b|,\s*lp\b/gi) || [];
     const companyCount = companyMatches.length;
-    const hasCompanies = companyCount >= 5;
+
     const hasFairValue = tableLower.includes("fair value") || tableLower.includes("fair");
     const hasCost = tableLower.includes("cost") || tableLower.includes("amortized");
 
-    if (!hasCompanies || (!hasFairValue && !hasCost)) continue;
+    const looksLikeHoldingsByHeader =
+      (tableLower.includes("portfolio company") || tableLower.includes("investments") || tableLower.includes("borrower")) &&
+      tableLower.includes("industry") &&
+      hasFairValue;
+
+    // Accept if header strongly indicates holdings OR we see enough company-like rows.
+    const hasCompanies = companyCount >= 3;
+
+    if ((!looksLikeHoldingsByHeader && !hasCompanies) || (!hasFairValue && !hasCost)) continue;
 
     holdingsTableCount++;
     console.log(`   ✅ HOLDINGS TABLE ${holdingsTableCount} at index ${tableCount} (${tableSizeKB.toFixed(0)} KB, ${companyCount} companies)`);
