@@ -249,6 +249,21 @@ function parseDate(value: string | null | undefined): string | null {
   const cleaned = value.trim();
   if (!cleaned || cleaned === "-" || cleaned === "—" || cleaned.toLowerCase() === "n/a") return null;
   
+  // Try MM/YY format (e.g., "12/28" meaning December 2028) - use last day of month
+  const mmyyMatch = cleaned.match(/^(\d{1,2})\/(\d{2})$/);
+  if (mmyyMatch) {
+    const [, month, year] = mmyyMatch;
+    const monthNum = parseInt(month);
+    // Interpret 2-digit year as 20XX (e.g., 28 -> 2028)
+    const yearNum = 2000 + parseInt(year);
+    // Use last day of the month
+    const lastDay = new Date(yearNum, monthNum, 0).getDate();
+    const date = new Date(yearNum, monthNum - 1, lastDay);
+    if (!isNaN(date.getTime())) {
+      return date.toISOString().split("T")[0];
+    }
+  }
+  
   // Try MM/YYYY format (common in SEC filings for maturity dates) - use last day of month
   const mmyyyyMatch = cleaned.match(/^(\d{1,2})\/(\d{4})$/);
   if (mmyyyyMatch) {
