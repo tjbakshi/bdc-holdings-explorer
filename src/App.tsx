@@ -10,6 +10,7 @@ import CompanyDetail from "./pages/CompanyDetail";
 import HoldingDetail from "./pages/HoldingDetail";
 import Admin from "./pages/Admin";
 import DataViewer from "./pages/DataViewer";
+import AssetSearch from "./pages/AssetSearch";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -28,6 +29,7 @@ const App = () => (
           <Route path="/holding/:holdingId" element={<HoldingDetail />} />
           <Route path="/admin" element={<Admin />} />
           <Route path="/data-viewer" element={<DataViewer />} />
+          <Route path="/asset-search" element={<AssetSearch />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
         </Routes>

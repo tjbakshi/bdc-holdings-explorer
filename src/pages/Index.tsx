@@ -162,6 +162,15 @@ const Index = () => {
           Showing {filteredBdcs?.length || 0} of {bdcs?.length || 0} BDCs
         </div>
 
+        <div className="mt-8 flex justify-center">
+          <Link to="/asset-search">
+            <Button variant="outline" size="lg" className="gap-2">
+              <Search className="h-5 w-5" />
+              Search Assets Across All BDCs
+            </Button>
+          </Link>
+        </div>
+
         <div className="mt-12 pt-6 border-t border-border text-center">
           <Link to="/admin" className="text-sm text-muted-foreground hover:text-foreground transition-colors">
             Admin / Data Updates (Internal)
